@@ -103,7 +103,7 @@ fn main() -> iced::Result {
                             "https://localhost:8073/api/health".into(),
                         ]).await.map(|b| b.contains("ok")).unwrap_or(false)
                     },
-                    Message::LaunchPreCheck,
+                    |running| Message::LaunchPreCheck(running, false),
                 ),
                 // Check for updates
                 Task::perform(
@@ -316,7 +316,7 @@ enum Message {
     OpenRunLog,
     ScrollRunLog,
     // Launch
-    LaunchPreCheck(bool),   // true = sapphire already running
+    LaunchPreCheck(bool, bool),   // (already_running, user_initiated)
     SapphireLine(String),   // a line of output from sapphire
     SapphireExited(String), // process ended
     SapphireStopConfirmed,  // process is actually dead
@@ -364,6 +364,17 @@ enum TsStatus {
 
 /// Run a command on a background thread so it doesn't freeze the UI.
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Create a Command that won't flash a console window on Windows
+fn hidden_cmd(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
 
 async fn run_cmd_async(program: String, args: Vec<String>) -> Result<String, String> {
     let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
@@ -990,6 +1001,11 @@ fn launch_sapphire_stream(install_path: String, pid_store: Arc<AtomicU32>) -> im
             .stderr(std::process::Stdio::piped())
             .env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUTF8", "1");
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
 
         let mut child = match cmd.spawn() {
             Ok(c) => c,
@@ -1153,20 +1169,22 @@ impl App {
                             "https://localhost:8073/api/health".into(),
                         ]).await.map(|b| b.contains("ok")).unwrap_or(false)
                     },
-                    Message::LaunchPreCheck,
+                    |running| Message::LaunchPreCheck(running, true),
                 )
             }
-            Message::LaunchPreCheck(already_running) => {
+            Message::LaunchPreCheck(already_running, user_initiated) => {
                 if already_running {
-                    // Sapphire is already up — we can't capture its logs but we can show status
                     self.sapphire_running = true;
                     self.sapphire_log.clear();
                     self.sapphire_log.push("Sapphire is already running (started outside this app).".into());
                     self.sapphire_log.push("".into());
                     self.sapphire_log.push("No live logs available for this session.".into());
                     self.sapphire_log.push("To see logs: click Stop, then Launch again.".into());
-                    self.active_tab = Tab::Running;
                     self.log_lines.push("Sapphire already running.".to_string());
+                    // Only switch to Running tab if user clicked Launch
+                    if user_initiated {
+                        self.active_tab = Tab::Running;
+                    }
                     Task::none()
                 } else {
                     // Not running, launch it
@@ -1512,7 +1530,7 @@ impl App {
             Message::CopyRunLog => {
                 let log_text = self.sapphire_log.join("\n");
                 // Use clip.exe on Windows, xclip on Linux
-                let _ = std::process::Command::new("clip")
+                let _ = hidden_cmd("clip")
                     .stdin(std::process::Stdio::piped())
                     .spawn()
                     .and_then(|mut child| {
