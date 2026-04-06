@@ -1,11 +1,12 @@
 use iced::widget::{
-    button, column, container, horizontal_space, pick_list, row, scrollable, text, text_input,
-    Column,
+    button, column, container, horizontal_space, pick_list, row, scrollable, text,
+    text_input, Column,
 };
 use iced::{color, Element, Font, Length, Padding, Task, Theme};
 use iced::window;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 fn main() -> iced::Result {
@@ -128,6 +129,8 @@ struct App {
     confirm_delete_userdata: bool,
     // Sapphire process
     sapphire_running: bool,
+    sapphire_log: Vec<String>,
+    sapphire_pid: Arc<AtomicU32>,
 }
 
 impl Default for App {
@@ -153,6 +156,8 @@ impl Default for App {
             confirm_delete_folder: false,
             confirm_delete_userdata: false,
             sapphire_running: false,
+            sapphire_log: Vec::new(),
+            sapphire_pid: Arc::new(AtomicU32::new(0)),
         }
     }
 }
@@ -164,6 +169,7 @@ enum Tab {
     Update,
     Uninstall,
     Troubleshoot,
+    Running,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +197,10 @@ enum Message {
     BranchSelected(Branch),
     BrowsePath,
     Launch,
+    StopSapphire,
+    OpenBrowser,
+    SwitchBranch,
+    SwitchBranchResult(String, bool),
     TabSelected(Tab),
     ToggleLog,
     // Install flow
@@ -199,6 +209,8 @@ enum Message {
     StepResult(Step, StepStatus),
     InstallStepResult(Step, StepStatus, String), // step, status, log output
     Log(String),
+    CopyRunLog,
+    ScrollRunLog,
     // Launch
     SapphireLine(String),   // a line of output from sapphire
     SapphireExited(String), // process ended
@@ -553,18 +565,40 @@ async fn uninstall_delete_userdata(install_path: String) -> (String, bool) {
 
 // ── Launch streaming ───────────────────────────────────────────────────────
 
-fn launch_sapphire_stream(install_path: String) -> impl futures::Stream<Item = Message> {
+fn launch_sapphire_stream(install_path: String, pid_store: Arc<AtomicU32>) -> impl futures::Stream<Item = Message> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     tokio::task::spawn(async move {
-        let mut child = match tokio::process::Command::new("conda")
-            .args(["run", "-n", "sapphire", "python", "-u", "main.py"])
+        // Find the conda env's python directly — avoids conda run buffering issues
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        let conda_python_paths = [
+            format!("{}\\miniconda3\\envs\\sapphire\\python.exe", home),
+            format!("{}\\Miniconda3\\envs\\sapphire\\python.exe", home),
+            format!("{}\\anaconda3\\envs\\sapphire\\python.exe", home),
+            format!("{}\\Anaconda3\\envs\\sapphire\\python.exe", home),
+        ];
+
+        let python_exe = conda_python_paths
+            .iter()
+            .find(|p| PathBuf::from(p).exists())
+            .cloned();
+
+        let (program, args) = if let Some(ref py) = python_exe {
+            (py.as_str(), vec!["-u", "main.py"])
+        } else {
+            // Fallback to conda run
+            ("conda", vec!["run", "-n", "sapphire", "python", "-u", "main.py"])
+        };
+
+        let mut cmd = tokio::process::Command::new(program);
+        cmd.args(&args)
             .current_dir(&install_path)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-        {
+            .env("PYTHONIOENCODING", "utf-8")
+            .env("PYTHONUTF8", "1");
+
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
                 let _ = tx.send(Message::SapphireExited(format!("Failed to start: {}", e)));
@@ -572,35 +606,58 @@ fn launch_sapphire_stream(install_path: String) -> impl futures::Stream<Item = M
             }
         };
 
+        // Store PID for stop button
+        if let Some(pid) = child.id() {
+            pid_store.store(pid, Ordering::Relaxed);
+        }
+
+        if let Some(ref py) = python_exe {
+            let _ = tx.send(Message::SapphireLine(format!("Using {}", py)));
+        }
+
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
         let tx_out = tx.clone();
         let tx_err = tx.clone();
 
-        // Read stdout in one task
+        // Read stdout — buffered line reading with lossy UTF-8
         let stdout_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut reader = BufReader::new(stdout);
+            let mut buf = Vec::new();
+            use tokio::io::AsyncBufReadExt;
+            while reader.read_until(b'\n', &mut buf).await.unwrap_or(0) > 0 {
+                // Strip \r\n
+                while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+                let line = strip_ansi(&String::from_utf8_lossy(&buf));
+                buf.clear();
                 if tx_out.send(Message::SapphireLine(line)).is_err() {
                     break;
                 }
             }
         });
 
-        // Read stderr in another
+        // Read stderr
         let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::new();
+            use tokio::io::AsyncBufReadExt;
+            while reader.read_until(b'\n', &mut buf).await.unwrap_or(0) > 0 {
+                while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                    buf.pop();
+                }
+                let line = strip_ansi(&String::from_utf8_lossy(&buf));
+                buf.clear();
                 if tx_err.send(Message::SapphireLine(line)).is_err() {
                     break;
                 }
             }
         });
 
-        let _ = stdout_task.await;
-        let _ = stderr_task.await;
+        // Wait for everything concurrently — don't deadlock
+        let (_, _, status) = tokio::join!(stdout_task, stderr_task, child.wait());
 
-        let status = child.wait().await;
         let msg = match status {
             Ok(s) if s.success() => "Sapphire exited.".to_string(),
             Ok(s) if s.code() == Some(42) => "Sapphire is restarting...".to_string(),
@@ -624,7 +681,27 @@ impl App {
             }
             Message::BranchSelected(branch) => {
                 self.selected_branch = Some(branch);
-                Task::none()
+                // Auto-switch branch if repo exists
+                let git_dir = PathBuf::from(&self.install_path).join(".git");
+                if git_dir.exists() && !self.sapphire_running {
+                    let path = self.install_path.clone();
+                    let git_branch = match branch {
+                        Branch::Development => "dev",
+                        Branch::Stable => "main",
+                    };
+                    self.log_lines.push(format!("Switching to {} branch...", git_branch));
+                    let b = git_branch.to_string();
+                    Task::perform(
+                        async move {
+                            run_cmd_full_async("git".into(), vec!["-C".into(), path, "checkout".into(), b.clone()]).await
+                                .map(|out| (format!("Switched to {}: {}", b, out), true))
+                                .unwrap_or_else(|e| (format!("Branch switch failed: {}", e), false))
+                        },
+                        |(msg, ok)| Message::SwitchBranchResult(msg, ok),
+                    )
+                } else {
+                    Task::none()
+                }
             }
             Message::BrowsePath => {
                 // TODO: native file dialog
@@ -647,18 +724,76 @@ impl App {
                 }
 
                 self.sapphire_running = true;
-
+                self.sapphire_log.clear();
+                self.active_tab = Tab::Running;
                 self.log_lines.push("Launching Sapphire...".to_string());
 
                 let path = self.install_path.clone();
-                Task::stream(launch_sapphire_stream(path))
+                let pid = self.sapphire_pid.clone();
+                Task::stream(launch_sapphire_stream(path, pid))
+            }
+            Message::StopSapphire => {
+                // Kill ALL python processes that look like sapphire
+                // taskkill by our PID tree first, then sweep any orphans
+                let pid = self.sapphire_pid.load(Ordering::Relaxed);
+                if pid > 0 {
+                    let _ = Command::new("taskkill")
+                        .args(["/F", "/T", "/PID", &pid.to_string()])
+                        .output();
+                    self.sapphire_pid.store(0, Ordering::Relaxed);
+                }
+                // Also kill any python running main.py or sapphire.py
+                let _ = Command::new("wmic")
+                    .args(["process", "where",
+                        "name='python.exe' and (commandline like '%sapphire.py%' or commandline like '%sapphire\\\\main.py%')",
+                        "call", "terminate"])
+                    .output();
+                self.log_lines.push("Stopped all Sapphire processes.".to_string());
+                Task::none()
+            }
+            Message::OpenBrowser => {
+                let _ = Command::new("cmd")
+                    .args(["/c", "start", "https://localhost:8073"])
+                    .spawn();
+                Task::none()
+            }
+            Message::SwitchBranch => {
+                let path = self.install_path.clone();
+                let git_dir = PathBuf::from(&path).join(".git");
+                if !git_dir.exists() {
+                    self.log_lines.push("No repo found — install first.".to_string());
+                    return Task::none();
+                }
+                let branch = match self.selected_branch {
+                    Some(Branch::Development) => "dev",
+                    _ => "main",
+                };
+                self.log_lines.push(format!("Switching to {} branch...", branch));
+                let b = branch.to_string();
+                Task::perform(
+                    async move {
+                        run_cmd_full_async("git".into(), vec!["-C".into(), path, "checkout".into(), b.clone()]).await
+                            .map(|out| (format!("Switched to {}: {}", b, out), true))
+                            .unwrap_or_else(|e| (format!("Branch switch failed: {}", e), false))
+                    },
+                    |(msg, ok)| Message::SwitchBranchResult(msg, ok),
+                )
+            }
+            Message::SwitchBranchResult(msg, _ok) => {
+                self.log_lines.push(msg);
+                Task::none()
             }
             Message::SapphireLine(line) => {
-                self.log_lines.push(line);
+                self.sapphire_log.push(line);
+                // Cap at 5000 lines to prevent memory bloat
+                if self.sapphire_log.len() > 5000 {
+                    self.sapphire_log.drain(..1000);
+                }
                 Task::none()
             }
             Message::SapphireExited(msg) => {
                 self.sapphire_running = false;
+                self.sapphire_log.push(format!("--- {} ---", msg));
                 self.log_lines.push(msg);
                 Task::none()
             }
@@ -792,6 +927,28 @@ impl App {
                 self.kick_next_install()
             }
 
+            Message::CopyRunLog => {
+                let log_text = self.sapphire_log.join("\n");
+                // Use clip.exe on Windows, xclip on Linux
+                let _ = std::process::Command::new("clip")
+                    .stdin(std::process::Stdio::piped())
+                    .spawn()
+                    .and_then(|mut child| {
+                        use std::io::Write;
+                        if let Some(ref mut stdin) = child.stdin {
+                            stdin.write_all(log_text.as_bytes())?;
+                        }
+                        child.wait()
+                    });
+                self.log_lines.push("Copied sapphire log to clipboard.".to_string());
+                Task::none()
+            }
+            Message::ScrollRunLog => {
+                scrollable::snap_to(
+                    scrollable::Id::new("run-log"),
+                    scrollable::RelativeOffset { x: 0.0, y: 1.0 },
+                )
+            }
             Message::Log(line) => {
                 self.log_lines.push(line);
                 Task::none()
@@ -948,26 +1105,42 @@ impl App {
         )
         .placeholder("Branch...");
 
-        let launch_label = if self.sapphire_running { "Running..." } else { "Launch" };
-        let launch_btn = button(
-            text(launch_label).font(Font {
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            }),
-        )
-        .on_press_maybe(if self.sapphire_running { None } else { Some(Message::Launch) })
-        .style(button::success);
-
-        let header = row![
+        let mut header = row![
             path_input,
             browse_btn,
             horizontal_space(),
             branch_picker,
-            launch_btn,
         ]
         .spacing(8)
         .padding(8)
         .align_y(iced::Alignment::Center);
+
+        if self.sapphire_running {
+            let open_btn = button(text("Open Browser").font(Font {
+                weight: iced::font::Weight::Bold,
+                ..Font::DEFAULT
+            }))
+            .on_press(Message::OpenBrowser)
+            .style(button::primary);
+
+            let stop_btn = button(text("Stop").font(Font {
+                weight: iced::font::Weight::Bold,
+                ..Font::DEFAULT
+            }))
+            .on_press(Message::StopSapphire)
+            .style(button::danger);
+
+            header = header.push(open_btn).push(stop_btn);
+        } else {
+            let launch_btn = button(text("Launch").font(Font {
+                weight: iced::font::Weight::Bold,
+                ..Font::DEFAULT
+            }))
+            .on_press(Message::Launch)
+            .style(button::success);
+
+            header = header.push(launch_btn);
+        }
 
         container(header)
             .width(Length::Fill)
@@ -981,11 +1154,13 @@ impl App {
     // ── Tab bar ────────────────────────────────────────────────────────────
 
     fn view_tab_bar(&self) -> Element<Message> {
+        let running_label = if self.sapphire_running { "Running •" } else { "Running" };
         let tabs = row![
             self.tab_button("Install", Tab::Install),
             self.tab_button("Update", Tab::Update),
             self.tab_button("Uninstall", Tab::Uninstall),
             self.tab_button("Troubleshoot", Tab::Troubleshoot),
+            self.tab_button(running_label, Tab::Running),
         ]
         .spacing(0);
 
@@ -1025,11 +1200,17 @@ impl App {
     // ── Tab content ────────────────────────────────────────────────────────
 
     fn view_tab_content(&self) -> Element<Message> {
+        // Running tab gets its own layout with fixed toolbar + scrollable log
+        if self.active_tab == Tab::Running {
+            return self.view_running_tab();
+        }
+
         let content: Element<Message> = match self.active_tab {
             Tab::Install => self.view_install_tab(),
             Tab::Update => self.view_update_tab(),
             Tab::Uninstall => self.view_uninstall_tab(),
             Tab::Troubleshoot => self.view_troubleshoot_tab(),
+            Tab::Running => unreachable!(),
         };
 
         container(
@@ -1225,6 +1406,64 @@ impl App {
         .into()
     }
 
+    fn view_running_tab(&self) -> Element<Message> {
+        let status_text = if self.sapphire_running {
+            text("Sapphire is running").size(13).color(color!(0x4caf50))
+        } else if self.sapphire_log.is_empty() {
+            text("Hit Launch to start Sapphire.").size(13).color(color!(0x7f849c))
+        } else {
+            text("Sapphire stopped").size(13).color(color!(0x7f849c))
+        };
+
+        let copy_btn = button(text("Copy").size(11))
+            .on_press_maybe(if self.sapphire_log.is_empty() { None } else { Some(Message::CopyRunLog) })
+            .style(button::secondary)
+            .padding([2, 8]);
+
+        let bottom_btn = button(text("↓ Bottom").size(11))
+            .on_press(Message::ScrollRunLog)
+            .style(button::secondary)
+            .padding([2, 8]);
+
+        let toolbar = row![status_text, horizontal_space(), copy_btn, bottom_btn]
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+
+        let log_text = if self.sapphire_log.is_empty() {
+            "Waiting...".to_string()
+        } else {
+            self.sapphire_log.join("\n")
+        };
+
+        let log_scroll = scrollable(
+            container(
+                text(log_text).size(12).font(Font::MONOSPACE),
+            )
+            .width(Length::Fill)
+            .padding(6),
+        )
+        .id(scrollable::Id::new("run-log"))
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        let log_area = container(log_scroll)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(iced::Background::Color(color!(0x11111b))),
+                ..Default::default()
+            });
+
+        // Return the full layout — toolbar is fixed, log scrolls independently
+        container(
+            column![toolbar, log_area].spacing(4)
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(Padding { top: 8.0, right: 12.0, bottom: 4.0, left: 12.0 })
+        .into()
+    }
+
     // ── Log panel ──────────────────────────────────────────────────────────
 
     fn view_log_panel(&self) -> Element<Message> {
@@ -1283,4 +1522,23 @@ fn step_label(step: Step) -> &'static str {
         Step::Deps => "Install dependencies",
         Step::Done => "Done!",
     }
+}
+
+/// Strip ANSI escape sequences from a string
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip until we hit a letter (the terminator of the escape sequence)
+            for c2 in chars.by_ref() {
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
