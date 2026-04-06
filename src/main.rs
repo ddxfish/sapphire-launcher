@@ -32,7 +32,19 @@ fn main() -> iced::Result {
             )
         })
         .window(win_settings)
-        .run()
+        .run_with(|| {
+            let app = App::default();
+            let task = Task::perform(
+                async {
+                    run_cmd_full_async("curl".into(), vec![
+                        "-sk".into(), "--max-time".into(), "3".into(),
+                        "https://localhost:8073/api/health".into(),
+                    ]).await.map(|b| b.contains("ok")).unwrap_or(false)
+                },
+                Message::LaunchPreCheck,
+            );
+            (app, task)
+        })
 }
 
 fn load_window_icon() -> Option<window::Icon> {
@@ -127,6 +139,9 @@ struct App {
     confirm_remove_env: bool,
     confirm_delete_folder: bool,
     confirm_delete_userdata: bool,
+    // Update
+    updating: bool,
+    update_status: Vec<(String, StepStatus)>, // label, status
     // Troubleshoot
     ts_checks: Vec<(TsCheck, TsStatus)>,
     ts_running: bool,
@@ -156,6 +171,11 @@ impl Default for App {
             scanning: false,
             installing: false,
             uninstalling: false,
+            updating: false,
+            update_status: vec![
+                ("Pull latest changes".into(), StepStatus::NotStarted),
+                ("Update dependencies".into(), StepStatus::NotStarted),
+            ],
             ts_checks: vec![
                 (TsCheck::SapphireRunning, TsStatus::NotChecked),
                 (TsCheck::WebUi, TsStatus::NotChecked),
@@ -234,6 +254,10 @@ enum Message {
     UninstallDeleteFolderClick,
     UninstallDeleteUserdataClick,
     UninstallResult(String, bool), // message, success
+    // Update
+    UpdateClicked,
+    UpdateAfterStop,
+    UpdateStepDone(String, bool), // message, success — chains to next step
     // Troubleshoot
     TroubleshootCheck,
     TroubleshootResult(TsCheck, TsStatus),
@@ -834,27 +858,42 @@ impl App {
             }
             Message::BranchSelected(branch) => {
                 self.selected_branch = Some(branch);
-                // Auto-switch branch if repo exists
                 let git_dir = PathBuf::from(&self.install_path).join(".git");
-                if git_dir.exists() && !self.sapphire_running {
-                    let path = self.install_path.clone();
-                    let git_branch = match branch {
-                        Branch::Development => "dev",
-                        Branch::Stable => "main",
-                    };
-                    self.log_lines.push(format!("Switching to {} branch...", git_branch));
-                    let b = git_branch.to_string();
-                    Task::perform(
-                        async move {
-                            run_cmd_full_async("git".into(), vec!["-C".into(), path, "checkout".into(), b.clone()]).await
-                                .map(|out| (format!("Switched to {}: {}", b, out), true))
-                                .unwrap_or_else(|e| (format!("Branch switch failed: {}", e), false))
-                        },
-                        |(msg, ok)| Message::SwitchBranchResult(msg, ok),
-                    )
-                } else {
-                    Task::none()
+                if !git_dir.exists() {
+                    return Task::none();
                 }
+
+                // Stop sapphire if running before switching
+                if self.sapphire_running || self.sapphire_stopping {
+                    self.log_lines.push("Stopping Sapphire for branch switch...".to_string());
+                    self.kill_sapphire_processes();
+                    self.sapphire_stopping = true;
+                }
+
+                let path = self.install_path.clone();
+                let git_branch = match branch {
+                    Branch::Development => "dev",
+                    Branch::Stable => "main",
+                };
+                self.log_lines.push(format!("Switching to {} branch...", git_branch));
+                let b = git_branch.to_string();
+                Task::perform(
+                    async move {
+                        // Wait for sapphire to die if it was running
+                        for _ in 0..20 {
+                            let still_up = run_cmd_full_async("curl".into(), vec![
+                                "-sk".into(), "--max-time".into(), "2".into(),
+                                "https://localhost:8073/api/health".into(),
+                            ]).await.map(|r| r.contains("ok")).unwrap_or(false);
+                            if !still_up { break; }
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        }
+                        run_cmd_full_async("git".into(), vec!["-C".into(), path, "checkout".into(), b.clone()]).await
+                            .map(|out| (format!("Switched to {}: {}", b, out), true))
+                            .unwrap_or_else(|e| (format!("Branch switch failed: {}", e), false))
+                    },
+                    |(msg, ok)| Message::SwitchBranchResult(msg, ok),
+                )
             }
             Message::BrowsePath => {
                 // TODO: native file dialog
@@ -913,32 +952,7 @@ impl App {
             Message::StopSapphire => {
                 self.sapphire_stopping = true;
                 self.log_lines.push("Stopping Sapphire...".to_string());
-
-                // Kill our tracked process tree first
-                let pid = self.sapphire_pid.load(Ordering::Relaxed);
-                if pid > 0 {
-                    let _ = Command::new("taskkill")
-                        .args(["/F", "/T", "/PID", &pid.to_string()])
-                        .output();
-                    self.sapphire_pid.store(0, Ordering::Relaxed);
-                }
-                // Sweep ALL python processes from the sapphire conda env
-                let home = std::env::var("USERPROFILE").unwrap_or_default();
-                let env_path = format!("{}\\miniconda3\\envs\\sapphire", home);
-                if let Ok(output) = Command::new("wmic")
-                    .args(["process", "where", &format!("name='python.exe' and executablepath like '%{}%'", env_path.replace('\\', "\\\\")),
-                        "get", "processid"])
-                    .output()
-                {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    for line in stdout.lines() {
-                        if let Ok(pid) = line.trim().parse::<u32>() {
-                            let _ = Command::new("taskkill")
-                                .args(["/F", "/PID", &pid.to_string()])
-                                .output();
-                        }
-                    }
-                }
+                self.kill_sapphire_processes();
 
                 // Poll until health endpoint stops responding
                 Task::perform(async {
@@ -983,7 +997,113 @@ impl App {
                 )
             }
             Message::SwitchBranchResult(msg, _ok) => {
+                self.sapphire_running = false;
+                self.sapphire_stopping = false;
                 self.log_lines.push(msg);
+                Task::none()
+            }
+
+            // ── Update flow ───────────────────────────────────────────
+            Message::UpdateClicked => {
+                if self.sapphire_running || self.sapphire_stopping {
+                    // Auto-stop sapphire, then update after it's dead
+                    self.log_lines.push("[update] Stopping Sapphire first...".to_string());
+                    self.kill_sapphire_processes();
+                    self.sapphire_stopping = true;
+                    // Poll until dead, then trigger update
+                    return Task::perform(async {
+                        for _ in 0..20 {
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            let still_up = run_cmd_full_async("curl".into(), vec![
+                                "-sk".into(), "--max-time".into(), "2".into(),
+                                "https://localhost:8073/api/health".into(),
+                            ]).await.map(|b| b.contains("ok")).unwrap_or(false);
+                            if !still_up { return; }
+                        }
+                    }, |_| Message::UpdateAfterStop);
+                }
+                let git_dir = PathBuf::from(&self.install_path).join(".git");
+                if !git_dir.exists() {
+                    self.log_lines.push("No repo found — install first.".to_string());
+                    return Task::none();
+                }
+                self.updating = true;
+                // Reset steps
+                for (_, s) in &mut self.update_status {
+                    *s = StepStatus::NotStarted;
+                }
+                // Step 1: git pull
+                self.update_status[0].1 = StepStatus::Installing;
+                self.log_lines.push("[update] Pulling latest changes...".to_string());
+                let path = self.install_path.clone();
+                Task::perform(async move {
+                    match run_cmd_full_async("git".into(), vec!["-C".into(), path, "pull".into()]).await {
+                        Ok(out) => (format!("pull: {}", out.lines().next().unwrap_or(&out)), true),
+                        Err(e) => (format!("pull failed: {}", e), false),
+                    }
+                }, |(msg, ok)| Message::UpdateStepDone(msg, ok))
+            }
+            Message::UpdateAfterStop => {
+                self.sapphire_running = false;
+                self.sapphire_stopping = false;
+                self.log_lines.push("Sapphire stopped. Starting update...".to_string());
+                let git_dir = PathBuf::from(&self.install_path).join(".git");
+                if !git_dir.exists() {
+                    self.log_lines.push("No repo found — install first.".to_string());
+                    return Task::none();
+                }
+                self.updating = true;
+                for (_, s) in &mut self.update_status {
+                    *s = StepStatus::NotStarted;
+                }
+                self.update_status[0].1 = StepStatus::Installing;
+                self.log_lines.push("[update] Pulling latest changes...".to_string());
+                let path = self.install_path.clone();
+                Task::perform(async move {
+                    match run_cmd_full_async("git".into(), vec!["-C".into(), path, "pull".into()]).await {
+                        Ok(out) => (format!("pull: {}", out.lines().next().unwrap_or(&out)), true),
+                        Err(e) => (format!("pull failed: {}", e), false),
+                    }
+                }, |(msg, ok)| Message::UpdateStepDone(msg, ok))
+            }
+            Message::UpdateStepDone(msg, success) => {
+                self.log_lines.push(format!("[update] {}", msg));
+
+                // Figure out which step just finished
+                let current_step = self.update_status.iter().position(|(_, s)| *s == StepStatus::Installing);
+
+                if !success {
+                    if let Some(i) = current_step {
+                        self.update_status[i].1 = StepStatus::Failed(msg);
+                    }
+                    self.updating = false;
+                    self.log_lines.push("[update] Stopped — fix the issue and try again.".to_string());
+                    return Task::none();
+                }
+
+                if let Some(i) = current_step {
+                    self.update_status[i].1 = StepStatus::Done(msg);
+
+                    // Kick next step
+                    if i == 0 {
+                        // Step 2: pip install -r requirements.txt
+                        self.update_status[1].1 = StepStatus::Installing;
+                        self.log_lines.push("[update] Updating dependencies...".to_string());
+                        let (program, mut args) = find_conda_pip();
+                        let req = PathBuf::from(&self.install_path).join("requirements.txt");
+                        args.extend(["install".into(), "-r".into(), req.to_string_lossy().to_string()]);
+                        return Task::perform(async move {
+                            match run_cmd_full_async(program, args).await {
+                                Ok(_) => ("Dependencies updated.".to_string(), true),
+                                Err(e) => (format!("pip install failed: {}", e), false),
+                            }
+                        }, |(msg, ok)| Message::UpdateStepDone(msg, ok));
+                    }
+                }
+
+                // All done
+                self.updating = false;
+                self.log_lines.push("[update] Update complete!".to_string());
                 Task::none()
             }
             Message::SapphireLine(line) => {
@@ -1296,6 +1416,33 @@ impl App {
 
     /// Find the next step that needs installing and fire it off.
     /// Steps that are already Found/Done get skipped.
+    /// Kill all sapphire python processes
+    fn kill_sapphire_processes(&self) {
+        let pid = self.sapphire_pid.load(Ordering::Relaxed);
+        if pid > 0 {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .output();
+            self.sapphire_pid.store(0, Ordering::Relaxed);
+        }
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        let env_path = format!("{}\\miniconda3\\envs\\sapphire", home);
+        if let Ok(output) = Command::new("wmic")
+            .args(["process", "where", &format!("name='python.exe' and executablepath like '%{}%'", env_path.replace('\\', "\\\\")),
+                "get", "processid"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Ok(pid) = line.trim().parse::<u32>() {
+                    let _ = Command::new("taskkill")
+                        .args(["/F", "/PID", &pid.to_string()])
+                        .output();
+                }
+            }
+        }
+    }
+
     fn kick_next_install(&mut self) -> Task<Message> {
         // Find the first NotFound step
         let next = self
@@ -1586,14 +1733,52 @@ impl App {
     }
 
     fn view_update_tab(&self) -> Element<Message> {
+        let mut steps_col = Column::new().spacing(6);
+
+        for (label, status) in &self.update_status {
+            let indicator = text(status.indicator())
+                .size(16)
+                .color(status.color())
+                .width(20);
+
+            let label_text = text(label.as_str()).size(14);
+
+            let mut row_items = row![indicator, label_text].spacing(10).align_y(iced::Alignment::Center);
+
+            if let Some(detail) = status.detail() {
+                row_items = row_items.push(
+                    text(format!("— {}", detail)).size(11).color(color!(0x7f849c)),
+                );
+            }
+
+            steps_col = steps_col.push(row_items);
+        }
+
+        let update_label = if self.updating {
+            "Updating..."
+        } else if self.sapphire_running || self.sapphire_stopping {
+            "Stop & Update"
+        } else {
+            "Update"
+        };
+
+        let update_btn = button(text(update_label))
+            .on_press_maybe(if self.updating || self.sapphire_stopping {
+                None
+            } else {
+                Some(Message::UpdateClicked)
+            })
+            .style(button::primary);
+
         column![
             text("Update Sapphire").size(18).font(Font {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
             }),
-            text("Pull the latest changes and update dependencies.").size(13),
+            steps_col,
+            update_btn,
         ]
-        .spacing(6)
+        .spacing(10)
         .into()
     }
 
