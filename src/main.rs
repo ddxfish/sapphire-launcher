@@ -12,7 +12,7 @@ fn main() -> iced::Result {
     let icon = load_window_icon();
 
     let win_settings = window::Settings {
-        size: iced::Size::new(700.0, 480.0),
+        size: iced::Size::new(700.0, 500.0),
         icon,
         ..Default::default()
     };
@@ -1032,11 +1032,17 @@ impl App {
             Tab::Troubleshoot => self.view_troubleshoot_tab(),
         };
 
-        container(scrollable(content).height(Length::Fill))
-            .width(Length::Fill)
+        container(
+            scrollable(
+                container(content).width(Length::Fill)
+            )
             .height(Length::Fill)
-            .padding(Padding { top: 10.0, right: 16.0, bottom: 6.0, left: 16.0 })
-            .into()
+            .width(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(Padding { top: 10.0, right: 16.0, bottom: 6.0, left: 16.0 })
+        .into()
     }
 
     fn view_install_tab(&self) -> Element<Message> {
@@ -1111,6 +1117,7 @@ impl App {
             buttons_row,
         ]
         .spacing(8)
+        .padding(Padding { top: 0.0, right: 0.0, bottom: 12.0, left: 0.0 })
         .into()
     }
 
