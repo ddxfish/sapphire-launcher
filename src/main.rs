@@ -6,11 +6,18 @@ use iced::{color, Element, Font, Length, Padding, Task, Theme};
 use iced::window;
 use std::path::PathBuf;
 use std::process::Command;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 fn main() -> iced::Result {
     let icon = load_window_icon();
 
-    let mut app = iced::application("Sapphire Launcher", App::update, App::view)
+    let win_settings = window::Settings {
+        size: iced::Size::new(700.0, 480.0),
+        icon,
+        ..Default::default()
+    };
+
+    iced::application("Sapphire Launcher", App::update, App::view)
         .theme(|_| {
             Theme::custom(
                 "Sapphire Dark".to_string(),
@@ -23,16 +30,8 @@ fn main() -> iced::Result {
                 },
             )
         })
-        .window_size((900.0, 650.0));
-
-    if let Some(icon) = icon {
-        app = app.window(window::Settings {
-            icon: Some(icon),
-            ..Default::default()
-        });
-    }
-
-    app.run()
+        .window(win_settings)
+        .run()
 }
 
 fn load_window_icon() -> Option<window::Icon> {
@@ -127,6 +126,8 @@ struct App {
     confirm_remove_env: bool,
     confirm_delete_folder: bool,
     confirm_delete_userdata: bool,
+    // Sapphire process
+    sapphire_running: bool,
 }
 
 impl Default for App {
@@ -139,7 +140,7 @@ impl Default for App {
             install_path: format!("{}\\sapphire", home),
             selected_branch: Some(Branch::Stable),
             active_tab: Tab::default(),
-            log_visible: false,
+            log_visible: true,
             log_lines: vec!["Ready.".to_string()],
             steps: ALL_STEPS
                 .iter()
@@ -151,6 +152,7 @@ impl Default for App {
             confirm_remove_env: false,
             confirm_delete_folder: false,
             confirm_delete_userdata: false,
+            sapphire_running: false,
         }
     }
 }
@@ -197,6 +199,9 @@ enum Message {
     StepResult(Step, StepStatus),
     InstallStepResult(Step, StepStatus, String), // step, status, log output
     Log(String),
+    // Launch
+    SapphireLine(String),   // a line of output from sapphire
+    SapphireExited(String), // process ended
     // Uninstall flow (two-click confirmation)
     UninstallCondaEnvClick,   // first click → confirm, second click → go
     UninstallDeleteFolderClick,
@@ -546,6 +551,68 @@ async fn uninstall_delete_userdata(install_path: String) -> (String, bool) {
     .unwrap_or_else(|e| (format!("Task failed: {}", e), false))
 }
 
+// ── Launch streaming ───────────────────────────────────────────────────────
+
+fn launch_sapphire_stream(install_path: String) -> impl futures::Stream<Item = Message> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+
+    tokio::task::spawn(async move {
+        let mut child = match tokio::process::Command::new("conda")
+            .args(["run", "-n", "sapphire", "python", "-u", "main.py"])
+            .current_dir(&install_path)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = tx.send(Message::SapphireExited(format!("Failed to start: {}", e)));
+                return;
+            }
+        };
+
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let tx_out = tx.clone();
+        let tx_err = tx.clone();
+
+        // Read stdout in one task
+        let stdout_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tx_out.send(Message::SapphireLine(line)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Read stderr in another
+        let stderr_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(stderr).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if tx_err.send(Message::SapphireLine(line)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let _ = stdout_task.await;
+        let _ = stderr_task.await;
+
+        let status = child.wait().await;
+        let msg = match status {
+            Ok(s) if s.success() => "Sapphire exited.".to_string(),
+            Ok(s) if s.code() == Some(42) => "Sapphire is restarting...".to_string(),
+            Ok(s) => format!("Sapphire exited (code {}).", s.code().unwrap_or(-1)),
+            Err(e) => format!("Error: {}", e),
+        };
+        let _ = tx.send(Message::SapphireExited(msg));
+    });
+
+    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+}
+
 // ── Update ─────────────────────────────────────────────────────────────────
 
 impl App {
@@ -564,7 +631,35 @@ impl App {
                 Task::none()
             }
             Message::Launch => {
-                // TODO: launch sapphire
+                if self.sapphire_running {
+                    self.log_lines.push("Sapphire is already running.".to_string());
+                    return Task::none();
+                }
+
+                let main_py = PathBuf::from(&self.install_path).join("main.py");
+                if !main_py.exists() {
+                    self.log_lines.push(format!(
+                        "Can't find {}. Run the installer first.",
+                        main_py.display()
+                    ));
+    
+                    return Task::none();
+                }
+
+                self.sapphire_running = true;
+
+                self.log_lines.push("Launching Sapphire...".to_string());
+
+                let path = self.install_path.clone();
+                Task::stream(launch_sapphire_stream(path))
+            }
+            Message::SapphireLine(line) => {
+                self.log_lines.push(line);
+                Task::none()
+            }
+            Message::SapphireExited(msg) => {
+                self.sapphire_running = false;
+                self.log_lines.push(msg);
                 Task::none()
             }
             Message::TabSelected(tab) => {
@@ -661,7 +756,7 @@ impl App {
 
             Message::GoClicked => {
                 self.installing = true;
-                self.log_visible = true;
+
                 self.log_lines.push("Starting install...".to_string());
 
                 // Find the first step that needs work
@@ -712,7 +807,7 @@ impl App {
                 // Second click — do it
                 self.confirm_remove_env = false;
                 self.uninstalling = true;
-                self.log_visible = true;
+
                 self.log_lines.push("[uninstall] Removing conda environment 'sapphire'...".to_string());
                 Task::perform(uninstall_conda_env(), |(msg, ok)| {
                     Message::UninstallResult(msg, ok)
@@ -726,7 +821,7 @@ impl App {
                 }
                 self.confirm_delete_folder = false;
                 self.uninstalling = true;
-                self.log_visible = true;
+
                 let path = self.install_path.clone();
                 self.log_lines.push(format!("[uninstall] Deleting {}...", path));
                 Task::perform(uninstall_delete_folder(path), |(msg, ok)| {
@@ -741,7 +836,7 @@ impl App {
                 }
                 self.confirm_delete_userdata = false;
                 self.uninstalling = true;
-                self.log_visible = true;
+
                 let path = self.install_path.clone();
                 self.log_lines.push(format!("[uninstall] Deleting {}\\user...", path));
                 Task::perform(uninstall_delete_userdata(path), |(msg, ok)| {
@@ -825,18 +920,16 @@ impl App {
     // ── View ───────────────────────────────────────────────────────────────
 
     fn view(&self) -> Element<Message> {
-        let content = column![
+        column![
             self.view_header(),
             self.view_tab_bar(),
             self.view_tab_content(),
             self.view_log_panel(),
         ]
-        .spacing(0);
-
-        container(content)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        .spacing(0)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
     // ── Header bar ─────────────────────────────────────────────────────────
@@ -855,13 +948,14 @@ impl App {
         )
         .placeholder("Branch...");
 
+        let launch_label = if self.sapphire_running { "Running..." } else { "Launch" };
         let launch_btn = button(
-            text("Launch").font(Font {
+            text(launch_label).font(Font {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
             }),
         )
-        .on_press(Message::Launch)
+        .on_press_maybe(if self.sapphire_running { None } else { Some(Message::Launch) })
         .style(button::success);
 
         let header = row![
@@ -938,10 +1032,10 @@ impl App {
             Tab::Troubleshoot => self.view_troubleshoot_tab(),
         };
 
-        container(content)
+        container(scrollable(content).height(Length::Fill))
             .width(Length::Fill)
             .height(Length::Fill)
-            .padding(Padding { top: 10.0, right: 16.0, bottom: 8.0, left: 16.0 })
+            .padding(Padding { top: 10.0, right: 16.0, bottom: 6.0, left: 16.0 })
             .into()
     }
 
@@ -1129,9 +1223,10 @@ impl App {
     fn view_log_panel(&self) -> Element<Message> {
         let toggle = button(if self.log_visible { "▼ Log" } else { "▶ Log" })
             .on_press(Message::ToggleLog)
-            .style(button::text);
+            .style(button::text)
+            .padding([2, 8]);
 
-        let mut panel = column![toggle].spacing(4).width(Length::Fill);
+        let mut panel = column![toggle].spacing(2).width(Length::Fill);
 
         if self.log_visible {
             let log_text = self.log_lines.join("\n");
@@ -1143,11 +1238,11 @@ impl App {
                             .font(Font::MONOSPACE),
                     )
                     .width(Length::Fill)
-                    .padding(8),
+                    .padding(6),
                 )
                 .anchor_bottom()
-                .height(150)
-                .width(Length::Fill),
+                .width(Length::Fill)
+                .height(100),
             )
             .width(Length::Fill)
             .style(|_theme| container::Style {
@@ -1155,7 +1250,7 @@ impl App {
                 border: iced::Border {
                     color: color!(0x313244),
                     width: 1.0,
-                    radius: 4.into(),
+                    radius: 0.into(),
                 },
                 ..Default::default()
             });
@@ -1164,16 +1259,7 @@ impl App {
 
         container(panel)
             .width(Length::Fill)
-            .padding(Padding {
-                top: 4.0,
-                right: 12.0,
-                bottom: 8.0,
-                left: 12.0,
-            })
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(color!(0x181825))),
-                ..Default::default()
-            })
+            .padding(Padding { top: 8.0, right: 0.0, bottom: 0.0, left: 0.0 })
             .into()
     }
 }
