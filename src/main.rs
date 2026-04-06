@@ -127,8 +127,12 @@ struct App {
     confirm_remove_env: bool,
     confirm_delete_folder: bool,
     confirm_delete_userdata: bool,
+    // Troubleshoot
+    ts_checks: Vec<(TsCheck, TsStatus)>,
+    ts_running: bool,
     // Sapphire process
     sapphire_running: bool,
+    sapphire_stopping: bool,
     sapphire_log: Vec<String>,
     sapphire_pid: Arc<AtomicU32>,
 }
@@ -152,10 +156,18 @@ impl Default for App {
             scanning: false,
             installing: false,
             uninstalling: false,
+            ts_checks: vec![
+                (TsCheck::SapphireRunning, TsStatus::NotChecked),
+                (TsCheck::WebUi, TsStatus::NotChecked),
+                (TsCheck::Starlette, TsStatus::NotChecked),
+                (TsCheck::DepsHealth, TsStatus::NotChecked),
+            ],
+            ts_running: false,
             confirm_remove_env: false,
             confirm_delete_folder: false,
             confirm_delete_userdata: false,
             sapphire_running: false,
+            sapphire_stopping: false,
             sapphire_log: Vec::new(),
             sapphire_pid: Arc::new(AtomicU32::new(0)),
         }
@@ -210,15 +222,41 @@ enum Message {
     InstallStepResult(Step, StepStatus, String), // step, status, log output
     Log(String),
     CopyRunLog,
+    OpenRunLog,
     ScrollRunLog,
     // Launch
+    LaunchPreCheck(bool),   // true = sapphire already running
     SapphireLine(String),   // a line of output from sapphire
     SapphireExited(String), // process ended
+    SapphireStopConfirmed,  // process is actually dead
     // Uninstall flow (two-click confirmation)
     UninstallCondaEnvClick,   // first click → confirm, second click → go
     UninstallDeleteFolderClick,
     UninstallDeleteUserdataClick,
     UninstallResult(String, bool), // message, success
+    // Troubleshoot
+    TroubleshootCheck,
+    TroubleshootResult(TsCheck, TsStatus),
+    TroubleshootFix(TsCheck),
+    TroubleshootFixResult(TsCheck, String, bool),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TsCheck {
+    SapphireRunning,
+    WebUi,
+    Starlette,
+    DepsHealth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TsStatus {
+    NotChecked,
+    Checking,
+    Ok(String),
+    Problem(String),
+    Fixing,
+    Fixed(String),
 }
 
 // ── Async detection logic ──────────────────────────────────────────────────
@@ -563,6 +601,121 @@ async fn uninstall_delete_userdata(install_path: String) -> (String, bool) {
     .unwrap_or_else(|e| (format!("Task failed: {}", e), false))
 }
 
+// ── Troubleshoot checks ────────────────────────────────────────────────────
+
+async fn ts_check_running() -> (TsCheck, TsStatus) {
+    match run_cmd_full_async("curl".into(), vec![
+        "-sk".into(), "--max-time".into(), "5".into(),
+        "https://localhost:8073/api/health".into(),
+    ]).await {
+        Ok(body) if body.contains("ok") => (TsCheck::SapphireRunning, TsStatus::Ok("Sapphire is responding".into())),
+        Ok(_) => (TsCheck::SapphireRunning, TsStatus::Problem("Sapphire responded but health check failed".into())),
+        Err(_) => (TsCheck::SapphireRunning, TsStatus::Problem("Can't reach Sapphire — is it running?".into())),
+    }
+}
+
+async fn ts_check_webui() -> (TsCheck, TsStatus) {
+    match run_cmd_full_async("curl".into(), vec![
+        "-sk".into(), "--max-time".into(), "5".into(),
+        "-o".into(), "NUL".into(),
+        "-w".into(), "%{http_code}".into(),
+        "-L".into(), "https://localhost:8073/".into(),
+    ]).await {
+        Ok(code) => {
+            let code = code.trim().to_string();
+            // curl output may have extra text before the code — grab last 3 chars
+            let status = code.chars().rev().take(3).collect::<String>().chars().rev().collect::<String>();
+            if status == "200" {
+                (TsCheck::WebUi, TsStatus::Ok("Web UI is loading fine".into()))
+            } else if status == "500" {
+                (TsCheck::WebUi, TsStatus::Problem("Web UI returns error 500 — likely a package version issue".into()))
+            } else {
+                (TsCheck::WebUi, TsStatus::Problem(format!("Web UI returned HTTP {}", status)))
+            }
+        }
+        Err(_) => (TsCheck::WebUi, TsStatus::Problem("Can't reach web UI — is Sapphire running?".into())),
+    }
+}
+
+async fn ts_check_starlette() -> (TsCheck, TsStatus) {
+    let (program, mut args) = find_conda_pip();
+    args.extend(["show".into(), "starlette".into()]);
+    match run_cmd_full_async(program, args).await {
+        Ok(output) => {
+            if let Some(ver_line) = output.lines().find(|l| l.starts_with("Version:")) {
+                let ver = ver_line.replace("Version:", "").trim().to_string();
+                if ver == "0.52.1" {
+                    (TsCheck::Starlette, TsStatus::Ok(format!("starlette {} (correct)", ver)))
+                } else {
+                    (TsCheck::Starlette, TsStatus::Problem(format!("starlette {} installed, needs 0.52.1", ver)))
+                }
+            } else {
+                (TsCheck::Starlette, TsStatus::Problem("starlette not installed".into()))
+            }
+        }
+        Err(e) => (TsCheck::Starlette, TsStatus::Problem(format!("Couldn't check: {}", e))),
+    }
+}
+
+async fn ts_check_deps() -> (TsCheck, TsStatus) {
+    let (program, mut args) = find_conda_pip();
+    args.push("check".into());
+    match run_cmd_full_async(program, args).await {
+        Ok(output) if output.contains("No broken requirements") => {
+            (TsCheck::DepsHealth, TsStatus::Ok("All dependencies look good".into()))
+        }
+        Ok(output) => {
+            let problems: Vec<&str> = output.lines().take(5).collect();
+            (TsCheck::DepsHealth, TsStatus::Problem(format!("Broken packages:\n{}", problems.join("\n"))))
+        }
+        Err(e) => {
+            // pip check returns non-zero when deps are broken — that's the actual output
+            if e.contains("has requirement") || e.contains("not installed") {
+                let problems: Vec<&str> = e.lines().take(5).collect();
+                (TsCheck::DepsHealth, TsStatus::Problem(format!("Broken packages:\n{}", problems.join("\n"))))
+            } else {
+                (TsCheck::DepsHealth, TsStatus::Problem(format!("Couldn't check: {}", e)))
+            }
+        }
+    }
+}
+
+/// Find pip in the conda sapphire env directly
+fn find_conda_pip() -> (String, Vec<String>) {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let pip_paths = [
+        format!("{}\\miniconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
+        format!("{}\\Miniconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
+        format!("{}\\anaconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
+    ];
+    for p in &pip_paths {
+        if PathBuf::from(p).exists() {
+            return (p.clone(), vec![]);
+        }
+    }
+    // Fallback to conda run
+    ("conda".into(), vec!["run".into(), "-n".into(), "sapphire".into(), "pip".into()])
+}
+
+async fn ts_fix_starlette() -> (TsCheck, String, bool) {
+    let (program, mut base_args) = find_conda_pip();
+    base_args.extend(["install".into(), "starlette==0.52.1".into()]);
+    match run_cmd_full_async(program, base_args).await {
+        Ok(out) => (TsCheck::Starlette, format!("Fixed! Restart Sapphire to apply."), true),
+        Err(e) => (TsCheck::Starlette, format!("Fix failed: {}", e), false),
+    }
+}
+
+async fn ts_fix_deps(install_path: String) -> (TsCheck, String, bool) {
+    let req = PathBuf::from(&install_path).join("requirements.txt");
+    let (program, mut base_args) = find_conda_pip();
+    base_args.extend(["install".into(), "-r".into(), req.to_string_lossy().to_string()]);
+    match run_cmd_full_async(program, base_args).await {
+        Ok(out) => (TsCheck::DepsHealth, format!("Repaired! Restart Sapphire to apply."), true),
+        Err(e) => (TsCheck::DepsHealth, format!("Repair failed: {}", e), false),
+    }
+}
+
 // ── Launch streaming ───────────────────────────────────────────────────────
 
 fn launch_sapphire_stream(install_path: String, pid_store: Arc<AtomicU32>) -> impl futures::Stream<Item = Message> {
@@ -719,22 +872,49 @@ impl App {
                         "Can't find {}. Run the installer first.",
                         main_py.display()
                     ));
-    
                     return Task::none();
                 }
 
-                self.sapphire_running = true;
-                self.sapphire_log.clear();
-                self.active_tab = Tab::Running;
-                self.log_lines.push("Launching Sapphire...".to_string());
-
-                let path = self.install_path.clone();
-                let pid = self.sapphire_pid.clone();
-                Task::stream(launch_sapphire_stream(path, pid))
+                // Check if sapphire is already running (from a previous session/cmd window)
+                self.log_lines.push("Checking if Sapphire is already running...".to_string());
+                Task::perform(
+                    async {
+                        run_cmd_full_async("curl".into(), vec![
+                            "-sk".into(), "--max-time".into(), "3".into(),
+                            "https://localhost:8073/api/health".into(),
+                        ]).await.map(|b| b.contains("ok")).unwrap_or(false)
+                    },
+                    Message::LaunchPreCheck,
+                )
+            }
+            Message::LaunchPreCheck(already_running) => {
+                if already_running {
+                    // Sapphire is already up — we can't capture its logs but we can show status
+                    self.sapphire_running = true;
+                    self.sapphire_log.clear();
+                    self.sapphire_log.push("Sapphire is already running (started outside this app).".into());
+                    self.sapphire_log.push("".into());
+                    self.sapphire_log.push("No live logs available for this session.".into());
+                    self.sapphire_log.push("To see logs: click Stop, then Launch again.".into());
+                    self.active_tab = Tab::Running;
+                    self.log_lines.push("Sapphire already running.".to_string());
+                    Task::none()
+                } else {
+                    // Not running, launch it
+                    self.sapphire_running = true;
+                    self.sapphire_log.clear();
+                    self.active_tab = Tab::Running;
+                    self.log_lines.push("Launching Sapphire...".to_string());
+                    let path = self.install_path.clone();
+                    let pid = self.sapphire_pid.clone();
+                    Task::stream(launch_sapphire_stream(path, pid))
+                }
             }
             Message::StopSapphire => {
-                // Kill ALL python processes that look like sapphire
-                // taskkill by our PID tree first, then sweep any orphans
+                self.sapphire_stopping = true;
+                self.log_lines.push("Stopping Sapphire...".to_string());
+
+                // Kill our tracked process tree first
                 let pid = self.sapphire_pid.load(Ordering::Relaxed);
                 if pid > 0 {
                     let _ = Command::new("taskkill")
@@ -742,14 +922,37 @@ impl App {
                         .output();
                     self.sapphire_pid.store(0, Ordering::Relaxed);
                 }
-                // Also kill any python running main.py or sapphire.py
-                let _ = Command::new("wmic")
-                    .args(["process", "where",
-                        "name='python.exe' and (commandline like '%sapphire.py%' or commandline like '%sapphire\\\\main.py%')",
-                        "call", "terminate"])
-                    .output();
-                self.log_lines.push("Stopped all Sapphire processes.".to_string());
-                Task::none()
+                // Sweep ALL python processes from the sapphire conda env
+                let home = std::env::var("USERPROFILE").unwrap_or_default();
+                let env_path = format!("{}\\miniconda3\\envs\\sapphire", home);
+                if let Ok(output) = Command::new("wmic")
+                    .args(["process", "where", &format!("name='python.exe' and executablepath like '%{}%'", env_path.replace('\\', "\\\\")),
+                        "get", "processid"])
+                    .output()
+                {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    for line in stdout.lines() {
+                        if let Ok(pid) = line.trim().parse::<u32>() {
+                            let _ = Command::new("taskkill")
+                                .args(["/F", "/PID", &pid.to_string()])
+                                .output();
+                        }
+                    }
+                }
+
+                // Poll until health endpoint stops responding
+                Task::perform(async {
+                    for _ in 0..20 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        let still_up = run_cmd_full_async("curl".into(), vec![
+                            "-sk".into(), "--max-time".into(), "2".into(),
+                            "https://localhost:8073/api/health".into(),
+                        ]).await.map(|b| b.contains("ok")).unwrap_or(false);
+                        if !still_up {
+                            return;
+                        }
+                    }
+                }, |_| Message::SapphireStopConfirmed)
             }
             Message::OpenBrowser => {
                 let _ = Command::new("cmd")
@@ -793,8 +996,15 @@ impl App {
             }
             Message::SapphireExited(msg) => {
                 self.sapphire_running = false;
+                self.sapphire_stopping = false;
                 self.sapphire_log.push(format!("--- {} ---", msg));
                 self.log_lines.push(msg);
+                Task::none()
+            }
+            Message::SapphireStopConfirmed => {
+                self.sapphire_running = false;
+                self.sapphire_stopping = false;
+                self.log_lines.push("Sapphire stopped.".to_string());
                 Task::none()
             }
             Message::TabSelected(tab) => {
@@ -940,7 +1150,18 @@ impl App {
                         }
                         child.wait()
                     });
-                self.log_lines.push("Copied sapphire log to clipboard.".to_string());
+                self.log_lines.push("Copied to clipboard.".to_string());
+                Task::none()
+            }
+            Message::OpenRunLog => {
+                // Write log to temp file and open in Notepad for selection/copying
+                let log_text = self.sapphire_log.join("\n");
+                let log_path = std::env::temp_dir().join("sapphire_log.txt");
+                if std::fs::write(&log_path, &log_text).is_ok() {
+                    let _ = Command::new("notepad").arg(&log_path).spawn();
+                } else {
+                    self.log_lines.push("Couldn't write log file.".to_string());
+                }
                 Task::none()
             }
             Message::ScrollRunLog => {
@@ -1013,6 +1234,60 @@ impl App {
                     }
                 } else {
                     self.log_lines.push("[uninstall] Something went wrong — check the log above.".to_string());
+                }
+                Task::none()
+            }
+
+            // ── Troubleshoot ──────────────────────────────────────────
+            Message::TroubleshootCheck => {
+                self.ts_running = true;
+                for (_, status) in &mut self.ts_checks {
+                    *status = TsStatus::Checking;
+                }
+                self.log_lines.push("[troubleshoot] Running checks...".to_string());
+
+                Task::batch(vec![
+                    Task::perform(ts_check_running(), |(c, s)| Message::TroubleshootResult(c, s)),
+                    Task::perform(ts_check_webui(), |(c, s)| Message::TroubleshootResult(c, s)),
+                    Task::perform(ts_check_starlette(), |(c, s)| Message::TroubleshootResult(c, s)),
+                    Task::perform(ts_check_deps(), |(c, s)| Message::TroubleshootResult(c, s)),
+                ])
+            }
+            Message::TroubleshootResult(check, status) => {
+                if let Some((_, s)) = self.ts_checks.iter_mut().find(|(c, _)| *c == check) {
+                    *s = status;
+                }
+                let still_checking = self.ts_checks.iter().any(|(_, s)| *s == TsStatus::Checking);
+                if !still_checking {
+                    self.ts_running = false;
+                    self.log_lines.push("[troubleshoot] Done.".to_string());
+                }
+                Task::none()
+            }
+            Message::TroubleshootFix(check) => {
+                if let Some((_, s)) = self.ts_checks.iter_mut().find(|(c, _)| *c == check) {
+                    *s = TsStatus::Fixing;
+                }
+                self.log_lines.push(format!("[troubleshoot] Fixing {}...", ts_label(check)));
+                let path = self.install_path.clone();
+                match check {
+                    TsCheck::Starlette => Task::perform(ts_fix_starlette(), |(c, msg, ok)| {
+                        Message::TroubleshootFixResult(c, msg, ok)
+                    }),
+                    TsCheck::DepsHealth => Task::perform(ts_fix_deps(path), |(c, msg, ok)| {
+                        Message::TroubleshootFixResult(c, msg, ok)
+                    }),
+                    _ => Task::none(),
+                }
+            }
+            Message::TroubleshootFixResult(check, msg, success) => {
+                self.log_lines.push(format!("[troubleshoot] {}", msg));
+                if let Some((_, s)) = self.ts_checks.iter_mut().find(|(c, _)| *c == check) {
+                    if success {
+                        *s = TsStatus::Fixed(msg);
+                    } else {
+                        *s = TsStatus::Problem(msg);
+                    }
                 }
                 Task::none()
             }
@@ -1115,7 +1390,15 @@ impl App {
         .padding(8)
         .align_y(iced::Alignment::Center);
 
-        if self.sapphire_running {
+        if self.sapphire_stopping {
+            let stopping_btn = button(text("Stopping...").font(Font {
+                weight: iced::font::Weight::Bold,
+                ..Font::DEFAULT
+            }))
+            .style(button::secondary);
+
+            header = header.push(stopping_btn);
+        } else if self.sapphire_running {
             let open_btn = button(text("Open Browser").font(Font {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
@@ -1395,14 +1678,68 @@ impl App {
     }
 
     fn view_troubleshoot_tab(&self) -> Element<Message> {
+        let mut checks_col = Column::new().spacing(8);
+
+        for (check, status) in &self.ts_checks {
+            let (indicator, color) = match status {
+                TsStatus::NotChecked => ("○", color!(0x585b70)),
+                TsStatus::Checking | TsStatus::Fixing => ("◌", color!(0x3d85c6)),
+                TsStatus::Ok(_) | TsStatus::Fixed(_) => ("●", color!(0x4caf50)),
+                TsStatus::Problem(_) => ("●", color!(0xe74c3c)),
+            };
+
+            let label_text = ts_label(*check);
+            let detail = match status {
+                TsStatus::Ok(s) | TsStatus::Problem(s) | TsStatus::Fixed(s) => Some(s.as_str()),
+                TsStatus::Checking => Some("checking..."),
+                TsStatus::Fixing => Some("fixing..."),
+                TsStatus::NotChecked => None,
+            };
+
+            let mut check_row = row![
+                text(indicator).size(14).color(color).width(18),
+                text(label_text).size(14),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+
+            if let Some(d) = detail {
+                check_row = check_row.push(
+                    text(format!("— {}", d)).size(11).color(color!(0x7f849c))
+                );
+            }
+
+            // Add Fix button for fixable problems
+            let is_fixable = matches!(
+                (check, status),
+                (TsCheck::Starlette, TsStatus::Problem(_)) | (TsCheck::DepsHealth, TsStatus::Problem(_))
+            );
+            if is_fixable {
+                check_row = check_row.push(horizontal_space());
+                check_row = check_row.push(
+                    button(text("Fix").size(11))
+                        .on_press(Message::TroubleshootFix(*check))
+                        .style(button::success)
+                        .padding([2, 10])
+                );
+            }
+
+            checks_col = checks_col.push(check_row);
+        }
+
+        let check_btn = button(text("Check Sapphire"))
+            .on_press_maybe(if self.ts_running { None } else { Some(Message::TroubleshootCheck) })
+            .style(button::primary);
+
         column![
             text("Troubleshoot").size(18).font(Font {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
             }),
-            text("Quick fixes for common issues.").size(13),
+            checks_col,
+            check_btn,
         ]
-        .spacing(6)
+        .spacing(10)
         .into()
     }
 
@@ -1420,12 +1757,17 @@ impl App {
             .style(button::secondary)
             .padding([2, 8]);
 
+        let open_btn = button(text("Open in Notepad").size(11))
+            .on_press_maybe(if self.sapphire_log.is_empty() { None } else { Some(Message::OpenRunLog) })
+            .style(button::secondary)
+            .padding([2, 8]);
+
         let bottom_btn = button(text("↓ Bottom").size(11))
             .on_press(Message::ScrollRunLog)
             .style(button::secondary)
             .padding([2, 8]);
 
-        let toolbar = row![status_text, horizontal_space(), copy_btn, bottom_btn]
+        let toolbar = row![status_text, horizontal_space(), copy_btn, open_btn, bottom_btn]
             .spacing(6)
             .align_y(iced::Alignment::Center);
 
@@ -1525,6 +1867,15 @@ fn step_label(step: Step) -> &'static str {
 }
 
 /// Strip ANSI escape sequences from a string
+fn ts_label(check: TsCheck) -> &'static str {
+    match check {
+        TsCheck::SapphireRunning => "Sapphire responding",
+        TsCheck::WebUi => "Web UI loading",
+        TsCheck::Starlette => "Starlette version",
+        TsCheck::DepsHealth => "Package health",
+    }
+}
+
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
