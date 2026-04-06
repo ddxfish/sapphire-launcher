@@ -4,7 +4,7 @@ use iced::widget::{
     button, column, container, horizontal_space, pick_list, row, scrollable, text,
     text_input, Column,
 };
-use iced::{color, Element, Font, Length, Padding, Task, Theme};
+use iced::{color, Element, Font, Length, Padding, Subscription, Task, Theme};
 use iced::window;
 use std::path::PathBuf;
 use std::process::Command;
@@ -24,30 +24,40 @@ fn load_config() -> (String, Branch) {
         .or_else(|_| std::env::var("HOME"))
         .unwrap_or_else(|_| "C:\\".to_string());
     let default_path = format!("{}\\sapphire", home);
-    let default_branch = Branch::Stable;
 
     let path = config_path();
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(_) => return (default_path, default_branch),
+    let install_path = match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            content
+                .split("\"install_path\"")
+                .nth(1)
+                .and_then(|s| s.split('"').nth(1))
+                .map(|s| s.replace("\\\\", "\\"))
+                .unwrap_or(default_path)
+        }
+        Err(_) => default_path,
     };
 
-    // Minimal JSON parsing — no serde dependency needed for two fields
-    let install_path = content
-        .split("\"install_path\"")
-        .nth(1)
-        .and_then(|s| s.split('"').nth(1))
-        .map(|s| s.replace("\\\\", "\\"))
-        .unwrap_or(default_path);
-
-    let branch = content
-        .split("\"branch\"")
-        .nth(1)
-        .and_then(|s| s.split('"').nth(1))
-        .map(|s| if s == "Development" { Branch::Development } else { Branch::Stable })
-        .unwrap_or(default_branch);
+    // Detect actual branch from the repo instead of trusting config
+    let branch = detect_git_branch(&install_path);
 
     (install_path, branch)
+}
+
+fn detect_git_branch(install_path: &str) -> Branch {
+    let git_dir = PathBuf::from(install_path).join(".git");
+    if !git_dir.exists() {
+        return Branch::Stable;
+    }
+    let mut cmd = hidden_cmd(&find_git());
+    cmd.args(["-C", install_path, "rev-parse", "--abbrev-ref", "HEAD"]);
+    match cmd.output() {
+        Ok(out) if out.status.success() => {
+            let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if branch == "dev" { Branch::Development } else { Branch::Stable }
+        }
+        _ => Branch::Stable,
+    }
 }
 
 fn save_config(install_path: &str, branch: Branch) {
@@ -89,6 +99,7 @@ fn main() -> iced::Result {
                 },
             )
         })
+        .subscription(App::subscription)
         .window(win_settings)
         .run_with(|| {
             let app = App::default();
@@ -110,6 +121,8 @@ fn main() -> iced::Result {
                     check_for_updates(path, branch),
                     Message::UpdatesAvailable,
                 ),
+                // Auto-scan install status
+                Task::done(Message::ScanClicked),
             ]);
             (app, task)
         })
@@ -158,15 +171,15 @@ enum StepStatus {
 }
 
 impl StepStatus {
-    fn indicator(&self) -> &str {
+    fn indicator(&self, tick: usize) -> &str {
+        const SPINNER: &[&str] = &["/", "-", "\\", "|"];
         match self {
-            StepStatus::NotStarted => "○",
-            StepStatus::Checking => "◌",
-            StepStatus::Found(_) => "●",
-            StepStatus::NotFound(_) => "◎",
-            StepStatus::Installing => "◌",
-            StepStatus::Done(_) => "●",
-            StepStatus::Failed(_) => "✕",
+            StepStatus::NotStarted => "-",
+            StepStatus::Checking | StepStatus::Installing => SPINNER[tick % SPINNER.len()],
+            StepStatus::Found(_) => "+",
+            StepStatus::NotFound(_) => "?",
+            StepStatus::Done(_) => "+",
+            StepStatus::Failed(_) => "x",
         }
     }
 
@@ -215,6 +228,8 @@ struct App {
     // Troubleshoot
     ts_checks: Vec<(TsCheck, TsStatus)>,
     ts_running: bool,
+    // Animation
+    spinner_tick: usize,
     // Sapphire process
     sapphire_running: bool,
     sapphire_stopping: bool,
@@ -239,6 +254,7 @@ impl Default for App {
             scanning: false,
             installing: false,
             uninstalling: false,
+            spinner_tick: 0,
             updates_available: None,
             checking_updates: false,
             updating: false,
@@ -252,6 +268,7 @@ impl Default for App {
                 (TsCheck::Starlette, TsStatus::NotChecked),
                 (TsCheck::DepsHealth, TsStatus::NotChecked),
                 (TsCheck::Plugins, TsStatus::NotChecked),
+                (TsCheck::Gpu, TsStatus::NotChecked),
             ],
             ts_running: false,
             confirm_remove_env: false,
@@ -296,6 +313,7 @@ const BRANCHES: &[Branch] = &[Branch::Stable, Branch::Development];
 
 #[derive(Debug, Clone)]
 enum Message {
+    Tick,
     PathChanged(String),
     BranchSelected(Branch),
     BrowsePath,
@@ -348,6 +366,7 @@ enum TsCheck {
     Starlette,
     DepsHealth,
     Plugins,
+    Gpu,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,7 +424,7 @@ async fn run_cmd_async(program: String, args: Vec<String>) -> Result<String, Str
 
 // These return (Step, StepStatus) after checking the system
 async fn check_git() -> (Step, StepStatus) {
-    match run_cmd_async("git".into(), vec!["--version".into()]).await {
+    match run_cmd_async(find_git(), vec!["--version".into()]).await {
         Ok(ver) => (Step::Git, StepStatus::Found(ver)),
         Err(_) => (
             Step::Git,
@@ -415,7 +434,7 @@ async fn check_git() -> (Step, StepStatus) {
 }
 
 async fn check_conda() -> (Step, StepStatus) {
-    match run_cmd_async("conda".into(), vec!["--version".into()]).await {
+    match run_cmd_async(find_conda(), vec!["--version".into()]).await {
         Ok(ver) => (Step::Conda, StepStatus::Found(ver)),
         Err(_) => {
             let home = std::env::var("USERPROFILE").unwrap_or_default();
@@ -442,7 +461,7 @@ async fn check_conda() -> (Step, StepStatus) {
 }
 
 async fn check_conda_init() -> (Step, StepStatus) {
-    match run_cmd_async("conda".into(), vec!["info".into(), "--json".into()]).await {
+    match run_cmd_async(find_conda(), vec!["info".into(), "--json".into()]).await {
         Ok(_) => (
             Step::CondaInit,
             StepStatus::Found("Conda is initialized".to_string()),
@@ -455,7 +474,7 @@ async fn check_conda_init() -> (Step, StepStatus) {
 }
 
 async fn check_python_env() -> (Step, StepStatus) {
-    match run_cmd_async("conda".into(), vec!["env".into(), "list".into()]).await {
+    match run_cmd_async(find_conda(), vec!["env".into(), "list".into()]).await {
         Ok(output) => {
             if output.lines().any(|l| l.starts_with("sapphire ") || l.starts_with("sapphire\t")) {
                 (
@@ -570,14 +589,18 @@ async fn install_conda() -> (Step, StepStatus, String) {
 }
 
 async fn install_conda_init() -> (Step, StepStatus, String) {
-    match run_cmd_full_async("conda".into(), vec!["init".into()]).await {
+    // Accept Anaconda ToS automatically (required since mid-2025)
+    let conda = find_conda();
+    let _ = run_cmd_full_async(conda.clone(), vec!["tos".into(), "accept".into()]).await;
+
+    match run_cmd_full_async(conda, vec!["init".into()]).await {
         Ok(out) => (Step::CondaInit, StepStatus::Done("Conda initialized".to_string()), out),
         Err(e) => (Step::CondaInit, StepStatus::Failed(format!("Conda init had a problem: {}", e)), e),
     }
 }
 
 async fn install_python_env() -> (Step, StepStatus, String) {
-    match run_cmd_full_async("conda".into(), vec!["create".into(), "-n".into(), "sapphire".into(), "python=3.11".into(), "-y".into()]).await {
+    match run_cmd_full_async(find_conda(), vec!["create".into(), "-n".into(), "sapphire".into(), "python=3.11".into(), "-y".into()]).await {
         Ok(out) => (Step::PythonEnv, StepStatus::Done("Python 3.11 environment 'sapphire' created".to_string()), out),
         Err(e) => {
             if e.contains("already exists") {
@@ -617,7 +640,7 @@ async fn install_clone(install_path: String, branch: String) -> (Step, StepStatu
 
     // If already a repo, just make sure we're on the right branch
     if repo_path.join(".git").exists() {
-        let _ = run_cmd_full_async("git".into(), vec!["-C".into(), install_path.clone(), "checkout".into(), git_branch.to_string()]).await;
+        let _ = run_cmd_full_async(find_git(), vec!["-C".into(), install_path.clone(), "checkout".into(), git_branch.to_string()]).await;
         return (
             Step::Clone,
             StepStatus::Done(format!("Repo exists, switched to {} branch", git_branch)),
@@ -626,7 +649,7 @@ async fn install_clone(install_path: String, branch: String) -> (Step, StepStatu
     }
 
     match run_cmd_full_async(
-        "git".into(),
+        find_git(),
         vec![
             "clone".into(),
             "--branch".into(),
@@ -659,20 +682,11 @@ async fn install_deps(install_path: String) -> (Step, StepStatus, String) {
         );
     }
 
-    // We need to run pip inside the conda env.
-    // Use conda run to execute pip in the sapphire environment.
-    match run_cmd_full_async(
-        "conda".into(),
-        vec![
-            "run".into(),
-            "-n".into(),
-            "sapphire".into(),
-            "pip".into(),
-            "install".into(),
-            "-r".into(),
-            req_file.to_string_lossy().to_string(),
-        ],
-    ).await {
+    // Run pip inside the conda env — use find_conda_pip for direct path,
+    // which is more reliable than conda run on fresh installs
+    let (program, mut base_args) = find_conda_pip();
+    base_args.extend(["install".into(), "-r".into(), req_file.to_string_lossy().to_string()]);
+    match run_cmd_full_async(program, base_args).await {
         Ok(out) => (
             Step::Deps,
             StepStatus::Done("Dependencies installed".to_string()),
@@ -689,7 +703,7 @@ async fn install_deps(install_path: String) -> (Step, StepStatus, String) {
 // ── Async uninstall logic ───────────────────────────────────────────────────
 
 async fn uninstall_conda_env() -> (String, bool) {
-    match run_cmd_full_async("conda".into(), vec!["remove".into(), "-n".into(), "sapphire".into(), "--all".into(), "-y".into()]).await {
+    match run_cmd_full_async(find_conda(), vec!["remove".into(), "-n".into(), "sapphire".into(), "--all".into(), "-y".into()]).await {
         Ok(out) => (format!("Removed conda environment 'sapphire'.\n{}", out), true),
         Err(e) => {
             if e.contains("does not exist") || e.contains("not found") {
@@ -745,12 +759,12 @@ async fn check_for_updates(install_path: String, branch: Branch) -> Option<u32> 
     };
 
     // Fetch latest from remote
-    let _ = run_cmd_full_async("git".into(), vec![
+    let _ = run_cmd_full_async(find_git(), vec![
         "-C".into(), install_path.clone(), "fetch".into(), "origin".into(),
     ]).await;
 
     // Count commits behind
-    match run_cmd_full_async("git".into(), vec![
+    match run_cmd_full_async(find_git(), vec![
         "-C".into(), install_path,
         "rev-list".into(), "--count".into(),
         format!("HEAD..origin/{}", git_branch),
@@ -758,6 +772,46 @@ async fn check_for_updates(install_path: String, branch: Branch) -> Option<u32> 
         Ok(count) => count.trim().parse::<u32>().ok(),
         Err(_) => None,
     }
+}
+
+// ── Update helpers ─────────────────────────────────────────────────────────
+
+async fn git_stash_and_pull(install_path: String) -> (String, bool) {
+    // Check for local changes
+    let dirty = match run_cmd_full_async(find_git(), vec![
+        "-C".into(), install_path.clone(), "status".into(), "--porcelain".into(),
+    ]).await {
+        Ok(out) => !out.trim().is_empty(),
+        Err(_) => false,
+    };
+
+    if dirty {
+        // Stash local changes
+        match run_cmd_full_async(find_git(), vec![
+            "-C".into(), install_path.clone(), "stash".into(), "push".into(),
+            "-m".into(), "sapphire-launcher auto-stash before update".into(),
+        ]).await {
+            Ok(_) => {}
+            Err(e) => return (format!("Couldn't stash local changes: {}", e), false),
+        }
+    }
+
+    // Pull
+    let result = match run_cmd_full_async(find_git(), vec![
+        "-C".into(), install_path.clone(), "pull".into(),
+    ]).await {
+        Ok(out) => {
+            let summary = out.lines().next().unwrap_or(&out).to_string();
+            if dirty {
+                (format!("pull: {} (your local changes were stashed — run 'git stash pop' to restore)", summary), true)
+            } else {
+                (format!("pull: {}", summary), true)
+            }
+        }
+        Err(e) => (format!("pull failed: {}", e), false),
+    };
+
+    result
 }
 
 // ── Troubleshoot checks ────────────────────────────────────────────────────
@@ -840,6 +894,57 @@ async fn ts_check_deps() -> (TsCheck, TsStatus) {
 }
 
 /// Find pip in the conda sapphire env directly
+/// Find git executable on disk
+fn find_git() -> String {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let common_paths = [
+        "C:\\Program Files\\Git\\cmd\\git.exe".to_string(),
+        "C:\\Program Files (x86)\\Git\\cmd\\git.exe".to_string(),
+        "C:\\Program Files\\Git\\bin\\git.exe".to_string(),
+        format!("{}\\AppData\\Local\\Programs\\Git\\cmd\\git.exe", home),
+        format!("{}\\scoop\\shims\\git.exe", home),
+        format!("{}\\AppData\\Local\\GitHubDesktop\\app\\resources\\app\\git\\cmd\\git.exe", home),
+    ];
+    for p in &common_paths {
+        if PathBuf::from(p).exists() {
+            return p.clone();
+        }
+    }
+    // Try refreshing PATH from registry and searching there
+    if let Ok(output) = hidden_cmd("cmd")
+        .args(["/c", "where", "git"])
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout);
+            if let Some(first_line) = path.lines().next() {
+                let p = first_line.trim();
+                if !p.is_empty() && PathBuf::from(p).exists() {
+                    return p.to_string();
+                }
+            }
+        }
+    }
+    "git".into() // final fallback
+}
+
+/// Find conda executable on disk
+fn find_conda() -> String {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let conda_paths = [
+        format!("{}\\miniconda3\\Scripts\\conda.exe", home),
+        format!("{}\\Miniconda3\\Scripts\\conda.exe", home),
+        format!("{}\\anaconda3\\Scripts\\conda.exe", home),
+        format!("{}\\Anaconda3\\Scripts\\conda.exe", home),
+    ];
+    for p in &conda_paths {
+        if PathBuf::from(p).exists() {
+            return p.clone();
+        }
+    }
+    "conda".into() // fallback to PATH
+}
+
 fn find_conda_pip() -> (String, Vec<String>) {
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     let pip_paths = [
@@ -853,7 +958,7 @@ fn find_conda_pip() -> (String, Vec<String>) {
         }
     }
     // Fallback to conda run
-    ("conda".into(), vec!["run".into(), "-n".into(), "sapphire".into(), "pip".into()])
+    (find_conda(), vec!["run".into(), "-n".into(), "sapphire".into(), "pip".into()])
 }
 
 async fn ts_fix_starlette() -> (TsCheck, String, bool) {
@@ -872,6 +977,23 @@ async fn ts_fix_deps(install_path: String) -> (TsCheck, String, bool) {
     match run_cmd_full_async(program, base_args).await {
         Ok(out) => (TsCheck::DepsHealth, format!("Repaired! Restart Sapphire to apply."), true),
         Err(e) => (TsCheck::DepsHealth, format!("Repair failed: {}", e), false),
+    }
+}
+
+async fn ts_check_gpu() -> (TsCheck, TsStatus) {
+    match run_cmd_async("nvidia-smi".into(), vec![
+        "--query-gpu=name,memory.total".into(), "--format=csv,noheader,nounits".into(),
+    ]).await {
+        Ok(output) => {
+            let info = output.trim().to_string();
+            if let Some((name, mem)) = info.split_once(',') {
+                let mem_gb = mem.trim().parse::<f64>().unwrap_or(0.0) / 1024.0;
+                (TsCheck::Gpu, TsStatus::Ok(format!("{} ({:.0} GB) — voice features will use GPU", name.trim(), mem_gb)))
+            } else {
+                (TsCheck::Gpu, TsStatus::Ok(format!("NVIDIA GPU found: {}", info)))
+            }
+        }
+        Err(_) => (TsCheck::Gpu, TsStatus::Ok("No NVIDIA GPU found — voice features will use CPU (still works, just slower)".into())),
     }
 }
 
@@ -1084,6 +1206,10 @@ fn launch_sapphire_stream(install_path: String, pid_store: Arc<AtomicU32>) -> im
 impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::Tick => {
+                self.spinner_tick = self.spinner_tick.wrapping_add(1);
+                Task::none()
+            }
             Message::PathChanged(path) => {
                 if !path.is_empty() {
                     self.install_path = path;
@@ -1124,7 +1250,7 @@ impl App {
                             if !still_up { break; }
                             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                         }
-                        run_cmd_full_async("git".into(), vec!["-C".into(), path, "checkout".into(), b.clone()]).await
+                        run_cmd_full_async(find_git(), vec!["-C".into(), path, "checkout".into(), b.clone()]).await
                             .map(|out| (format!("Switched to {}: {}", b, out), true))
                             .unwrap_or_else(|e| (format!("Branch switch failed: {}", e), false))
                     },
@@ -1186,8 +1312,8 @@ impl App {
                         self.active_tab = Tab::Running;
                     }
                     Task::none()
-                } else {
-                    // Not running, launch it
+                } else if user_initiated {
+                    // Not running, user clicked Launch — start it
                     self.sapphire_running = true;
                     self.sapphire_log.clear();
                     self.active_tab = Tab::Running;
@@ -1195,6 +1321,9 @@ impl App {
                     let path = self.install_path.clone();
                     let pid = self.sapphire_pid.clone();
                     Task::stream(launch_sapphire_stream(path, pid))
+                } else {
+                    // Startup check — not running, nothing to do
+                    Task::none()
                 }
             }
             Message::StopSapphire => {
@@ -1237,7 +1366,7 @@ impl App {
                 let b = branch.to_string();
                 Task::perform(
                     async move {
-                        run_cmd_full_async("git".into(), vec!["-C".into(), path, "checkout".into(), b.clone()]).await
+                        run_cmd_full_async(find_git(), vec!["-C".into(), path, "checkout".into(), b.clone()]).await
                             .map(|out| (format!("Switched to {}: {}", b, out), true))
                             .unwrap_or_else(|e| (format!("Branch switch failed: {}", e), false))
                     },
@@ -1300,12 +1429,7 @@ impl App {
                 self.update_status[0].1 = StepStatus::Installing;
                 self.log_lines.push("[update] Pulling latest changes...".to_string());
                 let path = self.install_path.clone();
-                Task::perform(async move {
-                    match run_cmd_full_async("git".into(), vec!["-C".into(), path, "pull".into()]).await {
-                        Ok(out) => (format!("pull: {}", out.lines().next().unwrap_or(&out)), true),
-                        Err(e) => (format!("pull failed: {}", e), false),
-                    }
-                }, |(msg, ok)| Message::UpdateStepDone(msg, ok))
+                Task::perform(git_stash_and_pull(path), |(msg, ok)| Message::UpdateStepDone(msg, ok))
             }
             Message::UpdateAfterStop => {
                 self.sapphire_running = false;
@@ -1324,12 +1448,7 @@ impl App {
                 self.update_status[0].1 = StepStatus::Installing;
                 self.log_lines.push("[update] Pulling latest changes...".to_string());
                 let path = self.install_path.clone();
-                Task::perform(async move {
-                    match run_cmd_full_async("git".into(), vec!["-C".into(), path, "pull".into()]).await {
-                        Ok(out) => (format!("pull: {}", out.lines().next().unwrap_or(&out)), true),
-                        Err(e) => (format!("pull failed: {}", e), false),
-                    }
-                }, |(msg, ok)| Message::UpdateStepDone(msg, ok))
+                Task::perform(git_stash_and_pull(path), |(msg, ok)| Message::UpdateStepDone(msg, ok))
             }
             Message::UpdateStepDone(msg, success) => {
                 self.log_lines.push(format!("[update] {}", msg));
@@ -1676,6 +1795,7 @@ impl App {
                     Task::perform(ts_check_starlette(), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_deps(), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_plugins(path), |(c, s)| Message::TroubleshootResult(c, s)),
+                    Task::perform(ts_check_gpu(), |(c, s)| Message::TroubleshootResult(c, s)),
                 ])
             }
             Message::TroubleshootResult(check, status) => {
@@ -1800,6 +1920,18 @@ impl App {
         }
     }
 
+    fn subscription(&self) -> Subscription<Message> {
+        // Only tick when something is animating
+        let anything_busy = self.scanning || self.installing || self.updating
+            || self.uninstalling || self.ts_running || self.checking_updates
+            || self.sapphire_stopping;
+        if anything_busy {
+            iced::time::every(std::time::Duration::from_millis(200)).map(|_| Message::Tick)
+        } else {
+            Subscription::none()
+        }
+    }
+
     // ── View ───────────────────────────────────────────────────────────────
 
     fn view(&self) -> Element<Message> {
@@ -1901,7 +2033,7 @@ impl App {
     // ── Tab bar ────────────────────────────────────────────────────────────
 
     fn view_tab_bar(&self) -> Element<Message> {
-        let running_label = if self.sapphire_running { "Running •" } else { "Running" };
+        let running_label = if self.sapphire_running { "Log •" } else { "Log" };
         let tabs = row![
             self.tab_button("Install", Tab::Install),
             self.tab_button("Update", Tab::Update),
@@ -1977,7 +2109,7 @@ impl App {
         let mut steps_col = Column::new().spacing(6);
 
         for (step, status) in &self.steps {
-            let indicator = text(status.indicator())
+            let indicator = text(status.indicator(self.spinner_tick))
                 .size(16)
                 .color(status.color())
                 .width(20);
@@ -2053,7 +2185,7 @@ impl App {
         let mut steps_col = Column::new().spacing(6);
 
         for (label, status) in &self.update_status {
-            let indicator = text(status.indicator())
+            let indicator = text(status.indicator(self.spinner_tick))
                 .size(16)
                 .color(status.color())
                 .width(20);
@@ -2218,11 +2350,12 @@ impl App {
         let mut checks_col = Column::new().spacing(8);
 
         for (check, status) in &self.ts_checks {
+            const SPINNER: &[&str] = &["/", "-", "\\", "|"];
             let (indicator, color) = match status {
-                TsStatus::NotChecked => ("○", color!(0x585b70)),
-                TsStatus::Checking | TsStatus::Fixing => ("◌", color!(0x3d85c6)),
-                TsStatus::Ok(_) | TsStatus::Fixed(_) => ("●", color!(0x4caf50)),
-                TsStatus::Problem(_) => ("●", color!(0xe74c3c)),
+                TsStatus::NotChecked => ("-", color!(0x585b70)),
+                TsStatus::Checking | TsStatus::Fixing => (SPINNER[self.spinner_tick % SPINNER.len()], color!(0x3d85c6)),
+                TsStatus::Ok(_) | TsStatus::Fixed(_) => ("+", color!(0x4caf50)),
+                TsStatus::Problem(_) => ("!", color!(0xe74c3c)),
             };
 
             let label_text = ts_label(*check);
@@ -2272,12 +2405,15 @@ impl App {
             .style(button::primary);
 
         column![
-            text("Troubleshoot").size(18).font(Font {
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            }),
+            row![
+                text("Troubleshoot").size(18).font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::DEFAULT
+                }),
+                horizontal_space(),
+                check_btn,
+            ].align_y(iced::Alignment::Center),
             checks_col,
-            check_btn,
         ]
         .spacing(10)
         .into()
@@ -2414,6 +2550,7 @@ fn ts_label(check: TsCheck) -> &'static str {
         TsCheck::Starlette => "Starlette version",
         TsCheck::DepsHealth => "Package health",
         TsCheck::Plugins => "Optional features",
+        TsCheck::Gpu => "GPU",
     }
 }
 
