@@ -4,6 +4,9 @@ A Windows GUI installer and manager for [Sapphire](https://github.com/ddxfish/sa
 
 Sapphire Launcher handles everything so you don't have to touch a terminal. One exe, double-click, done.
 
+<img width="869" height="657" alt="image" src="https://github.com/user-attachments/assets/406e8a2f-8364-4038-bea1-a8c0c390ff29" />
+
+
 ## What it does
 
 - **Install** — Automatically installs Git, Miniconda, creates a Python environment, clones Sapphire, and installs all dependencies. Just click Go.
