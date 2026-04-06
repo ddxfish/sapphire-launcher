@@ -250,6 +250,9 @@ enum Message {
     SapphireExited(String), // process ended
     SapphireStopConfirmed,  // process is actually dead
     // Uninstall flow (two-click confirmation)
+    ResetPassword,
+    ResetCredentials,
+    ResetResult(String),
     UninstallCondaEnvClick,   // first click → confirm, second click → go
     UninstallDeleteFolderClick,
     UninstallDeleteUserdataClick,
@@ -1295,6 +1298,39 @@ impl App {
                 Task::none()
             }
 
+            // ── Resets ─────────────────────────────────────────────────
+            Message::ResetPassword => {
+                let key_path = PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
+                    .join("Sapphire").join("secret_key");
+                let msg = if key_path.exists() {
+                    match std::fs::remove_file(&key_path) {
+                        Ok(()) => "Password reset. Sapphire will ask for a new password on next launch.".into(),
+                        Err(e) => format!("Couldn't delete {}: {}", key_path.display(), e),
+                    }
+                } else {
+                    "No password file found — nothing to reset.".into()
+                };
+                self.log_lines.push(msg.clone());
+                Task::done(Message::ResetResult(msg))
+            }
+            Message::ResetCredentials => {
+                let cred_path = PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
+                    .join("Sapphire").join("credentials.json");
+                let msg = if cred_path.exists() {
+                    match std::fs::remove_file(&cred_path) {
+                        Ok(()) => "API keys cleared. You'll need to re-enter them in Sapphire.".into(),
+                        Err(e) => format!("Couldn't delete {}: {}", cred_path.display(), e),
+                    }
+                } else {
+                    "No credentials file found — nothing to reset.".into()
+                };
+                self.log_lines.push(msg.clone());
+                Task::done(Message::ResetResult(msg))
+            }
+            Message::ResetResult(_msg) => {
+                Task::none()
+            }
+
             // ── Uninstall flow (two-click confirmation) ─────────────
             Message::UninstallCondaEnvClick => {
                 if !self.confirm_remove_env {
@@ -1785,80 +1821,106 @@ impl App {
     fn view_uninstall_tab(&self) -> Element<Message> {
         let busy = self.uninstalling;
 
-        // ── Remove conda env ──
-        let env_label = if self.confirm_remove_env {
-            "YES, remove the conda environment"
-        } else {
-            "Remove conda environment"
-        };
-        let remove_env_btn = button(text(env_label))
-            .on_press_maybe(if busy { None } else { Some(Message::UninstallCondaEnvClick) })
-            .style(button::danger);
+        // ═══════════════════════════════════════════════════════════
+        // Quick Resets — safe, non-destructive to the install
+        // ═══════════════════════════════════════════════════════════
 
-        let env_warning = if self.confirm_remove_env {
-            text("Click again to confirm. This deletes all Python packages in the 'sapphire' env.")
-                .size(12)
-                .color(color!(0xe74c3c))
-        } else {
-            text("Removes the 'sapphire' Python environment and all its packages.")
-                .size(12)
-                .color(color!(0x7f849c))
-        };
+        let reset_pw_btn = button(text("Reset Password").size(13))
+            .on_press(Message::ResetPassword)
+            .style(button::primary)
+            .padding([4, 12]);
 
-        // ── Delete user data ──
-        let userdata_label = if self.confirm_delete_userdata {
-            "YES, delete my settings and user data"
-        } else {
-            "Reset user data"
-        };
-        let delete_userdata_btn = button(text(userdata_label))
-            .on_press_maybe(if busy { None } else { Some(Message::UninstallDeleteUserdataClick) })
-            .style(button::danger);
+        let reset_creds_btn = button(text("Reset API Keys").size(13))
+            .on_press(Message::ResetCredentials)
+            .style(button::primary)
+            .padding([4, 12]);
 
-        let userdata_warning = if self.confirm_delete_userdata {
-            text("Click again to confirm. Your settings, API keys, and personal data will be permanently deleted.")
-                .size(12)
-                .color(color!(0xe74c3c))
-        } else {
-            text("Deletes your user/ folder — settings, API keys, and personal data. Sapphire itself stays installed.")
-                .size(12)
-                .color(color!(0x7f849c))
-        };
-
-        // ── Delete entire folder ──
-        let folder_label = if self.confirm_delete_folder {
-            format!("YES, permanently delete {}", self.install_path)
-        } else {
-            format!("Delete entire Sapphire folder")
-        };
-        let delete_folder_btn = button(text(folder_label))
-            .on_press_maybe(if busy { None } else { Some(Message::UninstallDeleteFolderClick) })
-            .style(button::danger);
-
-        let folder_warning = if self.confirm_delete_folder {
-            text("FINAL WARNING: Click again to permanently delete everything. This cannot be undone.")
-                .size(12)
-                .color(color!(0xe74c3c))
-        } else {
-            text(format!("Nukes {} and everything in it. Code, settings, all of it. Cannot be undone.", self.install_path))
-                .size(12)
-                .color(color!(0xe74c3c))
-        };
-
-        column![
-            text("Uninstall").size(18).font(Font {
+        let resets_section = column![
+            text("Quick Resets").size(16).font(Font {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
             }),
-            text("Won't touch Git or Miniconda — only Sapphire-specific stuff.").size(12).color(color!(0x7f849c)),
-            Column::new()
-                .spacing(14)
-                .padding(Padding { top: 8.0, right: 0.0, bottom: 0.0, left: 0.0 })
-                .push(column![remove_env_btn, env_warning].spacing(3))
-                .push(column![delete_userdata_btn, userdata_warning].spacing(3))
-                .push(column![delete_folder_btn, folder_warning].spacing(3)),
+            row![
+                column![
+                    reset_pw_btn,
+                    text("Forgot your password? This clears it so Sapphire asks for a new one.")
+                        .size(11).color(color!(0x7f849c)),
+                ].spacing(3).width(Length::FillPortion(1)),
+                column![
+                    reset_creds_btn,
+                    text("Clears saved API keys (Claude, OpenAI, etc). You'll re-enter them in Sapphire.")
+                        .size(11).color(color!(0x7f849c)),
+                ].spacing(3).width(Length::FillPortion(1)),
+            ].spacing(16),
+        ].spacing(8);
+
+        // ═══════════════════════════════════════════════════════════
+        // Danger Zone — destructive actions
+        // ═══════════════════════════════════════════════════════════
+
+        // Remove conda env
+        let env_label = if self.confirm_remove_env { "YES, remove it" } else { "Remove conda env" };
+        let remove_env_btn = button(text(env_label).size(13))
+            .on_press_maybe(if busy { None } else { Some(Message::UninstallCondaEnvClick) })
+            .style(button::danger)
+            .padding([4, 12]);
+        let env_desc = if self.confirm_remove_env {
+            text("Click again to confirm.").size(11).color(color!(0xe74c3c))
+        } else {
+            text("Deletes the 'sapphire' Python environment and all packages.").size(11).color(color!(0x7f849c))
+        };
+
+        // Delete user data
+        let ud_label = if self.confirm_delete_userdata { "YES, delete user data" } else { "Delete user data" };
+        let delete_ud_btn = button(text(ud_label).size(13))
+            .on_press_maybe(if busy { None } else { Some(Message::UninstallDeleteUserdataClick) })
+            .style(button::danger)
+            .padding([4, 12]);
+        let ud_desc = if self.confirm_delete_userdata {
+            text("Click again to confirm.").size(11).color(color!(0xe74c3c))
+        } else {
+            text("Removes sapphire/user/ — your settings and personal data.").size(11).color(color!(0x7f849c))
+        };
+
+        // Delete everything
+        let folder_label = if self.confirm_delete_folder { "YES, delete everything" } else { "Delete Sapphire folder" };
+        let delete_folder_btn = button(text(folder_label).size(13))
+            .on_press_maybe(if busy { None } else { Some(Message::UninstallDeleteFolderClick) })
+            .style(button::danger)
+            .padding([4, 12]);
+        let folder_desc = if self.confirm_delete_folder {
+            text("FINAL WARNING. Everything will be permanently deleted.").size(11).color(color!(0xe74c3c))
+        } else {
+            text(format!("Nukes {} — code, settings, everything. Cannot be undone.", self.install_path))
+                .size(11).color(color!(0x7f849c))
+        };
+
+        let danger_section = column![
+            text("Danger Zone").size(16).font(Font {
+                weight: iced::font::Weight::Bold,
+                ..Font::DEFAULT
+            }).color(color!(0xe74c3c)),
+            text("These actions are destructive. Won't touch Git or Miniconda.").size(11).color(color!(0x7f849c)),
+            column![remove_env_btn, env_desc].spacing(2),
+            column![delete_ud_btn, ud_desc].spacing(2),
+            column![delete_folder_btn, folder_desc].spacing(2),
+        ].spacing(8);
+
+        // Divider between sections
+        let divider = container(text(""))
+            .width(Length::Fill)
+            .height(1)
+            .style(|_theme| container::Style {
+                background: Some(iced::Background::Color(color!(0x313244))),
+                ..Default::default()
+            });
+
+        column![
+            resets_section,
+            divider,
+            danger_section,
         ]
-        .spacing(6)
+        .spacing(12)
         .into()
     }
 
