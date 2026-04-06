@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 iced = { version = "0.13", features = ["image", "tokio"] }
 image = "0.24"
-tokio = { version = "1", features = ["rt", "process", "sync", "io-util", "macros"] }
+tokio = { version = "1", features = ["rt", "process", "sync", "io-util", "macros", "fs"] }
 tokio-stream = "0.1"
 futures = "0.3"
 

@@ -181,6 +181,7 @@ impl Default for App {
                 (TsCheck::WebUi, TsStatus::NotChecked),
                 (TsCheck::Starlette, TsStatus::NotChecked),
                 (TsCheck::DepsHealth, TsStatus::NotChecked),
+                (TsCheck::Plugins, TsStatus::NotChecked),
             ],
             ts_running: false,
             confirm_remove_env: false,
@@ -274,6 +275,7 @@ enum TsCheck {
     WebUi,
     Starlette,
     DepsHealth,
+    Plugins,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -740,6 +742,98 @@ async fn ts_fix_deps(install_path: String) -> (TsCheck, String, bool) {
     match run_cmd_full_async(program, base_args).await {
         Ok(out) => (TsCheck::DepsHealth, format!("Repaired! Restart Sapphire to apply."), true),
         Err(e) => (TsCheck::DepsHealth, format!("Repair failed: {}", e), false),
+    }
+}
+
+async fn ts_check_plugins(install_path: String) -> (TsCheck, TsStatus) {
+    let install_dir = PathBuf::from(&install_path).join("install");
+    if !install_dir.exists() {
+        return (TsCheck::Plugins, TsStatus::Ok("No optional features found".into()));
+    }
+
+    let (pip_program, pip_base) = find_conda_pip();
+
+    // Find all requirements-*.txt files
+    let mut results: Vec<String> = Vec::new();
+    let mut any_missing = false;
+
+    let features = [
+        ("requirements-stt.txt", "Speech-to-Text"),
+        ("requirements-tts.txt", "Text-to-Speech"),
+        ("requirements-wakeword.txt", "Wake Word"),
+    ];
+
+    for (file, label) in &features {
+        let req_path = install_dir.join(file);
+        if !req_path.exists() { continue; }
+
+        // Read the requirements file and check each package
+        let contents = match tokio::fs::read_to_string(&req_path).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        let mut all_installed = true;
+        let mut missing = Vec::new();
+
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') { continue; }
+            // Extract package name (before any >= or == specifier)
+            let pkg_name = line.split(&['>', '<', '=', '!', '['][..]).next().unwrap_or(line).trim();
+
+            let mut args = pip_base.clone();
+            args.extend(["show".into(), pkg_name.into()]);
+            match run_cmd_full_async(pip_program.clone(), args).await {
+                Ok(_) => {} // installed
+                Err(_) => {
+                    all_installed = false;
+                    missing.push(pkg_name.to_string());
+                }
+            }
+        }
+
+        if all_installed {
+            results.push(format!("{}: installed", label));
+        } else {
+            any_missing = true;
+            results.push(format!("{}: missing {}", label, missing.join(", ")));
+        }
+    }
+
+    let summary = results.join(" | ");
+    if any_missing {
+        (TsCheck::Plugins, TsStatus::Problem(summary))
+    } else if results.is_empty() {
+        (TsCheck::Plugins, TsStatus::Ok("No optional features found".into()))
+    } else {
+        (TsCheck::Plugins, TsStatus::Ok(summary))
+    }
+}
+
+async fn ts_fix_plugins(install_path: String) -> (TsCheck, String, bool) {
+    let install_dir = PathBuf::from(&install_path).join("install");
+    let (pip_program, pip_base) = find_conda_pip();
+
+    let features = ["requirements-stt.txt", "requirements-tts.txt", "requirements-wakeword.txt"];
+    let mut any_fail = false;
+
+    for file in &features {
+        let req_path = install_dir.join(file);
+        if !req_path.exists() { continue; }
+
+        let mut args = pip_base.clone();
+        args.extend(["install".into(), "-r".into(), req_path.to_string_lossy().to_string()]);
+        if let Err(e) = run_cmd_full_async(pip_program.clone(), args).await {
+            any_fail = true;
+            return (TsCheck::Plugins, format!("Failed on {}: {}", file, e), false);
+        }
+    }
+
+    if any_fail {
+        (TsCheck::Plugins, "Some features failed to install.".into(), false)
+    } else {
+        (TsCheck::Plugins, "All optional features installed. Restart Sapphire to apply.".into(), true)
     }
 }
 
@@ -1401,12 +1495,14 @@ impl App {
                     *status = TsStatus::Checking;
                 }
                 self.log_lines.push("[troubleshoot] Running checks...".to_string());
+                let path = self.install_path.clone();
 
                 Task::batch(vec![
                     Task::perform(ts_check_running(), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_webui(), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_starlette(), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_deps(), |(c, s)| Message::TroubleshootResult(c, s)),
+                    Task::perform(ts_check_plugins(path), |(c, s)| Message::TroubleshootResult(c, s)),
                 ])
             }
             Message::TroubleshootResult(check, status) => {
@@ -1431,6 +1527,9 @@ impl App {
                         Message::TroubleshootFixResult(c, msg, ok)
                     }),
                     TsCheck::DepsHealth => Task::perform(ts_fix_deps(path), |(c, msg, ok)| {
+                        Message::TroubleshootFixResult(c, msg, ok)
+                    }),
+                    TsCheck::Plugins => Task::perform(ts_fix_plugins(path), |(c, msg, ok)| {
                         Message::TroubleshootFixResult(c, msg, ok)
                     }),
                     _ => Task::none(),
@@ -1959,12 +2058,15 @@ impl App {
             // Add Fix button for fixable problems
             let is_fixable = matches!(
                 (check, status),
-                (TsCheck::Starlette, TsStatus::Problem(_)) | (TsCheck::DepsHealth, TsStatus::Problem(_))
+                (TsCheck::Starlette, TsStatus::Problem(_))
+                    | (TsCheck::DepsHealth, TsStatus::Problem(_))
+                    | (TsCheck::Plugins, TsStatus::Problem(_))
             );
+            let fix_label = if *check == TsCheck::Plugins { "Install" } else { "Fix" };
             if is_fixable {
                 check_row = check_row.push(horizontal_space());
                 check_row = check_row.push(
-                    button(text("Fix").size(11))
+                    button(text(fix_label).size(11))
                         .on_press(Message::TroubleshootFix(*check))
                         .style(button::success)
                         .padding([2, 10])
@@ -2120,6 +2222,7 @@ fn ts_label(check: TsCheck) -> &'static str {
         TsCheck::WebUi => "Web UI loading",
         TsCheck::Starlette => "Starlette version",
         TsCheck::DepsHealth => "Package health",
+        TsCheck::Plugins => "Optional features",
     }
 }
 
