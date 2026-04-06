@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 use iced::widget::{
     button, column, container, horizontal_space, pick_list, row, scrollable, text,
     text_input, Column,
@@ -8,6 +10,62 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use tokio::io::{AsyncBufReadExt, BufReader};
+
+// ── Config persistence ─────────────────────────────────────────────────────
+
+fn config_path() -> PathBuf {
+    PathBuf::from(std::env::var("APPDATA").unwrap_or_else(|_| ".".into()))
+        .join("Sapphire")
+        .join("launcher.json")
+}
+
+fn load_config() -> (String, Branch) {
+    let home = std::env::var("USERPROFILE")
+        .or_else(|_| std::env::var("HOME"))
+        .unwrap_or_else(|_| "C:\\".to_string());
+    let default_path = format!("{}\\sapphire", home);
+    let default_branch = Branch::Stable;
+
+    let path = config_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(_) => return (default_path, default_branch),
+    };
+
+    // Minimal JSON parsing — no serde dependency needed for two fields
+    let install_path = content
+        .split("\"install_path\"")
+        .nth(1)
+        .and_then(|s| s.split('"').nth(1))
+        .map(|s| s.replace("\\\\", "\\"))
+        .unwrap_or(default_path);
+
+    let branch = content
+        .split("\"branch\"")
+        .nth(1)
+        .and_then(|s| s.split('"').nth(1))
+        .map(|s| if s == "Development" { Branch::Development } else { Branch::Stable })
+        .unwrap_or(default_branch);
+
+    (install_path, branch)
+}
+
+fn save_config(install_path: &str, branch: Branch) {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let branch_str = match branch {
+        Branch::Development => "Development",
+        Branch::Stable => "Stable",
+    };
+    let escaped_path = install_path.replace('\\', "\\\\");
+    let json = format!(
+        "{{\n  \"install_path\": \"{}\",\n  \"branch\": \"{}\"\n}}\n",
+        escaped_path, branch_str
+    );
+    let _ = std::fs::write(&path, json);
+}
 
 fn main() -> iced::Result {
     let icon = load_window_icon();
@@ -34,15 +92,25 @@ fn main() -> iced::Result {
         .window(win_settings)
         .run_with(|| {
             let app = App::default();
-            let task = Task::perform(
-                async {
-                    run_cmd_full_async("curl".into(), vec![
-                        "-sk".into(), "--max-time".into(), "3".into(),
-                        "https://localhost:8073/api/health".into(),
-                    ]).await.map(|b| b.contains("ok")).unwrap_or(false)
-                },
-                Message::LaunchPreCheck,
-            );
+            let path = app.install_path.clone();
+            let branch = app.selected_branch.unwrap_or(Branch::Stable);
+            let task = Task::batch(vec![
+                // Check if sapphire is already running
+                Task::perform(
+                    async {
+                        run_cmd_full_async("curl".into(), vec![
+                            "-sk".into(), "--max-time".into(), "3".into(),
+                            "https://localhost:8073/api/health".into(),
+                        ]).await.map(|b| b.contains("ok")).unwrap_or(false)
+                    },
+                    Message::LaunchPreCheck,
+                ),
+                // Check for updates
+                Task::perform(
+                    check_for_updates(path, branch),
+                    Message::UpdatesAvailable,
+                ),
+            ]);
             (app, task)
         })
 }
@@ -140,6 +208,8 @@ struct App {
     confirm_delete_folder: bool,
     confirm_delete_userdata: bool,
     // Update
+    updates_available: Option<u32>, // None = unknown, Some(0) = up to date, Some(n) = behind
+    checking_updates: bool,
     updating: bool,
     update_status: Vec<(String, StepStatus)>, // label, status
     // Troubleshoot
@@ -154,13 +224,11 @@ struct App {
 
 impl Default for App {
     fn default() -> Self {
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_else(|_| "C:\\".to_string());
+        let (install_path, branch) = load_config();
 
         Self {
-            install_path: format!("{}\\sapphire", home),
-            selected_branch: Some(Branch::Stable),
+            install_path,
+            selected_branch: Some(branch),
             active_tab: Tab::default(),
             log_visible: true,
             log_lines: vec!["Ready.".to_string()],
@@ -171,6 +239,8 @@ impl Default for App {
             scanning: false,
             installing: false,
             uninstalling: false,
+            updates_available: None,
+            checking_updates: false,
             updating: false,
             update_status: vec![
                 ("Pull latest changes".into(), StepStatus::NotStarted),
@@ -259,6 +329,8 @@ enum Message {
     UninstallDeleteUserdataClick,
     UninstallResult(String, bool), // message, success
     // Update
+    CheckForUpdates,
+    UpdatesAvailable(Option<u32>), // None = check failed, Some(n) = n commits behind
     UpdateClicked,
     UpdateAfterStop,
     UpdateStepDone(String, bool), // message, success — chains to next step
@@ -291,11 +363,18 @@ enum TsStatus {
 // ── Async detection logic ──────────────────────────────────────────────────
 
 /// Run a command on a background thread so it doesn't freeze the UI.
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 async fn run_cmd_async(program: String, args: Vec<String>) -> Result<String, String> {
     let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
-        Command::new(&program)
-            .args(&args)
-            .output()
+        let mut cmd = Command::new(&program);
+        cmd.args(&args);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.output()
             .map(|out| {
                 let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
@@ -428,7 +507,14 @@ async fn check_deps(install_path: String) -> (Step, StepStatus) {
 /// Run a command on a background thread, returning combined stdout+stderr for logging
 async fn run_cmd_full_async(program: String, args: Vec<String>) -> Result<String, String> {
     let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
-        match Command::new(&program).args(&args).output() {
+        let mut cmd = Command::new(&program);
+        cmd.args(&args);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.output() {
             Ok(out) => {
                 let stdout = String::from_utf8_lossy(&out.stdout).to_string();
                 let stderr = String::from_utf8_lossy(&out.stderr).to_string();
@@ -500,16 +586,22 @@ async fn install_clone(install_path: String, branch: String) -> (Step, StepStatu
 
     let repo_path = PathBuf::from(&install_path);
 
-    // If folder exists but isn't a repo, bail — don't blow away their stuff
+    // If folder exists but isn't a repo, check if it's empty
     if repo_path.exists() && !repo_path.join(".git").exists() {
-        return (
-            Step::Clone,
-            StepStatus::Failed(format!(
-                "Folder {} already exists but isn't a Sapphire repo. Move or rename it first.",
-                install_path
-            )),
-            String::new(),
-        );
+        let is_empty = std::fs::read_dir(&repo_path)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false);
+        if !is_empty {
+            return (
+                Step::Clone,
+                StepStatus::Failed(format!(
+                    "Folder {} already exists and has files in it. Move or rename it first.",
+                    install_path
+                )),
+                String::new(),
+            );
+        }
+        // Empty folder — git clone works fine into empty dirs
     }
 
     // If already a repo, just make sure we're on the right branch
@@ -628,6 +720,33 @@ async fn uninstall_delete_userdata(install_path: String) -> (String, bool) {
     })
     .await
     .unwrap_or_else(|e| (format!("Task failed: {}", e), false))
+}
+
+// ── Update check ───────────────────────────────────────────────────────────
+
+async fn check_for_updates(install_path: String, branch: Branch) -> Option<u32> {
+    let git_dir = PathBuf::from(&install_path).join(".git");
+    if !git_dir.exists() { return None; }
+
+    let git_branch = match branch {
+        Branch::Development => "dev",
+        Branch::Stable => "main",
+    };
+
+    // Fetch latest from remote
+    let _ = run_cmd_full_async("git".into(), vec![
+        "-C".into(), install_path.clone(), "fetch".into(), "origin".into(),
+    ]).await;
+
+    // Count commits behind
+    match run_cmd_full_async("git".into(), vec![
+        "-C".into(), install_path,
+        "rev-list".into(), "--count".into(),
+        format!("HEAD..origin/{}", git_branch),
+    ]).await {
+        Ok(count) => count.trim().parse::<u32>().ok(),
+        Err(_) => None,
+    }
 }
 
 // ── Troubleshoot checks ────────────────────────────────────────────────────
@@ -950,11 +1069,15 @@ impl App {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::PathChanged(path) => {
-                self.install_path = path;
+                if !path.is_empty() {
+                    self.install_path = path;
+                    save_config(&self.install_path, self.selected_branch.unwrap_or(Branch::Stable));
+                }
                 Task::none()
             }
             Message::BranchSelected(branch) => {
                 self.selected_branch = Some(branch);
+                save_config(&self.install_path, branch);
                 let git_dir = PathBuf::from(&self.install_path).join(".git");
                 if !git_dir.exists() {
                     return Task::none();
@@ -993,8 +1116,18 @@ impl App {
                 )
             }
             Message::BrowsePath => {
-                // TODO: native file dialog
-                Task::none()
+                Task::perform(async {
+                    rfd::AsyncFileDialog::new()
+                        .set_title("Choose Sapphire install folder")
+                        .pick_folder()
+                        .await
+                        .map(|f| f.path().to_string_lossy().to_string())
+                }, |result| {
+                    match result {
+                        Some(path) => Message::PathChanged(path),
+                        None => Message::Log("Browse cancelled.".into()),
+                    }
+                })
             }
             Message::Launch => {
                 if self.sapphire_running {
@@ -1096,11 +1229,27 @@ impl App {
             Message::SwitchBranchResult(msg, _ok) => {
                 self.sapphire_running = false;
                 self.sapphire_stopping = false;
+                self.sapphire_log.clear();
                 self.log_lines.push(msg);
                 Task::none()
             }
 
             // ── Update flow ───────────────────────────────────────────
+            Message::CheckForUpdates => {
+                if self.checking_updates { return Task::none(); }
+                self.checking_updates = true;
+                let path = self.install_path.clone();
+                let branch = self.selected_branch.unwrap_or(Branch::Stable);
+                Task::perform(
+                    check_for_updates(path, branch),
+                    Message::UpdatesAvailable,
+                )
+            }
+            Message::UpdatesAvailable(count) => {
+                self.checking_updates = false;
+                self.updates_available = count;
+                Task::none()
+            }
             Message::UpdateClicked => {
                 if self.sapphire_running || self.sapphire_stopping {
                     // Auto-stop sapphire, then update after it's dead
@@ -1143,6 +1292,7 @@ impl App {
             Message::UpdateAfterStop => {
                 self.sapphire_running = false;
                 self.sapphire_stopping = false;
+                self.sapphire_log.clear();
                 self.log_lines.push("Sapphire stopped. Starting update...".to_string());
                 let git_dir = PathBuf::from(&self.install_path).join(".git");
                 if !git_dir.exists() {
@@ -1201,6 +1351,7 @@ impl App {
                 // All done
                 self.updating = false;
                 self.log_lines.push("[update] Update complete!".to_string());
+                self.updates_available = Some(0);
                 Task::none()
             }
             Message::SapphireLine(line) => {
@@ -1230,6 +1381,10 @@ impl App {
                 self.confirm_remove_env = false;
                 self.confirm_delete_folder = false;
                 self.confirm_delete_userdata = false;
+                // Auto-check for updates when opening Update tab
+                if tab == Tab::Update {
+                    return self.update(Message::CheckForUpdates);
+                }
                 Task::none()
             }
             Message::ToggleLog => {
@@ -1555,14 +1710,12 @@ impl App {
     fn kill_sapphire_processes(&self) {
         let pid = self.sapphire_pid.load(Ordering::Relaxed);
         if pid > 0 {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output();
+            let _ = hidden_cmd("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
             self.sapphire_pid.store(0, Ordering::Relaxed);
         }
         let home = std::env::var("USERPROFILE").unwrap_or_default();
         let env_path = format!("{}\\miniconda3\\envs\\sapphire", home);
-        if let Ok(output) = Command::new("wmic")
+        if let Ok(output) = hidden_cmd("wmic")
             .args(["process", "where", &format!("name='python.exe' and executablepath like '%{}%'", env_path.replace('\\', "\\\\")),
                 "get", "processid"])
             .output()
@@ -1570,9 +1723,7 @@ impl App {
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 if let Ok(pid) = line.trim().parse::<u32>() {
-                    let _ = Command::new("taskkill")
-                        .args(["/F", "/PID", &pid.to_string()])
-                        .output();
+                    let _ = hidden_cmd("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
                 }
             }
         }
@@ -1671,6 +1822,19 @@ impl App {
         .spacing(8)
         .padding(8)
         .align_y(iced::Alignment::Center);
+
+        // Update indicator
+        if let Some(n) = self.updates_available {
+            if n > 0 {
+                let badge = button(
+                    text(format!("{}↑", n)).size(12).color(color!(0x3d85c6))
+                )
+                .on_press(Message::TabSelected(Tab::Update))
+                .style(button::text)
+                .padding([2, 6]);
+                header = header.push(badge);
+            }
+        }
 
         if self.sapphire_stopping {
             let stopping_btn = button(text("Stopping...").font(Font {
@@ -1905,11 +2069,20 @@ impl App {
             })
             .style(button::primary);
 
+        let status_text = match self.updates_available {
+            Some(0) => text("Up to date.").size(13).color(color!(0x4caf50)),
+            Some(n) => text(format!("{} update{} available.", n, if n == 1 { "" } else { "s" }))
+                .size(13).color(color!(0x3d85c6)),
+            None if self.checking_updates => text("Checking...").size(13).color(color!(0x7f849c)),
+            None => text("Couldn't check for updates.").size(13).color(color!(0x7f849c)),
+        };
+
         column![
             text("Update Sapphire").size(18).font(Font {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
             }),
+            status_text,
             steps_col,
             update_btn,
         ]
