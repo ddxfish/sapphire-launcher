@@ -1,0 +1,9 @@
+# Windows (MSVC) release: statically link the C runtime ("bake it in") so the
+# launcher needs no VC++ Redistributable just to START. Self-contained exe,
+# safe to download-and-double-click on a fresh Windows. Costs a few hundred KB.
+# (Sapphire's own Python packages still need the redist — that's installed as a
+# launcher step in Phase 3, which is fine once this self-contained exe is running.)
+#
+# Only affects the Windows MSVC target. Linux builds are untouched.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

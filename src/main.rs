@@ -11,19 +11,150 @@ use std::process::Command;
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+// ── Platform seam ───────────────────────────────────────────────────────────
+// All OS divergence lives here. Callers stay OS-agnostic. Windows branches
+// preserve existing behavior byte-for-byte; the Linux branches are the new path.
+// (find_git / find_conda / find_conda_pip live further down, also #[cfg]-split.)
+
+/// Base config dir, shared with Sapphire. Mirrors core/setup.py::get_config_dir():
+/// Windows %APPDATA%\Sapphire, Linux $XDG_CONFIG_HOME/sapphire or ~/.config/sapphire.
+fn app_config_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(appdata) = std::env::var("APPDATA") {
+            if !appdata.is_empty() {
+                return PathBuf::from(appdata).join("Sapphire");
+            }
+        }
+        PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()))
+            .join("AppData").join("Roaming").join("Sapphire")
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
+            if !xdg.is_empty() {
+                return PathBuf::from(xdg).join("sapphire");
+            }
+        }
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+            .join(".config").join("sapphire")
+    }
+}
+
+/// Default Sapphire install location: ~/sapphire (home folder, not root).
+fn default_install_path() -> String {
+    #[cfg(windows)]
+    {
+        let home = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_else(|_| "C:\\".to_string());
+        format!("{}\\sapphire", home)
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        format!("{}/sapphire", home)
+    }
+}
+
+/// Resolve how to run Sapphire's Python: the env's interpreter directly if we can
+/// find it, else fall back to `conda run`. Returns (program, args-before-script).
+fn sapphire_python_cmd() -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        let cands = [
+            format!("{}\\miniconda3\\envs\\sapphire\\python.exe", home),
+            format!("{}\\Miniconda3\\envs\\sapphire\\python.exe", home),
+            format!("{}\\anaconda3\\envs\\sapphire\\python.exe", home),
+            format!("{}\\Anaconda3\\envs\\sapphire\\python.exe", home),
+        ];
+        for p in &cands {
+            if PathBuf::from(p).exists() { return (p.clone(), vec![]); }
+        }
+        ("conda".to_string(), vec!["run".into(), "-n".into(), "sapphire".into(), "python".into()])
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let cands = [
+            format!("{}/miniconda3/envs/sapphire/bin/python", home),
+            format!("{}/anaconda3/envs/sapphire/bin/python", home),
+        ];
+        for p in &cands {
+            if PathBuf::from(p).exists() { return (p.clone(), vec![]); }
+        }
+        ("conda".to_string(), vec!["run".into(), "-n".into(), "sapphire".into(), "python".into()])
+    }
+}
+
+/// Open a URL in the user's default browser.
+fn open_url(url: &str) {
+    #[cfg(windows)]
+    { let _ = hidden_cmd("cmd").args(["/c", "start", url]).spawn(); }
+    #[cfg(not(windows))]
+    { let _ = hidden_cmd("xdg-open").arg(url).spawn(); }
+}
+
+/// Open a file in the user's default viewer/editor.
+fn open_file(path: &std::path::Path) {
+    #[cfg(windows)]
+    { let _ = hidden_cmd("notepad").arg(path).spawn(); }
+    #[cfg(not(windows))]
+    { let _ = hidden_cmd("xdg-open").arg(path).spawn(); }
+}
+
+/// Platform null device for discarding command output.
+fn null_device() -> &'static str {
+    #[cfg(windows)]
+    { "NUL" }
+    #[cfg(not(windows))]
+    { "/dev/null" }
+}
+
+/// Kill Sapphire and its children. Windows: taskkill the tree + sweep env pythons.
+/// Linux: kill the process group (we spawn Sapphire in its own group) + sweep.
+fn kill_process_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        if pid > 0 {
+            let _ = hidden_cmd("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+        }
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        let env_path = format!("{}\\miniconda3\\envs\\sapphire", home);
+        if let Ok(output) = hidden_cmd("wmic")
+            .args(["process", "where", &format!("name='python.exe' and executablepath like '%{}%'", env_path.replace('\\', "\\\\")),
+                "get", "processid"])
+            .output()
+        {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                if let Ok(p) = line.trim().parse::<u32>() {
+                    let _ = hidden_cmd("taskkill").args(["/F", "/PID", &p.to_string()]).output();
+                }
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if pid > 0 {
+            // Negative pid targets the whole process group (Sapphire is spawned
+            // into its own group at launch), reaping child STT/TTS workers too.
+            let _ = hidden_cmd("kill").args(["-TERM", &format!("-{}", pid)]).output();
+        }
+        // Sweep any stray python running the sapphire env (e.g. started outside us).
+        let _ = hidden_cmd("pkill").args(["-TERM", "-f", "envs/sapphire/bin/python"]).output();
+    }
+}
+
 // ── Config persistence ─────────────────────────────────────────────────────
 
 fn config_path() -> PathBuf {
-    PathBuf::from(std::env::var("APPDATA").unwrap_or_else(|_| ".".into()))
-        .join("Sapphire")
-        .join("launcher.json")
+    app_config_dir().join("launcher.json")
 }
 
 fn load_config() -> (String, Branch) {
-    let home = std::env::var("USERPROFILE")
-        .or_else(|_| std::env::var("HOME"))
-        .unwrap_or_else(|_| "C:\\".to_string());
-    let default_path = format!("{}\\sapphire", home);
+    let default_path = default_install_path();
 
     let path = config_path();
     let install_path = match std::fs::read_to_string(&path) {
@@ -437,13 +568,26 @@ async fn check_conda() -> (Step, StepStatus) {
     match run_cmd_async(find_conda(), vec!["--version".into()]).await {
         Ok(ver) => (Step::Conda, StepStatus::Found(ver)),
         Err(_) => {
-            let home = std::env::var("USERPROFILE").unwrap_or_default();
-            let paths = [
-                format!("{}\\miniconda3\\Scripts\\conda.exe", home),
-                format!("{}\\anaconda3\\Scripts\\conda.exe", home),
-                format!("{}\\Miniconda3\\Scripts\\conda.exe", home),
-                format!("{}\\Anaconda3\\Scripts\\conda.exe", home),
-            ];
+            #[cfg(windows)]
+            let paths = {
+                let home = std::env::var("USERPROFILE").unwrap_or_default();
+                [
+                    format!("{}\\miniconda3\\Scripts\\conda.exe", home),
+                    format!("{}\\anaconda3\\Scripts\\conda.exe", home),
+                    format!("{}\\Miniconda3\\Scripts\\conda.exe", home),
+                    format!("{}\\Anaconda3\\Scripts\\conda.exe", home),
+                ]
+            };
+            #[cfg(not(windows))]
+            let paths = {
+                let home = std::env::var("HOME").unwrap_or_default();
+                [
+                    format!("{}/miniconda3/bin/conda", home),
+                    format!("{}/anaconda3/bin/conda", home),
+                    "/opt/miniconda3/bin/conda".to_string(),
+                    "/opt/anaconda3/bin/conda".to_string(),
+                ]
+            };
             for p in &paths {
                 if PathBuf::from(p).exists() {
                     return (
@@ -830,7 +974,7 @@ async fn ts_check_running() -> (TsCheck, TsStatus) {
 async fn ts_check_webui() -> (TsCheck, TsStatus) {
     match run_cmd_full_async("curl".into(), vec![
         "-sk".into(), "--max-time".into(), "5".into(),
-        "-o".into(), "NUL".into(),
+        "-o".into(), null_device().into(),
         "-w".into(), "%{http_code}".into(),
         "-L".into(), "https://localhost:8073/".into(),
     ]).await {
@@ -893,8 +1037,22 @@ async fn ts_check_deps() -> (TsCheck, TsStatus) {
     }
 }
 
-/// Find pip in the conda sapphire env directly
+/// Find git executable on disk (Linux: rely on PATH).
+#[cfg(not(windows))]
+fn find_git() -> String {
+    if let Ok(out) = std::process::Command::new("which").arg("git").output() {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() && PathBuf::from(&p).exists() {
+                return p;
+            }
+        }
+    }
+    "git".into()
+}
+
 /// Find git executable on disk
+#[cfg(windows)]
 fn find_git() -> String {
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     let common_paths = [
@@ -929,6 +1087,7 @@ fn find_git() -> String {
 }
 
 /// Find conda executable on disk
+#[cfg(windows)]
 fn find_conda() -> String {
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     let conda_paths = [
@@ -945,12 +1104,56 @@ fn find_conda() -> String {
     "conda".into() // fallback to PATH
 }
 
+/// Find conda executable on disk (Linux locations, then PATH).
+#[cfg(not(windows))]
+fn find_conda() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let conda_paths = [
+        format!("{}/miniconda3/bin/conda", home),
+        format!("{}/anaconda3/bin/conda", home),
+        "/opt/miniconda3/bin/conda".to_string(),
+        "/opt/anaconda3/bin/conda".to_string(),
+    ];
+    for p in &conda_paths {
+        if PathBuf::from(p).exists() {
+            return p.clone();
+        }
+    }
+    if let Ok(out) = std::process::Command::new("which").arg("conda").output() {
+        if out.status.success() {
+            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !p.is_empty() && PathBuf::from(&p).exists() {
+                return p;
+            }
+        }
+    }
+    "conda".into() // fallback to PATH
+}
+
+#[cfg(windows)]
 fn find_conda_pip() -> (String, Vec<String>) {
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     let pip_paths = [
         format!("{}\\miniconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
         format!("{}\\Miniconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
         format!("{}\\anaconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
+    ];
+    for p in &pip_paths {
+        if PathBuf::from(p).exists() {
+            return (p.clone(), vec![]);
+        }
+    }
+    // Fallback to conda run
+    (find_conda(), vec!["run".into(), "-n".into(), "sapphire".into(), "pip".into()])
+}
+
+/// Find pip in the conda sapphire env directly (Linux), else `conda run`.
+#[cfg(not(windows))]
+fn find_conda_pip() -> (String, Vec<String>) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let pip_paths = [
+        format!("{}/miniconda3/envs/sapphire/bin/pip", home),
+        format!("{}/anaconda3/envs/sapphire/bin/pip", home),
     ];
     for p in &pip_paths {
         if PathBuf::from(p).exists() {
@@ -1095,28 +1298,13 @@ fn launch_sapphire_stream(install_path: String, pid_store: Arc<AtomicU32>) -> im
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     tokio::task::spawn(async move {
-        // Find the conda env's python directly — avoids conda run buffering issues
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        let conda_python_paths = [
-            format!("{}\\miniconda3\\envs\\sapphire\\python.exe", home),
-            format!("{}\\Miniconda3\\envs\\sapphire\\python.exe", home),
-            format!("{}\\anaconda3\\envs\\sapphire\\python.exe", home),
-            format!("{}\\Anaconda3\\envs\\sapphire\\python.exe", home),
-        ];
+        // Resolve the env's python directly (avoids conda-run buffering) or conda run.
+        let (program, mut args) = sapphire_python_cmd();
+        let is_direct = args.is_empty();
+        args.push("-u".to_string());
+        args.push("main.py".to_string());
 
-        let python_exe = conda_python_paths
-            .iter()
-            .find(|p| PathBuf::from(p).exists())
-            .cloned();
-
-        let (program, args) = if let Some(ref py) = python_exe {
-            (py.as_str(), vec!["-u", "main.py"])
-        } else {
-            // Fallback to conda run
-            ("conda", vec!["run", "-n", "sapphire", "python", "-u", "main.py"])
-        };
-
-        let mut cmd = tokio::process::Command::new(program);
+        let mut cmd = tokio::process::Command::new(&program);
         cmd.args(&args)
             .current_dir(&install_path)
             .stdout(std::process::Stdio::piped())
@@ -1127,6 +1315,11 @@ fn launch_sapphire_stream(install_path: String, pid_store: Arc<AtomicU32>) -> im
         {
             use std::os::windows::process::CommandExt;
             cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        #[cfg(unix)]
+        {
+            // Own process group so Stop can kill the whole tree (child workers).
+            cmd.process_group(0);
         }
 
         let mut child = match cmd.spawn() {
@@ -1142,8 +1335,8 @@ fn launch_sapphire_stream(install_path: String, pid_store: Arc<AtomicU32>) -> im
             pid_store.store(pid, Ordering::Relaxed);
         }
 
-        if let Some(ref py) = python_exe {
-            let _ = tx.send(Message::SapphireLine(format!("Using {}", py)));
+        if is_direct {
+            let _ = tx.send(Message::SapphireLine(format!("Using {}", program)));
         }
 
         let stdout = child.stdout.take().unwrap();
@@ -1346,9 +1539,7 @@ impl App {
                 }, |_| Message::SapphireStopConfirmed)
             }
             Message::OpenBrowser => {
-                let _ = Command::new("cmd")
-                    .args(["/c", "start", "https://localhost:8073"])
-                    .spawn();
+                open_url("https://localhost:8073");
                 Task::none()
             }
             Message::SwitchBranch => {
@@ -1667,7 +1858,7 @@ impl App {
                 let log_text = self.sapphire_log.join("\n");
                 let log_path = std::env::temp_dir().join("sapphire_log.txt");
                 if std::fs::write(&log_path, &log_text).is_ok() {
-                    let _ = Command::new("notepad").arg(&log_path).spawn();
+                    open_file(&log_path);
                 } else {
                     self.log_lines.push("Couldn't write log file.".to_string());
                 }
@@ -1686,8 +1877,7 @@ impl App {
 
             // ── Resets ─────────────────────────────────────────────────
             Message::ResetPassword => {
-                let key_path = PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
-                    .join("Sapphire").join("secret_key");
+                let key_path = app_config_dir().join("secret_key");
                 let msg = if key_path.exists() {
                     match std::fs::remove_file(&key_path) {
                         Ok(()) => "Password reset. Sapphire will ask for a new password on next launch.".into(),
@@ -1700,8 +1890,7 @@ impl App {
                 Task::done(Message::ResetResult(msg))
             }
             Message::ResetCredentials => {
-                let cred_path = PathBuf::from(std::env::var("APPDATA").unwrap_or_default())
-                    .join("Sapphire").join("credentials.json");
+                let cred_path = app_config_dir().join("credentials.json");
                 let msg = if cred_path.exists() {
                     match std::fs::remove_file(&cred_path) {
                         Ok(()) => "API keys cleared. You'll need to re-enter them in Sapphire.".into(),
@@ -1847,23 +2036,9 @@ impl App {
     /// Kill all sapphire python processes
     fn kill_sapphire_processes(&self) {
         let pid = self.sapphire_pid.load(Ordering::Relaxed);
+        kill_process_tree(pid);
         if pid > 0 {
-            let _ = hidden_cmd("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
             self.sapphire_pid.store(0, Ordering::Relaxed);
-        }
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        let env_path = format!("{}\\miniconda3\\envs\\sapphire", home);
-        if let Ok(output) = hidden_cmd("wmic")
-            .args(["process", "where", &format!("name='python.exe' and executablepath like '%{}%'", env_path.replace('\\', "\\\\")),
-                "get", "processid"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Ok(pid) = line.trim().parse::<u32>() {
-                    let _ = hidden_cmd("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
-                }
-            }
         }
     }
 
