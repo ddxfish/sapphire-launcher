@@ -1,195 +1,19 @@
 #![windows_subsystem = "windows"]
 
-use iced::widget::{
-    button, column, container, horizontal_space, pick_list, row, scrollable, text,
-    text_input, Column,
-};
-use iced::{color, Element, Font, Length, Padding, Subscription, Task, Theme};
+use iced::widget::scrollable;
+use iced::{color, Subscription, Task, Theme};
 use iced::window;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
-use tokio::io::{AsyncBufReadExt, BufReader};
 
-// ── Platform seam ───────────────────────────────────────────────────────────
-// All OS divergence lives here. Callers stay OS-agnostic. Windows branches
-// preserve existing behavior byte-for-byte; the Linux branches are the new path.
-// (find_git / find_conda / find_conda_pip live further down, also #[cfg]-split.)
+mod ui;
+mod service;
+mod platform;
+use crate::platform::*;
+use crate::service::*;
 
-/// Base config dir, shared with Sapphire. Mirrors core/setup.py::get_config_dir():
-/// Windows %APPDATA%\Sapphire, Linux $XDG_CONFIG_HOME/sapphire or ~/.config/sapphire.
-fn app_config_dir() -> PathBuf {
-    #[cfg(windows)]
-    {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            if !appdata.is_empty() {
-                return PathBuf::from(appdata).join("Sapphire");
-            }
-        }
-        PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()))
-            .join("AppData").join("Roaming").join("Sapphire")
-    }
-    #[cfg(not(windows))]
-    {
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return PathBuf::from(xdg).join("sapphire");
-            }
-        }
-        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
-            .join(".config").join("sapphire")
-    }
-}
 
-/// Default Sapphire install location: ~/sapphire (home folder, not root).
-fn default_install_path() -> String {
-    #[cfg(windows)]
-    {
-        let home = std::env::var("USERPROFILE")
-            .or_else(|_| std::env::var("HOME"))
-            .unwrap_or_else(|_| "C:\\".to_string());
-        format!("{}\\sapphire", home)
-    }
-    #[cfg(not(windows))]
-    {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        format!("{}/sapphire", home)
-    }
-}
-
-/// Resolve how to run Sapphire's Python: the env's interpreter directly if we can
-/// find it, else fall back to `conda run`. Returns (program, args-before-script).
-fn sapphire_python_cmd() -> (String, Vec<String>) {
-    #[cfg(windows)]
-    {
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        let cands = [
-            format!("{}\\miniconda3\\envs\\sapphire\\python.exe", home),
-            format!("{}\\Miniconda3\\envs\\sapphire\\python.exe", home),
-            format!("{}\\anaconda3\\envs\\sapphire\\python.exe", home),
-            format!("{}\\Anaconda3\\envs\\sapphire\\python.exe", home),
-        ];
-        for p in &cands {
-            if PathBuf::from(p).exists() { return (p.clone(), vec![]); }
-        }
-        ("conda".to_string(), vec!["run".into(), "-n".into(), "sapphire".into(), "python".into()])
-    }
-    #[cfg(not(windows))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let cands = [
-            format!("{}/miniconda3/envs/sapphire/bin/python", home),
-            format!("{}/anaconda3/envs/sapphire/bin/python", home),
-        ];
-        for p in &cands {
-            if PathBuf::from(p).exists() { return (p.clone(), vec![]); }
-        }
-        ("conda".to_string(), vec!["run".into(), "-n".into(), "sapphire".into(), "python".into()])
-    }
-}
-
-/// Open a URL in the user's default browser.
-fn open_url(url: &str) {
-    #[cfg(windows)]
-    { let _ = hidden_cmd("cmd").args(["/c", "start", url]).spawn(); }
-    #[cfg(not(windows))]
-    { let _ = hidden_cmd("xdg-open").arg(url).spawn(); }
-}
-
-/// Open a file in the user's default viewer/editor.
-fn open_file(path: &std::path::Path) {
-    #[cfg(windows)]
-    { let _ = hidden_cmd("notepad").arg(path).spawn(); }
-    #[cfg(not(windows))]
-    { let _ = hidden_cmd("xdg-open").arg(path).spawn(); }
-}
-
-/// Platform null device for discarding command output.
-fn null_device() -> &'static str {
-    #[cfg(windows)]
-    { "NUL" }
-    #[cfg(not(windows))]
-    { "/dev/null" }
-}
-
-/// Kill Sapphire and its children. Windows: taskkill the tree + sweep env pythons.
-/// Linux: kill the process group (we spawn Sapphire in its own group) + sweep.
-fn kill_process_tree(pid: u32) {
-    #[cfg(windows)]
-    {
-        if pid > 0 {
-            let _ = hidden_cmd("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
-        }
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        let env_path = format!("{}\\miniconda3\\envs\\sapphire", home);
-        if let Ok(output) = hidden_cmd("wmic")
-            .args(["process", "where", &format!("name='python.exe' and executablepath like '%{}%'", env_path.replace('\\', "\\\\")),
-                "get", "processid"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Ok(p) = line.trim().parse::<u32>() {
-                    let _ = hidden_cmd("taskkill").args(["/F", "/PID", &p.to_string()]).output();
-                }
-            }
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        if pid > 0 {
-            // Negative pid targets the whole process group (Sapphire is spawned
-            // into its own group at launch), reaping child STT/TTS workers too.
-            let _ = hidden_cmd("kill").args(["-TERM", &format!("-{}", pid)]).output();
-        }
-        // Sweep any stray python running the sapphire env (e.g. started outside us).
-        let _ = hidden_cmd("pkill").args(["-TERM", "-f", "envs/sapphire/bin/python"]).output();
-    }
-}
-
-/// A detected systemd --user `sapphire.service` (Linux only).
-#[derive(Debug, Clone)]
-struct ServiceInfo {
-    active: bool,
-    sub_state: String,
-    working_dir: Option<String>,
-}
-
-/// Detect a systemd --user `sapphire.service`. Returns None if no such unit
-/// (or on Windows, or if systemctl is absent). This is what flips the launcher
-/// into "service mode" — Launch/Stop drive the unit instead of spawning python.
-#[cfg(not(windows))]
-fn detect_sapphire_service() -> Option<ServiceInfo> {
-    let out = std::process::Command::new("systemctl")
-        .args([
-            "--user", "show", "sapphire",
-            "-p", "LoadState", "-p", "ActiveState",
-            "-p", "SubState", "-p", "WorkingDirectory",
-        ])
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    let (mut load, mut active, mut sub, mut wd) = ("", "", "", "");
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("LoadState=") { load = v; }
-        else if let Some(v) = line.strip_prefix("ActiveState=") { active = v; }
-        else if let Some(v) = line.strip_prefix("SubState=") { sub = v; }
-        else if let Some(v) = line.strip_prefix("WorkingDirectory=") { wd = v; }
-    }
-    if load != "loaded" {
-        return None; // unit doesn't exist
-    }
-    Some(ServiceInfo {
-        active: active == "active",
-        sub_state: sub.to_string(),
-        working_dir: if wd.is_empty() { None } else { Some(wd.to_string()) },
-    })
-}
-
-#[cfg(windows)]
-fn detect_sapphire_service() -> Option<ServiceInfo> {
-    None
-}
 
 // ── Config persistence ─────────────────────────────────────────────────────
 
@@ -518,7 +342,6 @@ impl Default for App {
             ts_checks: vec![
                 (TsCheck::SapphireRunning, TsStatus::NotChecked),
                 (TsCheck::WebUi, TsStatus::NotChecked),
-                (TsCheck::Starlette, TsStatus::NotChecked),
                 (TsCheck::DepsHealth, TsStatus::NotChecked),
                 (TsCheck::Plugins, TsStatus::NotChecked),
                 (TsCheck::Gpu, TsStatus::NotChecked),
@@ -630,7 +453,6 @@ enum Message {
 enum TsCheck {
     SapphireRunning,
     WebUi,
-    Starlette,
     DepsHealth,
     Plugins,
     Gpu,
@@ -651,16 +473,6 @@ enum TsStatus {
 /// Run a command on a background thread so it doesn't freeze the UI.
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// Create a Command that won't flash a console window on Windows
-fn hidden_cmd(program: &str) -> Command {
-    let mut cmd = Command::new(program);
-    #[cfg(target_os = "windows")]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd
-}
 
 async fn run_cmd_async(program: String, args: Vec<String>) -> Result<String, String> {
     let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
@@ -708,13 +520,19 @@ async fn check_git() -> (Step, StepStatus) {
         "sh".into(),
         vec!["-c".into(), "ldconfig -p 2>/dev/null | grep -qi portaudio".into()],
     ).await.is_ok();
+    // curl is used by the launcher's health/troubleshoot checks (not preinstalled on a fresh box).
+    let curl_ok = run_cmd_async(
+        "sh".into(),
+        vec!["-c".into(), "command -v curl >/dev/null 2>&1".into()],
+    ).await.is_ok();
 
-    if git_ok && audio_ok {
-        return (Step::Git, StepStatus::Found("git and audio libraries present".to_string()));
+    if git_ok && audio_ok && curl_ok {
+        return (Step::Git, StepStatus::Found("git, audio libraries, and curl present".to_string()));
     }
     let mut missing = Vec::new();
     if !git_ok { missing.push("git"); }
     if !audio_ok { missing.push("audio libs (libportaudio)"); }
+    if !curl_ok { missing.push("curl"); }
     (
         Step::Git,
         StepStatus::NotFound(format!(
@@ -896,19 +714,19 @@ fn system_packages_plan() -> (Vec<String>, String) {
     let hay = format!("{} {}", id, id_like);
     let v = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     if hay.contains("debian") || hay.contains("ubuntu") {
-        (v(&["apt-get", "install", "-y", "git", "libportaudio2", "python3-dev"]),
-         "sudo apt install git libportaudio2 python3-dev".into())
+        (v(&["apt-get", "install", "-y", "git", "libportaudio2", "python3-dev", "curl"]),
+         "sudo apt install git libportaudio2 python3-dev curl".into())
     } else if hay.contains("fedora") || hay.contains("rhel") || hay.contains("centos") {
-        (v(&["dnf", "install", "-y", "git", "portaudio", "python3-devel"]),
-         "sudo dnf install git portaudio python3-devel".into())
+        (v(&["dnf", "install", "-y", "git", "portaudio", "python3-devel", "curl"]),
+         "sudo dnf install git portaudio python3-devel curl".into())
     } else if hay.contains("arch") {
-        (v(&["pacman", "-S", "--noconfirm", "git", "portaudio"]),
-         "sudo pacman -S git portaudio".into())
+        (v(&["pacman", "-S", "--noconfirm", "git", "portaudio", "curl"]),
+         "sudo pacman -S git portaudio curl".into())
     } else if hay.contains("suse") {
-        (v(&["zypper", "install", "-y", "git", "libportaudio2", "python3-devel"]),
-         "sudo zypper install git libportaudio2 python3-devel".into())
+        (v(&["zypper", "install", "-y", "git", "libportaudio2", "python3-devel", "curl"]),
+         "sudo zypper install git libportaudio2 python3-devel curl".into())
     } else {
-        (vec![], "install git, portaudio, and python dev headers with your package manager".into())
+        (vec![], "install git, portaudio, python dev headers, and curl with your package manager".into())
     }
 }
 
@@ -1253,26 +1071,6 @@ async fn ts_check_webui() -> (TsCheck, TsStatus) {
     }
 }
 
-async fn ts_check_starlette() -> (TsCheck, TsStatus) {
-    let (program, mut args) = find_conda_pip();
-    args.extend(["show".into(), "starlette".into()]);
-    match run_cmd_full_async(program, args).await {
-        Ok(output) => {
-            if let Some(ver_line) = output.lines().find(|l| l.starts_with("Version:")) {
-                let ver = ver_line.replace("Version:", "").trim().to_string();
-                if ver == "0.52.1" {
-                    (TsCheck::Starlette, TsStatus::Ok(format!("starlette {} (correct)", ver)))
-                } else {
-                    (TsCheck::Starlette, TsStatus::Problem(format!("starlette {} installed, needs 0.52.1", ver)))
-                }
-            } else {
-                (TsCheck::Starlette, TsStatus::Problem("starlette not installed".into()))
-            }
-        }
-        Err(e) => (TsCheck::Starlette, TsStatus::Problem(format!("Couldn't check: {}", e))),
-    }
-}
-
 async fn ts_check_deps() -> (TsCheck, TsStatus) {
     let (program, mut args) = find_conda_pip();
     args.push("check".into());
@@ -1423,15 +1221,6 @@ fn find_conda_pip() -> (String, Vec<String>) {
     (find_conda(), vec!["run".into(), "-n".into(), "sapphire".into(), "pip".into()])
 }
 
-async fn ts_fix_starlette() -> (TsCheck, String, bool) {
-    let (program, mut base_args) = find_conda_pip();
-    base_args.extend(["install".into(), "starlette==0.52.1".into()]);
-    match run_cmd_full_async(program, base_args).await {
-        Ok(out) => (TsCheck::Starlette, format!("Fixed! Restart Sapphire to apply."), true),
-        Err(e) => (TsCheck::Starlette, format!("Fix failed: {}", e), false),
-    }
-}
-
 async fn ts_fix_deps(install_path: String) -> (TsCheck, String, bool) {
     let req = PathBuf::from(&install_path).join("requirements.txt");
     let (program, mut base_args) = find_conda_pip();
@@ -1549,181 +1338,6 @@ async fn ts_fix_plugins(install_path: String) -> (TsCheck, String, bool) {
     } else {
         (TsCheck::Plugins, "All optional features installed. Restart Sapphire to apply.".into(), true)
     }
-}
-
-// ── Launch streaming ───────────────────────────────────────────────────────
-
-/// Reader task: owns the journalctl child and pumps lines into a channel.
-/// Uses lossy UTF-8 (download progress spam won't kill it) and collapses
-/// carriage-return progress bars to their final value. Stops when the receiver
-/// drops (subscription removed), which drops the child → `kill_on_drop`.
-async fn journal_reader(tx: tokio::sync::mpsc::UnboundedSender<String>) {
-    use tokio::io::AsyncBufReadExt;
-    let mut cmd = tokio::process::Command::new("journalctl");
-    cmd.args(["--user", "-u", "sapphire", "-f", "-n", "200", "-o", "cat"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    {
-        cmd.process_group(0);
-    }
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(format!("Couldn't read service logs: {}", e));
-            return;
-        }
-    };
-    let Some(stdout) = child.stdout.take() else { return };
-    let mut reader = BufReader::new(stdout);
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        tokio::select! {
-            _ = tx.closed() => break, // subscription gone → shut down (kills journalctl)
-            r = reader.read_until(b'\n', &mut buf) => match r {
-                Ok(0) => break, // EOF — journalctl exited
-                Ok(_) => {
-                    let mut s = String::from_utf8_lossy(&buf).into_owned();
-                    while s.ends_with('\n') || s.ends_with('\r') { s.pop(); }
-                    // Collapse \r progress bars to the latest segment.
-                    if let Some(i) = s.rfind('\r') { s = s[i + 1..].to_string(); }
-                    if tx.send(strip_ansi(&s)).is_err() { break; }
-                }
-                Err(_) => break,
-            }
-        }
-    }
-}
-
-/// A `Subscription`-driven follower of `journalctl --user -u sapphire -f`.
-/// As a Subscription (not Task::stream) iced parks it when idle. Each poll drains
-/// *all* currently-queued lines into one `SapphireLines` batch → one redraw per
-/// burst instead of one per line.
-fn journal_log_stream() -> impl futures::Stream<Item = Message> {
-    enum St {
-        Start,
-        Run(tokio::sync::mpsc::UnboundedReceiver<String>),
-    }
-    futures::stream::unfold(St::Start, |state| async move {
-        let mut rx = match state {
-            St::Start => {
-                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                // Spawned here (inside the polled stream → in tokio runtime context).
-                tokio::spawn(journal_reader(tx));
-                rx
-            }
-            St::Run(rx) => rx,
-        };
-        let first = rx.recv().await?;
-        let mut batch = vec![first];
-        while let Ok(line) = rx.try_recv() {
-            batch.push(line);
-            if batch.len() >= 2000 { break; }
-        }
-        Some((Message::SapphireLines(batch), St::Run(rx)))
-    })
-}
-
-fn launch_sapphire_stream(install_path: String, pid_store: Arc<AtomicU32>) -> impl futures::Stream<Item = Message> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-
-    tokio::task::spawn(async move {
-        // Resolve the env's python directly (avoids conda-run buffering) or conda run.
-        let (program, mut args) = sapphire_python_cmd();
-        let is_direct = args.is_empty();
-        args.push("-u".to_string());
-        args.push("main.py".to_string());
-
-        let mut cmd = tokio::process::Command::new(&program);
-        cmd.args(&args)
-            .current_dir(&install_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .env("PYTHONIOENCODING", "utf-8")
-            .env("PYTHONUTF8", "1");
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        #[cfg(unix)]
-        {
-            // Own process group so Stop can kill the whole tree (child workers).
-            cmd.process_group(0);
-        }
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send(Message::SapphireExited(format!("Failed to start: {}", e)));
-                return;
-            }
-        };
-
-        // Store PID for stop button
-        if let Some(pid) = child.id() {
-            pid_store.store(pid, Ordering::Relaxed);
-        }
-
-        if is_direct {
-            let _ = tx.send(Message::SapphireLine(format!("Using {}", program)));
-        }
-
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let tx_out = tx.clone();
-        let tx_err = tx.clone();
-
-        // Read stdout — buffered line reading with lossy UTF-8
-        let stdout_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            let mut buf = Vec::new();
-            use tokio::io::AsyncBufReadExt;
-            while reader.read_until(b'\n', &mut buf).await.unwrap_or(0) > 0 {
-                // Strip \r\n
-                while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
-                    buf.pop();
-                }
-                let line = strip_ansi(&String::from_utf8_lossy(&buf));
-                buf.clear();
-                if tx_out.send(Message::SapphireLine(line)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Read stderr
-        let stderr_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut buf = Vec::new();
-            use tokio::io::AsyncBufReadExt;
-            while reader.read_until(b'\n', &mut buf).await.unwrap_or(0) > 0 {
-                while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
-                    buf.pop();
-                }
-                let line = strip_ansi(&String::from_utf8_lossy(&buf));
-                buf.clear();
-                if tx_err.send(Message::SapphireLine(line)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Wait for everything concurrently — don't deadlock
-        let (_, _, status) = tokio::join!(stdout_task, stderr_task, child.wait());
-
-        let msg = match status {
-            Ok(s) if s.success() => "Sapphire exited.".to_string(),
-            Ok(s) if s.code() == Some(42) => "Sapphire is restarting...".to_string(),
-            Ok(s) => format!("Sapphire exited (code {}).", s.code().unwrap_or(-1)),
-            Err(e) => format!("Error: {}", e),
-        };
-        let _ = tx.send(Message::SapphireExited(msg));
-    });
-
-    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
 }
 
 // ── Update ─────────────────────────────────────────────────────────────────
@@ -2328,7 +1942,6 @@ impl App {
                 Task::batch(vec![
                     Task::perform(ts_check_running(), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_webui(), |(c, s)| Message::TroubleshootResult(c, s)),
-                    Task::perform(ts_check_starlette(), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_deps(), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_plugins(path), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_gpu(), |(c, s)| Message::TroubleshootResult(c, s)),
@@ -2352,9 +1965,6 @@ impl App {
                 self.log_lines.push(format!("[troubleshoot] Fixing {}...", ts_label(check)));
                 let path = self.install_path.clone();
                 match check {
-                    TsCheck::Starlette => Task::perform(ts_fix_starlette(), |(c, msg, ok)| {
-                        Message::TroubleshootFixResult(c, msg, ok)
-                    }),
                     TsCheck::DepsHealth => Task::perform(ts_fix_deps(path), |(c, msg, ok)| {
                         Message::TroubleshootFixResult(c, msg, ok)
                     }),
@@ -2602,666 +2212,6 @@ impl App {
         Subscription::batch(subs)
     }
 
-    // ── View ───────────────────────────────────────────────────────────────
-
-    fn view(&self) -> Element<Message> {
-        column![
-            self.view_header(),
-            self.view_tab_bar(),
-            self.view_tab_content(),
-            self.view_log_panel(),
-        ]
-        .spacing(0)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
-    }
-
-    // ── Header bar ─────────────────────────────────────────────────────────
-
-    fn view_header(&self) -> Element<Message> {
-        let placeholder = if cfg!(windows) { "C:\\Users\\You\\Sapphire" } else { "/home/you/sapphire" };
-        let path_input = text_input(placeholder, &self.install_path)
-            .on_input(Message::PathChanged)
-            .width(Length::FillPortion(3));
-
-        let browse_btn = button("Browse").on_press(Message::BrowsePath);
-
-        // At-a-glance: does the chosen folder actually hold a Sapphire install?
-        let p = PathBuf::from(&self.install_path);
-        let (hint_txt, hint_color) = if p.join("main.py").exists() {
-            ("installed", color!(0x4caf50))
-        } else if p.exists() {
-            ("no install here", color!(0xf9e154))
-        } else {
-            ("empty path", color!(0x7f849c))
-        };
-        let path_hint = text(hint_txt).size(11).color(hint_color);
-
-        let branch_picker = pick_list(
-            BRANCHES,
-            self.selected_branch,
-            Message::BranchSelected,
-        )
-        .placeholder("Branch...");
-
-        let mut header = row![
-            path_input,
-            browse_btn,
-            path_hint,
-            horizontal_space(),
-            branch_picker,
-        ]
-        .spacing(8)
-        .padding(8)
-        .align_y(iced::Alignment::Center);
-
-        // Update indicator
-        if let Some(n) = self.updates_available {
-            if n > 0 {
-                let badge = button(
-                    text(format!("{} new", n)).size(12).color(color!(0x3d85c6))
-                )
-                .on_press(Message::TabSelected(Tab::Update))
-                .style(button::text)
-                .padding([2, 6]);
-                header = header.push(badge);
-            }
-        }
-
-        if self.sapphire_stopping {
-            let stopping_btn = button(text("Stopping...").font(Font {
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            }))
-            .style(button::secondary);
-
-            header = header.push(stopping_btn);
-        } else if self.sapphire_running {
-            let open_btn = button(text("Open Browser").font(Font {
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            }))
-            .on_press(Message::OpenBrowser)
-            .style(button::primary);
-
-            let stop_btn = button(text("Stop").font(Font {
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            }))
-            .on_press(Message::StopSapphire)
-            .style(button::danger);
-
-            header = header.push(open_btn).push(stop_btn);
-        } else {
-            let launch_btn = button(text("Launch").font(Font {
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            }))
-            .on_press(Message::Launch)
-            .style(button::success);
-
-            header = header.push(launch_btn);
-        }
-
-        container(header)
-            .width(Length::Fill)
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(color!(0x181825))),
-                ..Default::default()
-            })
-            .into()
-    }
-
-    // ── Tab bar ────────────────────────────────────────────────────────────
-
-    fn view_tab_bar(&self) -> Element<Message> {
-        let running_label = if self.sapphire_running { "Log *" } else { "Log" };
-        let mut tabs = row![
-            self.tab_button("Install", Tab::Install),
-            self.tab_button("Update", Tab::Update),
-            self.tab_button("Uninstall", Tab::Uninstall),
-            self.tab_button("Troubleshoot", Tab::Troubleshoot),
-            self.tab_button(running_label, Tab::Running),
-        ]
-        .spacing(0);
-
-        // Service tab appears only when a systemd --user unit is detected (Linux).
-        if self.service.is_some() {
-            tabs = tabs.push(self.tab_button("Service", Tab::Service));
-        }
-
-        container(tabs)
-            .width(Length::Fill)
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(color!(0x11111b))),
-                ..Default::default()
-            })
-            .into()
-    }
-
-    fn tab_button<'a>(&self, label: &'a str, tab: Tab) -> Element<'a, Message> {
-        let is_active = self.active_tab == tab;
-
-        let btn = button(text(label))
-            .on_press(Message::TabSelected(tab))
-            .padding([8, 20]);
-
-        if is_active {
-            container(btn.style(button::primary))
-                .style(|_theme| container::Style {
-                    border: iced::Border {
-                        color: color!(0x3d85c6),
-                        width: 0.0,
-                        radius: 0.into(),
-                    },
-                    background: Some(iced::Background::Color(color!(0x1e1e2e))),
-                    ..Default::default()
-                })
-                .into()
-        } else {
-            container(btn.style(button::text)).into()
-        }
-    }
-
-    // ── Tab content ────────────────────────────────────────────────────────
-
-    fn view_tab_content(&self) -> Element<Message> {
-        // Running tab gets its own layout with fixed toolbar + scrollable log
-        if self.active_tab == Tab::Running {
-            return self.view_running_tab();
-        }
-
-        let content: Element<Message> = match self.active_tab {
-            Tab::Install => self.view_install_tab(),
-            Tab::Update => self.view_update_tab(),
-            Tab::Uninstall => self.view_uninstall_tab(),
-            Tab::Troubleshoot => self.view_troubleshoot_tab(),
-            Tab::Service => self.view_service_tab(),
-            Tab::Running => unreachable!(),
-        };
-
-        container(
-            scrollable(
-                container(content).width(Length::Fill)
-            )
-            .height(Length::Fill)
-            .width(Length::Fill),
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(Padding { top: 10.0, right: 16.0, bottom: 6.0, left: 16.0 })
-        .into()
-    }
-
-    fn view_install_tab(&self) -> Element<Message> {
-        let mut steps_col = Column::new().spacing(6);
-
-        for (step, status) in &self.steps {
-            let indicator = text(status.indicator(self.spinner_tick))
-                .size(16)
-                .color(status.color())
-                .width(20);
-
-            let label = text(step_label(*step)).size(15);
-
-            let mut row_items = row![indicator, label].spacing(10).align_y(iced::Alignment::Center);
-
-            // Show detail text if we have it
-            if let Some(detail) = status.detail() {
-                row_items = row_items.push(
-                    text(format!("— {}", detail))
-                        .size(12)
-                        .color(color!(0x7f849c)),
-                );
-            }
-
-            steps_col = steps_col.push(row_items);
-        }
-
-        // Action buttons
-        let has_not_found = self
-            .steps
-            .iter()
-            .any(|(s, st)| *s != Step::Done && matches!(st, StepStatus::NotFound(_)));
-
-        let all_not_started = self.steps.iter().all(|(_, st)| *st == StepStatus::NotStarted);
-
-        let mut buttons_row = row![].spacing(10);
-
-        // Scan button
-        let scan_label = if all_not_started { "Scan System" } else { "Re-scan" };
-        let scan_btn = button(text(scan_label))
-            .on_press_maybe(if self.scanning || self.installing {
-                None
-            } else {
-                Some(Message::ScanClicked)
-            })
-            .style(button::primary);
-        buttons_row = buttons_row.push(scan_btn);
-
-        // Go button — only if scan found stuff to install
-        if has_not_found {
-            let go_btn = button(
-                text("Go — Install Missing").font(Font {
-                    weight: iced::font::Weight::Bold,
-                    ..Font::DEFAULT
-                }),
-            )
-            .on_press_maybe(if self.scanning || self.installing {
-                None
-            } else {
-                Some(Message::GoClicked)
-            })
-            .style(button::success);
-            buttons_row = buttons_row.push(go_btn);
-        }
-
-        column![
-            text("Install Sapphire").size(18).font(Font {
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            }),
-            steps_col,
-            buttons_row,
-        ]
-        .spacing(8)
-        .padding(Padding { top: 0.0, right: 0.0, bottom: 12.0, left: 0.0 })
-        .into()
-    }
-
-    fn view_update_tab(&self) -> Element<Message> {
-        let mut steps_col = Column::new().spacing(6);
-
-        for (label, status) in &self.update_status {
-            let indicator = text(status.indicator(self.spinner_tick))
-                .size(16)
-                .color(status.color())
-                .width(20);
-
-            let label_text = text(label.as_str()).size(14);
-
-            let mut row_items = row![indicator, label_text].spacing(10).align_y(iced::Alignment::Center);
-
-            if let Some(detail) = status.detail() {
-                row_items = row_items.push(
-                    text(format!("— {}", detail)).size(11).color(color!(0x7f849c)),
-                );
-            }
-
-            steps_col = steps_col.push(row_items);
-        }
-
-        let update_label = if self.updating {
-            "Updating..."
-        } else if self.sapphire_running || self.sapphire_stopping {
-            "Stop & Update"
-        } else {
-            "Update"
-        };
-
-        let update_btn = button(text(update_label))
-            .on_press_maybe(if self.updating || self.sapphire_stopping {
-                None
-            } else {
-                Some(Message::UpdateClicked)
-            })
-            .style(button::primary);
-
-        let status_text = match self.updates_available {
-            Some(0) => text("Up to date.").size(13).color(color!(0x4caf50)),
-            Some(n) => text(format!("{} update{} available.", n, if n == 1 { "" } else { "s" }))
-                .size(13).color(color!(0x3d85c6)),
-            None if self.checking_updates => text("Checking...").size(13).color(color!(0x7f849c)),
-            None => text("Couldn't check for updates.").size(13).color(color!(0x7f849c)),
-        };
-
-        column![
-            text("Update Sapphire").size(18).font(Font {
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            }),
-            status_text,
-            steps_col,
-            update_btn,
-        ]
-        .spacing(10)
-        .into()
-    }
-
-    fn view_uninstall_tab(&self) -> Element<Message> {
-        let busy = self.uninstalling;
-
-        // ═══════════════════════════════════════════════════════════
-        // Quick Resets — safe, non-destructive to the install
-        // ═══════════════════════════════════════════════════════════
-
-        let reset_pw_btn = button(text("Reset Password").size(13))
-            .on_press(Message::ResetPassword)
-            .style(button::primary)
-            .padding([4, 12]);
-
-        let reset_creds_btn = button(text("Reset API Keys").size(13))
-            .on_press(Message::ResetCredentials)
-            .style(button::primary)
-            .padding([4, 12]);
-
-        let resets_section = column![
-            text("Quick Resets").size(16).font(Font {
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            }),
-            row![
-                column![
-                    reset_pw_btn,
-                    text("Forgot your password? This clears it so Sapphire asks for a new one.")
-                        .size(11).color(color!(0x7f849c)),
-                ].spacing(3).width(Length::FillPortion(1)),
-                column![
-                    reset_creds_btn,
-                    text("Clears saved API keys (Claude, OpenAI, etc). You'll re-enter them in Sapphire.")
-                        .size(11).color(color!(0x7f849c)),
-                ].spacing(3).width(Length::FillPortion(1)),
-            ].spacing(16),
-        ].spacing(8);
-
-        // ═══════════════════════════════════════════════════════════
-        // Danger Zone — destructive actions
-        // ═══════════════════════════════════════════════════════════
-
-        // Remove conda env
-        let env_label = if self.confirm_remove_env { "YES, remove it" } else { "Remove conda env" };
-        let remove_env_btn = button(text(env_label).size(13))
-            .on_press_maybe(if busy { None } else { Some(Message::UninstallCondaEnvClick) })
-            .style(button::danger)
-            .padding([4, 12]);
-        let env_desc = if self.confirm_remove_env {
-            text("Click again to confirm.").size(11).color(color!(0xe74c3c))
-        } else {
-            text("Deletes the 'sapphire' Python environment and all packages.").size(11).color(color!(0x7f849c))
-        };
-
-        // Delete user data
-        let ud_label = if self.confirm_delete_userdata { "YES, delete user data" } else { "Delete user data" };
-        let delete_ud_btn = button(text(ud_label).size(13))
-            .on_press_maybe(if busy { None } else { Some(Message::UninstallDeleteUserdataClick) })
-            .style(button::danger)
-            .padding([4, 12]);
-        let ud_desc = if self.confirm_delete_userdata {
-            text("Click again to confirm.").size(11).color(color!(0xe74c3c))
-        } else {
-            text("Removes sapphire/user/ — your settings and personal data.").size(11).color(color!(0x7f849c))
-        };
-
-        // Delete everything
-        let folder_label = if self.confirm_delete_folder { "YES, delete everything" } else { "Delete Sapphire folder" };
-        let delete_folder_btn = button(text(folder_label).size(13))
-            .on_press_maybe(if busy { None } else { Some(Message::UninstallDeleteFolderClick) })
-            .style(button::danger)
-            .padding([4, 12]);
-        let folder_desc = if self.confirm_delete_folder {
-            text("FINAL WARNING. Everything will be permanently deleted.").size(11).color(color!(0xe74c3c))
-        } else {
-            text(format!("Nukes {} — code, settings, everything. Cannot be undone.", self.install_path))
-                .size(11).color(color!(0x7f849c))
-        };
-
-        let danger_section = column![
-            text("Danger Zone").size(16).font(Font {
-                weight: iced::font::Weight::Bold,
-                ..Font::DEFAULT
-            }).color(color!(0xe74c3c)),
-            text("These actions are destructive. Won't touch Git or Miniconda.").size(11).color(color!(0x7f849c)),
-            column![remove_env_btn, env_desc].spacing(2),
-            column![delete_ud_btn, ud_desc].spacing(2),
-            column![delete_folder_btn, folder_desc].spacing(2),
-        ].spacing(8);
-
-        // Divider between sections
-        let divider = container(text(""))
-            .width(Length::Fill)
-            .height(1)
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(color!(0x313244))),
-                ..Default::default()
-            });
-
-        column![
-            resets_section,
-            divider,
-            danger_section,
-        ]
-        .spacing(12)
-        .into()
-    }
-
-    fn view_troubleshoot_tab(&self) -> Element<Message> {
-        let mut checks_col = Column::new().spacing(8);
-
-        for (check, status) in &self.ts_checks {
-            const SPINNER: &[&str] = &["/", "-", "\\", "|"];
-            let (indicator, color) = match status {
-                TsStatus::NotChecked => ("-", color!(0x585b70)),
-                TsStatus::Checking | TsStatus::Fixing => (SPINNER[self.spinner_tick % SPINNER.len()], color!(0x3d85c6)),
-                TsStatus::Ok(_) | TsStatus::Fixed(_) => ("+", color!(0x4caf50)),
-                TsStatus::Problem(_) => ("!", color!(0xe74c3c)),
-            };
-
-            let label_text = ts_label(*check);
-            let detail = match status {
-                TsStatus::Ok(s) | TsStatus::Problem(s) | TsStatus::Fixed(s) => Some(s.as_str()),
-                TsStatus::Checking => Some("checking..."),
-                TsStatus::Fixing => Some("fixing..."),
-                TsStatus::NotChecked => None,
-            };
-
-            let mut check_row = row![
-                text(indicator).size(14).color(color).width(18),
-                text(label_text).size(14),
-            ]
-            .spacing(8)
-            .align_y(iced::Alignment::Center);
-
-            if let Some(d) = detail {
-                check_row = check_row.push(
-                    text(format!("— {}", d)).size(11).color(color!(0x7f849c))
-                );
-            }
-
-            // Add Fix button for fixable problems
-            let is_fixable = matches!(
-                (check, status),
-                (TsCheck::Starlette, TsStatus::Problem(_))
-                    | (TsCheck::DepsHealth, TsStatus::Problem(_))
-                    | (TsCheck::Plugins, TsStatus::Problem(_))
-            );
-            let fix_label = if *check == TsCheck::Plugins { "Install" } else { "Fix" };
-            if is_fixable {
-                check_row = check_row.push(horizontal_space());
-                check_row = check_row.push(
-                    button(text(fix_label).size(11))
-                        .on_press(Message::TroubleshootFix(*check))
-                        .style(button::success)
-                        .padding([2, 10])
-                );
-            }
-
-            checks_col = checks_col.push(check_row);
-        }
-
-        let check_btn = button(text("Check Sapphire"))
-            .on_press_maybe(if self.ts_running { None } else { Some(Message::TroubleshootCheck) })
-            .style(button::primary);
-
-        column![
-            row![
-                text("Troubleshoot").size(18).font(Font {
-                    weight: iced::font::Weight::Bold,
-                    ..Font::DEFAULT
-                }),
-                horizontal_space(),
-                check_btn,
-            ].align_y(iced::Alignment::Center),
-            checks_col,
-        ]
-        .spacing(10)
-        .into()
-    }
-
-    fn view_service_tab(&self) -> Element<Message> {
-        let bold = Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT };
-
-        let (status_txt, status_color) = match &self.service {
-            Some(i) if i.active => (format!("active ({})", i.sub_state), color!(0x4caf50)),
-            Some(i) => (format!("inactive ({})", i.sub_state), color!(0x7f849c)),
-            None => ("no service detected".to_string(), color!(0x7f849c)),
-        };
-
-        let start_btn = button(text("Start").size(13))
-            .on_press(Message::ServiceStart).style(button::success).padding([4, 14]);
-        let stop_btn = button(text("Stop").size(13))
-            .on_press(Message::ServiceStop).style(button::danger).padding([4, 14]);
-        let restart_btn = button(text("Restart").size(13))
-            .on_press(Message::ServiceRestart).style(button::primary).padding([4, 14]);
-        let enable_btn = button(text("Enable at login").size(13))
-            .on_press(Message::ServiceEnable).style(button::secondary).padding([4, 14]);
-        let disable_btn = button(text("Disable at login").size(13))
-            .on_press(Message::ServiceDisable).style(button::secondary).padding([4, 14]);
-
-        let workdir = self.service.as_ref()
-            .and_then(|i| i.working_dir.clone())
-            .unwrap_or_else(|| "unknown".to_string());
-
-        column![
-            text("Service Control").size(18).font(bold),
-            text("Sapphire runs as a systemd --user service on this machine. The Launch/Stop buttons control the service.")
-                .size(11).color(color!(0x7f849c)),
-            row![
-                text("sapphire.service:").size(14),
-                text(status_txt).size(14).color(status_color),
-            ].spacing(8).align_y(iced::Alignment::Center),
-            row![start_btn, stop_btn, restart_btn].spacing(10),
-            row![enable_btn, disable_btn].spacing(10),
-            text(format!("Working directory: {}", workdir)).size(11).color(color!(0x7f849c)),
-            text("Live logs are in the Log tab.").size(11).color(color!(0x7f849c)),
-        ]
-        .spacing(12)
-        .into()
-    }
-
-    fn view_running_tab(&self) -> Element<Message> {
-        let status_text = if self.sapphire_running {
-            text("Sapphire is running").size(13).color(color!(0x4caf50))
-        } else if self.sapphire_log.is_empty() {
-            text("Hit Launch to start Sapphire.").size(13).color(color!(0x7f849c))
-        } else {
-            text("Sapphire stopped").size(13).color(color!(0x7f849c))
-        };
-
-        let copy_btn = button(text("Copy").size(11))
-            .on_press_maybe(if self.sapphire_log.is_empty() { None } else { Some(Message::CopyRunLog) })
-            .style(button::secondary)
-            .padding([2, 8]);
-
-        let open_label = if cfg!(windows) { "Open in Notepad" } else { "Open log" };
-        let open_btn = button(text(open_label).size(11))
-            .on_press_maybe(if self.sapphire_log.is_empty() { None } else { Some(Message::OpenRunLog) })
-            .style(button::secondary)
-            .padding([2, 8]);
-
-        let bottom_btn = button(text("Bottom").size(11))
-            .on_press(Message::ScrollRunLog)
-            .style(button::secondary)
-            .padding([2, 8]);
-
-        let toolbar = row![status_text, horizontal_space(), copy_btn, open_btn, bottom_btn]
-            .spacing(6)
-            .align_y(iced::Alignment::Center);
-
-        // Render only the tail — re-shaping thousands of lines every redraw is the
-        // expensive part. Copy/Open still use the full buffer.
-        let log_text = if self.sapphire_log.is_empty() {
-            "Waiting...".to_string()
-        } else {
-            let start = self.sapphire_log.len().saturating_sub(800);
-            self.sapphire_log[start..].join("\n")
-        };
-
-        let log_scroll = scrollable(
-            container(
-                text(log_text).size(12).font(Font::MONOSPACE),
-            )
-            .width(Length::Fill)
-            .padding(6),
-        )
-        .id(scrollable::Id::new("run-log"))
-        .width(Length::Fill)
-        .height(Length::Fill);
-
-        let log_area = container(log_scroll)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(color!(0x11111b))),
-                ..Default::default()
-            });
-
-        // Return the full layout — toolbar is fixed, log scrolls independently
-        container(
-            column![toolbar, log_area].spacing(4)
-        )
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .padding(Padding { top: 8.0, right: 12.0, bottom: 4.0, left: 12.0 })
-        .into()
-    }
-
-    // ── Log panel ──────────────────────────────────────────────────────────
-
-    fn view_log_panel(&self) -> Element<Message> {
-        let toggle = button(if self.log_visible { "[-] Log" } else { "[+] Log" })
-            .on_press(Message::ToggleLog)
-            .style(button::text)
-            .padding([2, 8]);
-
-        let mut panel = column![toggle].spacing(2).width(Length::Fill);
-
-        if self.log_visible {
-            // Tail only — keep redraw cheap as the launcher log grows.
-            let start = self.log_lines.len().saturating_sub(300);
-            let log_text = self.log_lines[start..].join("\n");
-            let log_area = container(
-                scrollable(
-                    container(
-                        text(log_text)
-                            .size(12)
-                            .font(Font::MONOSPACE),
-                    )
-                    .width(Length::Fill)
-                    .padding(6),
-                )
-                .anchor_bottom()
-                .width(Length::Fill)
-                .height(100),
-            )
-            .width(Length::Fill)
-            .style(|_theme| container::Style {
-                background: Some(iced::Background::Color(color!(0x11111b))),
-                border: iced::Border {
-                    color: color!(0x313244),
-                    width: 1.0,
-                    radius: 0.into(),
-                },
-                ..Default::default()
-            });
-            panel = panel.push(log_area);
-        }
-
-        container(panel)
-            .width(Length::Fill)
-            .padding(Padding { top: 8.0, right: 0.0, bottom: 0.0, left: 0.0 })
-            .into()
-    }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
@@ -3271,7 +2221,7 @@ fn step_label(step: Step) -> &'static str {
         #[cfg(windows)]
         Step::Git => "Check for Git",
         #[cfg(not(windows))]
-        Step::Git => "Check system packages (git, audio libs)",
+        Step::Git => "Check system packages (git, audio, curl)",
         Step::Conda => "Check for Miniconda",
         Step::CondaInit => "Initialize conda",
         Step::PythonEnv => "Create Python environment",
@@ -3286,7 +2236,6 @@ fn ts_label(check: TsCheck) -> &'static str {
     match check {
         TsCheck::SapphireRunning => "Sapphire responding",
         TsCheck::WebUi => "Web UI loading",
-        TsCheck::Starlette => "Starlette version",
         TsCheck::DepsHealth => "Package health",
         TsCheck::Plugins => "Optional features",
         TsCheck::Gpu => "GPU",
