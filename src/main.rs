@@ -147,6 +147,50 @@ fn kill_process_tree(pid: u32) {
     }
 }
 
+/// A detected systemd --user `sapphire.service` (Linux only).
+#[derive(Debug, Clone)]
+struct ServiceInfo {
+    active: bool,
+    sub_state: String,
+    working_dir: Option<String>,
+}
+
+/// Detect a systemd --user `sapphire.service`. Returns None if no such unit
+/// (or on Windows, or if systemctl is absent). This is what flips the launcher
+/// into "service mode" — Launch/Stop drive the unit instead of spawning python.
+#[cfg(not(windows))]
+fn detect_sapphire_service() -> Option<ServiceInfo> {
+    let out = std::process::Command::new("systemctl")
+        .args([
+            "--user", "show", "sapphire",
+            "-p", "LoadState", "-p", "ActiveState",
+            "-p", "SubState", "-p", "WorkingDirectory",
+        ])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (mut load, mut active, mut sub, mut wd) = ("", "", "", "");
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("LoadState=") { load = v; }
+        else if let Some(v) = line.strip_prefix("ActiveState=") { active = v; }
+        else if let Some(v) = line.strip_prefix("SubState=") { sub = v; }
+        else if let Some(v) = line.strip_prefix("WorkingDirectory=") { wd = v; }
+    }
+    if load != "loaded" {
+        return None; // unit doesn't exist
+    }
+    Some(ServiceInfo {
+        active: active == "active",
+        sub_state: sub.to_string(),
+        working_dir: if wd.is_empty() { None } else { Some(wd.to_string()) },
+    })
+}
+
+#[cfg(windows)]
+fn detect_sapphire_service() -> Option<ServiceInfo> {
+    None
+}
+
 // ── Config persistence ─────────────────────────────────────────────────────
 
 fn config_path() -> PathBuf {
@@ -237,6 +281,11 @@ fn main() -> iced::Result {
             let path = app.install_path.clone();
             let branch = app.selected_branch.unwrap_or(Branch::Stable);
             let task = Task::batch(vec![
+                // Detect a systemd --user service (Linux) → flips into service mode
+                Task::perform(
+                    async { tokio::task::spawn_blocking(detect_sapphire_service).await.unwrap_or(None) },
+                    Message::ServiceDetected,
+                ),
                 // Check if sapphire is already running
                 Task::perform(
                     async {
@@ -366,6 +415,12 @@ struct App {
     sapphire_stopping: bool,
     sapphire_log: Vec<String>,
     sapphire_pid: Arc<AtomicU32>,
+    // Linux systemd --user service (None on Windows / when no unit is detected)
+    service: Option<ServiceInfo>,
+    // While true, a Subscription follows journalctl for live service logs.
+    streaming_journal: bool,
+    // Bumped on each (re)start so iced treats the follower as a fresh subscription.
+    journal_epoch: usize,
 }
 
 impl Default for App {
@@ -409,6 +464,9 @@ impl Default for App {
             sapphire_stopping: false,
             sapphire_log: Vec::new(),
             sapphire_pid: Arc::new(AtomicU32::new(0)),
+            service: None,
+            streaming_journal: false,
+            journal_epoch: 0,
         }
     }
 }
@@ -421,6 +479,7 @@ enum Tab {
     Uninstall,
     Troubleshoot,
     Running,
+    Service,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,7 +525,8 @@ enum Message {
     ScrollRunLog,
     // Launch
     LaunchPreCheck(bool, bool),   // (already_running, user_initiated)
-    SapphireLine(String),   // a line of output from sapphire
+    SapphireLine(String),   // a single line of output from sapphire
+    SapphireLines(Vec<String>), // a coalesced batch of log lines (burst-safe)
     SapphireExited(String), // process ended
     SapphireStopConfirmed,  // process is actually dead
     // Uninstall flow (two-click confirmation)
@@ -488,6 +548,15 @@ enum Message {
     TroubleshootResult(TsCheck, TsStatus),
     TroubleshootFix(TsCheck),
     TroubleshootFixResult(TsCheck, String, bool),
+    // Service (Linux systemd --user)
+    ServiceDetected(Option<ServiceInfo>),
+    ServiceStart,
+    ServiceStop,
+    ServiceRestart,
+    ServiceEnable,
+    ServiceDisable,
+    ServiceActionResult(String, bool),
+    ServiceRefreshed(Option<ServiceInfo>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1294,6 +1363,79 @@ async fn ts_fix_plugins(install_path: String) -> (TsCheck, String, bool) {
 
 // ── Launch streaming ───────────────────────────────────────────────────────
 
+/// Reader task: owns the journalctl child and pumps lines into a channel.
+/// Uses lossy UTF-8 (download progress spam won't kill it) and collapses
+/// carriage-return progress bars to their final value. Stops when the receiver
+/// drops (subscription removed), which drops the child → `kill_on_drop`.
+async fn journal_reader(tx: tokio::sync::mpsc::UnboundedSender<String>) {
+    use tokio::io::AsyncBufReadExt;
+    let mut cmd = tokio::process::Command::new("journalctl");
+    cmd.args(["--user", "-u", "sapphire", "-f", "-n", "200", "-o", "cat"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    {
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(format!("Couldn't read service logs: {}", e));
+            return;
+        }
+    };
+    let Some(stdout) = child.stdout.take() else { return };
+    let mut reader = BufReader::new(stdout);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        tokio::select! {
+            _ = tx.closed() => break, // subscription gone → shut down (kills journalctl)
+            r = reader.read_until(b'\n', &mut buf) => match r {
+                Ok(0) => break, // EOF — journalctl exited
+                Ok(_) => {
+                    let mut s = String::from_utf8_lossy(&buf).into_owned();
+                    while s.ends_with('\n') || s.ends_with('\r') { s.pop(); }
+                    // Collapse \r progress bars to the latest segment.
+                    if let Some(i) = s.rfind('\r') { s = s[i + 1..].to_string(); }
+                    if tx.send(strip_ansi(&s)).is_err() { break; }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+}
+
+/// A `Subscription`-driven follower of `journalctl --user -u sapphire -f`.
+/// As a Subscription (not Task::stream) iced parks it when idle. Each poll drains
+/// *all* currently-queued lines into one `SapphireLines` batch → one redraw per
+/// burst instead of one per line.
+fn journal_log_stream() -> impl futures::Stream<Item = Message> {
+    enum St {
+        Start,
+        Run(tokio::sync::mpsc::UnboundedReceiver<String>),
+    }
+    futures::stream::unfold(St::Start, |state| async move {
+        let mut rx = match state {
+            St::Start => {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                // Spawned here (inside the polled stream → in tokio runtime context).
+                tokio::spawn(journal_reader(tx));
+                rx
+            }
+            St::Run(rx) => rx,
+        };
+        let first = rx.recv().await?;
+        let mut batch = vec![first];
+        while let Ok(line) = rx.try_recv() {
+            batch.push(line);
+            if batch.len() >= 2000 { break; }
+        }
+        Some((Message::SapphireLines(batch), St::Run(rx)))
+    })
+}
+
 fn launch_sapphire_stream(install_path: String, pid_store: Arc<AtomicU32>) -> impl futures::Stream<Item = Message> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -1470,6 +1612,11 @@ impl App {
                     return Task::none();
                 }
 
+                // Service mode: start the systemd unit + follow journalctl instead.
+                if self.service.is_some() {
+                    return self.update(Message::ServiceStart);
+                }
+
                 let main_py = PathBuf::from(&self.install_path).join("main.py");
                 if !main_py.exists() {
                     self.log_lines.push(format!(
@@ -1492,6 +1639,14 @@ impl App {
                 )
             }
             Message::LaunchPreCheck(already_running, user_initiated) => {
+                // Service mode: running state + logs are owned by ServiceDetected.
+                if self.service.is_some() {
+                    self.sapphire_running = already_running;
+                    if user_initiated {
+                        self.active_tab = Tab::Running;
+                    }
+                    return Task::none();
+                }
                 if already_running {
                     self.sapphire_running = true;
                     self.sapphire_log.clear();
@@ -1520,6 +1675,10 @@ impl App {
                 }
             }
             Message::StopSapphire => {
+                // Service mode: stop the unit (and refresh status) instead of pkill.
+                if self.service.is_some() {
+                    return self.update(Message::ServiceStop);
+                }
                 self.sapphire_stopping = true;
                 self.log_lines.push("Stopping Sapphire...".to_string());
                 self.kill_sapphire_processes();
@@ -1684,10 +1843,12 @@ impl App {
             }
             Message::SapphireLine(line) => {
                 self.sapphire_log.push(line);
-                // Cap at 5000 lines to prevent memory bloat
-                if self.sapphire_log.len() > 5000 {
-                    self.sapphire_log.drain(..1000);
-                }
+                self.cap_sapphire_log();
+                Task::none()
+            }
+            Message::SapphireLines(lines) => {
+                self.sapphire_log.extend(lines);
+                self.cap_sapphire_log();
                 Task::none()
             }
             Message::SapphireExited(msg) => {
@@ -2028,13 +2189,144 @@ impl App {
                 }
                 Task::none()
             }
+
+            // ── Service (Linux systemd --user) ────────────────────────
+            Message::ServiceDetected(info) => {
+                self.service = info.clone();
+                let mut tasks: Vec<Task<Message>> = Vec::new();
+                if let Some(info) = info {
+                    self.log_lines.push(format!("Detected sapphire.service ({}).", info.sub_state));
+                    // Auto-fill path from the unit's WorkingDirectory, but only if our
+                    // current path isn't already a valid install (don't override saved).
+                    if let Some(wd) = &info.working_dir {
+                        let have_valid = PathBuf::from(&self.install_path).join("main.py").exists();
+                        if !have_valid && PathBuf::from(wd).join("main.py").exists() {
+                            self.install_path = wd.clone();
+                            self.selected_branch = Some(detect_git_branch(wd));
+                            save_config(&self.install_path, self.selected_branch.unwrap_or(Branch::Stable));
+                            self.log_lines.push(format!("Using service path: {}", wd));
+                            tasks.push(Task::done(Message::ScanClicked));
+                        }
+                    }
+                    self.sapphire_running = info.active;
+                    if info.active {
+                        // Attach live logs (the journalctl Subscription starts itself).
+                        self.sapphire_log.clear();
+                        self.streaming_journal = true;
+                        self.journal_epoch += 1;
+                    }
+                }
+                Task::batch(tasks)
+            }
+            Message::ServiceStart => {
+                self.sapphire_running = true;
+                self.sapphire_stopping = false;
+                self.sapphire_log.clear();
+                self.streaming_journal = true;
+                self.journal_epoch += 1;
+                self.active_tab = Tab::Running;
+                self.log_lines.push("Starting Sapphire service...".to_string());
+                Task::perform(
+                    async {
+                        run_cmd_full_async("systemctl".into(), vec!["--user".into(), "start".into(), "sapphire".into()]).await
+                            .map(|_| ("Service started.".to_string(), true))
+                            .unwrap_or_else(|e| (format!("Service start failed: {}", e), false))
+                    },
+                    |(m, ok)| Message::ServiceActionResult(m, ok),
+                )
+            }
+            Message::ServiceStop => {
+                self.sapphire_stopping = true;
+                self.streaming_journal = false;
+                self.log_lines.push("Stopping Sapphire service...".to_string());
+                Task::perform(
+                    async {
+                        let r = run_cmd_full_async("systemctl".into(), vec!["--user".into(), "stop".into(), "sapphire".into()]).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                        r.map(|_| ("Service stopped.".to_string(), true))
+                            .unwrap_or_else(|e| (format!("Service stop failed: {}", e), false))
+                    },
+                    |(m, ok)| Message::ServiceActionResult(m, ok),
+                )
+            }
+            Message::ServiceRestart => {
+                self.sapphire_running = true;
+                self.sapphire_stopping = false;
+                self.streaming_journal = true;
+                self.journal_epoch += 1;
+                self.active_tab = Tab::Running;
+                self.log_lines.push("Restarting Sapphire service...".to_string());
+                Task::perform(
+                    async {
+                        run_cmd_full_async("systemctl".into(), vec!["--user".into(), "restart".into(), "sapphire".into()]).await
+                            .map(|_| ("Service restarted.".to_string(), true))
+                            .unwrap_or_else(|e| (format!("Service restart failed: {}", e), false))
+                    },
+                    |(m, ok)| Message::ServiceActionResult(m, ok),
+                )
+            }
+            Message::ServiceEnable => {
+                self.log_lines.push("Enabling sapphire.service (autostart at login)...".to_string());
+                Task::perform(
+                    async {
+                        run_cmd_full_async("systemctl".into(), vec!["--user".into(), "enable".into(), "sapphire".into()]).await
+                            .map(|_| ("Autostart enabled.".to_string(), true))
+                            .unwrap_or_else(|e| (format!("Enable failed: {}", e), false))
+                    },
+                    |(m, ok)| Message::ServiceActionResult(m, ok),
+                )
+            }
+            Message::ServiceDisable => {
+                self.log_lines.push("Disabling sapphire.service autostart...".to_string());
+                Task::perform(
+                    async {
+                        run_cmd_full_async("systemctl".into(), vec!["--user".into(), "disable".into(), "sapphire".into()]).await
+                            .map(|_| ("Autostart disabled.".to_string(), true))
+                            .unwrap_or_else(|e| (format!("Disable failed: {}", e), false))
+                    },
+                    |(m, ok)| Message::ServiceActionResult(m, ok),
+                )
+            }
+            Message::ServiceActionResult(msg, ok) => {
+                self.log_lines.push(format!("[service] {}", msg));
+                if !ok {
+                    self.sapphire_running = false;
+                    self.sapphire_stopping = false;
+                }
+                // Re-read the unit state to sync the UI.
+                Task::perform(
+                    async { tokio::task::spawn_blocking(detect_sapphire_service).await.unwrap_or(None) },
+                    Message::ServiceRefreshed,
+                )
+            }
+            Message::ServiceRefreshed(info) => {
+                if let Some(info) = &info {
+                    self.sapphire_running = info.active;
+                    self.sapphire_stopping = false;
+                }
+                self.service = info;
+                Task::none()
+            }
         }
     }
 
-    /// Find the next step that needs installing and fire it off.
-    /// Steps that are already Found/Done get skipped.
-    /// Kill all sapphire python processes
+    /// Keep the live log buffer bounded (scrollback cap).
+    fn cap_sapphire_log(&mut self) {
+        const CAP: usize = 2000;
+        if self.sapphire_log.len() > CAP {
+            let excess = self.sapphire_log.len() - CAP;
+            self.sapphire_log.drain(..excess);
+        }
+    }
+
+    /// Kill sapphire — the systemd unit in service mode, else the process tree.
+    /// (The journalctl follower is a Subscription; it dies when streaming_journal
+    /// goes false and iced drops it.)
     fn kill_sapphire_processes(&self) {
+        if self.service.is_some() {
+            let _ = hidden_cmd("systemctl").args(["--user", "stop", "sapphire"]).output();
+            return;
+        }
         let pid = self.sapphire_pid.load(Ordering::Relaxed);
         kill_process_tree(pid);
         if pid > 0 {
@@ -2096,15 +2388,23 @@ impl App {
     }
 
     fn subscription(&self) -> Subscription<Message> {
+        let mut subs: Vec<Subscription<Message>> = Vec::new();
+
         // Only tick when something is animating
         let anything_busy = self.scanning || self.installing || self.updating
             || self.uninstalling || self.ts_running || self.checking_updates
             || self.sapphire_stopping;
         if anything_busy {
-            iced::time::every(std::time::Duration::from_millis(200)).map(|_| Message::Tick)
-        } else {
-            Subscription::none()
+            subs.push(iced::time::every(std::time::Duration::from_millis(200)).map(|_| Message::Tick));
         }
+
+        // Follow service logs via journalctl while in service mode (parks when idle).
+        // The epoch id makes a Stop→Start cycle spawn a fresh follower.
+        if self.streaming_journal {
+            subs.push(Subscription::run_with_id(self.journal_epoch, journal_log_stream()));
+        }
+
+        Subscription::batch(subs)
     }
 
     // ── View ───────────────────────────────────────────────────────────────
@@ -2209,7 +2509,7 @@ impl App {
 
     fn view_tab_bar(&self) -> Element<Message> {
         let running_label = if self.sapphire_running { "Log •" } else { "Log" };
-        let tabs = row![
+        let mut tabs = row![
             self.tab_button("Install", Tab::Install),
             self.tab_button("Update", Tab::Update),
             self.tab_button("Uninstall", Tab::Uninstall),
@@ -2217,6 +2517,11 @@ impl App {
             self.tab_button(running_label, Tab::Running),
         ]
         .spacing(0);
+
+        // Service tab appears only when a systemd --user unit is detected (Linux).
+        if self.service.is_some() {
+            tabs = tabs.push(self.tab_button("Service", Tab::Service));
+        }
 
         container(tabs)
             .width(Length::Fill)
@@ -2264,6 +2569,7 @@ impl App {
             Tab::Update => self.view_update_tab(),
             Tab::Uninstall => self.view_uninstall_tab(),
             Tab::Troubleshoot => self.view_troubleshoot_tab(),
+            Tab::Service => self.view_service_tab(),
             Tab::Running => unreachable!(),
         };
 
@@ -2594,6 +2900,47 @@ impl App {
         .into()
     }
 
+    fn view_service_tab(&self) -> Element<Message> {
+        let bold = Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT };
+
+        let (status_txt, status_color) = match &self.service {
+            Some(i) if i.active => (format!("active ({})", i.sub_state), color!(0x4caf50)),
+            Some(i) => (format!("inactive ({})", i.sub_state), color!(0x7f849c)),
+            None => ("no service detected".to_string(), color!(0x7f849c)),
+        };
+
+        let start_btn = button(text("Start").size(13))
+            .on_press(Message::ServiceStart).style(button::success).padding([4, 14]);
+        let stop_btn = button(text("Stop").size(13))
+            .on_press(Message::ServiceStop).style(button::danger).padding([4, 14]);
+        let restart_btn = button(text("Restart").size(13))
+            .on_press(Message::ServiceRestart).style(button::primary).padding([4, 14]);
+        let enable_btn = button(text("Enable at login").size(13))
+            .on_press(Message::ServiceEnable).style(button::secondary).padding([4, 14]);
+        let disable_btn = button(text("Disable at login").size(13))
+            .on_press(Message::ServiceDisable).style(button::secondary).padding([4, 14]);
+
+        let workdir = self.service.as_ref()
+            .and_then(|i| i.working_dir.clone())
+            .unwrap_or_else(|| "—".to_string());
+
+        column![
+            text("Service Control").size(18).font(bold),
+            text("Sapphire runs as a systemd --user service on this machine. The Launch/Stop buttons control the service.")
+                .size(11).color(color!(0x7f849c)),
+            row![
+                text("sapphire.service:").size(14),
+                text(status_txt).size(14).color(status_color),
+            ].spacing(8).align_y(iced::Alignment::Center),
+            row![start_btn, stop_btn, restart_btn].spacing(10),
+            row![enable_btn, disable_btn].spacing(10),
+            text(format!("Working directory: {}", workdir)).size(11).color(color!(0x7f849c)),
+            text("Live logs are in the Log tab.").size(11).color(color!(0x7f849c)),
+        ]
+        .spacing(12)
+        .into()
+    }
+
     fn view_running_tab(&self) -> Element<Message> {
         let status_text = if self.sapphire_running {
             text("Sapphire is running").size(13).color(color!(0x4caf50))
@@ -2622,10 +2969,13 @@ impl App {
             .spacing(6)
             .align_y(iced::Alignment::Center);
 
+        // Render only the tail — re-shaping thousands of lines every redraw is the
+        // expensive part. Copy/Open still use the full buffer.
         let log_text = if self.sapphire_log.is_empty() {
             "Waiting...".to_string()
         } else {
-            self.sapphire_log.join("\n")
+            let start = self.sapphire_log.len().saturating_sub(800);
+            self.sapphire_log[start..].join("\n")
         };
 
         let log_scroll = scrollable(
@@ -2668,7 +3018,9 @@ impl App {
         let mut panel = column![toggle].spacing(2).width(Length::Fill);
 
         if self.log_visible {
-            let log_text = self.log_lines.join("\n");
+            // Tail only — keep redraw cheap as the launcher log grows.
+            let start = self.log_lines.len().saturating_sub(300);
+            let log_text = self.log_lines[start..].join("\n");
             let log_area = container(
                 scrollable(
                     container(
