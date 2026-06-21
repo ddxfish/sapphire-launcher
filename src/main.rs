@@ -1,11 +1,12 @@
 #![windows_subsystem = "windows"]
 
-use iced::widget::scrollable;
+use iced::widget::{scrollable, text_editor};
 use iced::{color, Subscription, Task, Theme};
 use iced::window;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+use std::sync::{Arc, Mutex, atomic::{AtomicU32, Ordering}};
+use std::time::Instant;
 
 mod ui;
 mod service;
@@ -121,6 +122,13 @@ fn main() -> iced::Result {
                     async { tokio::task::spawn_blocking(detect_sapphire_service).await.unwrap_or(None) },
                     Message::ServiceDetected,
                 ),
+                // Is systemd --user available at all? (gates the Autostart tab's Enable)
+                Task::perform(
+                    async { tokio::task::spawn_blocking(systemd_user_available).await.unwrap_or(false) },
+                    Message::SystemdChecked,
+                ),
+                // Load any saved service env vars into the editor
+                Task::perform(read_env_file(), Message::EnvLoaded),
                 // Check if sapphire is already running
                 Task::perform(
                     async {
@@ -312,6 +320,14 @@ struct App {
     streaming_journal: bool,
     // Bumped on each (re)start so iced treats the follower as a fresh subscription.
     journal_epoch: usize,
+    // Autostart tab (Linux): whether systemd --user is available; remove confirm.
+    systemd_available: bool,
+    confirm_remove_service: bool,
+    // Service env vars (EnvironmentFile), edited in the manage view.
+    env_content: text_editor::Content,
+    // Live install output (streamed by run_cmd_streamed, drained on Tick) + step timer.
+    install_output: Arc<Mutex<Vec<String>>>,
+    step_started: Option<Instant>,
 }
 
 impl Default for App {
@@ -357,6 +373,11 @@ impl Default for App {
             service: None,
             streaming_journal: false,
             journal_epoch: 0,
+            systemd_available: false,
+            confirm_remove_service: false,
+            env_content: text_editor::Content::new(),
+            install_output: Arc::new(Mutex::new(Vec::new())),
+            step_started: None,
         }
     }
 }
@@ -447,6 +468,15 @@ enum Message {
     ServiceDisable,
     ServiceActionResult(String, bool),
     ServiceRefreshed(Option<ServiceInfo>),
+    SystemdChecked(bool),
+    ServiceInstall,
+    ServiceInstallResult(String, bool),
+    ServiceRemoveClick,
+    ServiceRemoveResult(String, bool),
+    EnvLoaded(String),
+    EnvEdit(text_editor::Action),
+    EnvSaveRestart,
+    EnvSaved(bool),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -892,7 +922,7 @@ async fn install_clone(install_path: String, branch: String) -> (Step, StepStatu
     }
 }
 
-async fn install_deps(install_path: String) -> (Step, StepStatus, String) {
+async fn install_deps(install_path: String, sink: Arc<std::sync::Mutex<Vec<String>>>) -> (Step, StepStatus, String) {
     let req_file = PathBuf::from(&install_path).join("requirements.txt");
 
     if !req_file.exists() {
@@ -903,21 +933,14 @@ async fn install_deps(install_path: String) -> (Step, StepStatus, String) {
         );
     }
 
-    // Run pip inside the conda env — use find_conda_pip for direct path,
-    // which is more reliable than conda run on fresh installs
+    // Run pip inside the conda env. Stream output live so a multi-GB download
+    // (torch &c.) shows progress instead of looking frozen.
     let (program, mut base_args) = find_conda_pip();
     base_args.extend(["install".into(), "-r".into(), req_file.to_string_lossy().to_string()]);
-    match run_cmd_full_async(program, base_args).await {
-        Ok(out) => (
-            Step::Deps,
-            StepStatus::Done("Dependencies installed".to_string()),
-            out,
-        ),
-        Err(e) => (
-            Step::Deps,
-            StepStatus::Failed(format!("pip install failed: {}", e)),
-            e,
-        ),
+    match run_cmd_streamed(program, base_args, None, sink).await {
+        // lines were already streamed live → empty log_output to avoid double-printing
+        Ok(_) => (Step::Deps, StepStatus::Done("Dependencies installed".to_string()), String::new()),
+        Err(e) => (Step::Deps, StepStatus::Failed(format!("pip install failed: {}", e)), String::new()),
     }
 }
 
@@ -1347,6 +1370,15 @@ impl App {
         match message {
             Message::Tick => {
                 self.spinner_tick = self.spinner_tick.wrapping_add(1);
+                // Drain any live install output into the launcher log.
+                let drained: Vec<String> = match self.install_output.lock() {
+                    Ok(mut v) => std::mem::take(&mut *v),
+                    Err(_) => Vec::new(),
+                };
+                if !drained.is_empty() {
+                    self.log_lines.extend(drained);
+                    self.cap_log_lines();
+                }
                 Task::none()
             }
             Message::PathChanged(path) => {
@@ -1674,6 +1706,7 @@ impl App {
                 self.confirm_remove_env = false;
                 self.confirm_delete_folder = false;
                 self.confirm_delete_userdata = false;
+                self.confirm_remove_service = false;
                 // Auto-check for updates when opening Update tab
                 if tab == Tab::Update {
                     return self.update(Message::CheckForUpdates);
@@ -1766,6 +1799,7 @@ impl App {
 
             Message::GoClicked => {
                 self.installing = true;
+                if let Ok(mut v) = self.install_output.lock() { v.clear(); }
 
                 self.log_lines.push("Starting install...".to_string());
 
@@ -2103,6 +2137,70 @@ impl App {
                 self.service = info;
                 Task::none()
             }
+            Message::SystemdChecked(available) => {
+                self.systemd_available = available;
+                Task::none()
+            }
+            Message::ServiceInstall => {
+                self.log_lines.push("[service] Creating systemd --user unit...".to_string());
+                let path = self.install_path.clone();
+                Task::perform(install_service(path), |(m, ok)| Message::ServiceInstallResult(m, ok))
+            }
+            Message::ServiceInstallResult(msg, ok) => {
+                self.log_lines.push(format!("[service] {}", msg));
+                if ok {
+                    self.sapphire_running = true;
+                    self.streaming_journal = true;
+                    self.journal_epoch += 1;
+                    self.sapphire_log.clear();
+                }
+                // Re-detect so the tab flips to the manage view.
+                Task::perform(
+                    async { tokio::task::spawn_blocking(detect_sapphire_service).await.unwrap_or(None) },
+                    Message::ServiceRefreshed,
+                )
+            }
+            Message::ServiceRemoveClick => {
+                if !self.confirm_remove_service {
+                    self.confirm_remove_service = true;
+                    return Task::none();
+                }
+                self.confirm_remove_service = false;
+                self.streaming_journal = false;
+                self.log_lines.push("[service] Removing systemd --user unit...".to_string());
+                Task::perform(remove_service(), |(m, ok)| Message::ServiceRemoveResult(m, ok))
+            }
+            Message::ServiceRemoveResult(msg, ok) => {
+                self.log_lines.push(format!("[service] {}", msg));
+                if ok {
+                    self.sapphire_running = false;
+                    self.sapphire_stopping = false;
+                }
+                Task::perform(
+                    async { tokio::task::spawn_blocking(detect_sapphire_service).await.unwrap_or(None) },
+                    Message::ServiceRefreshed,
+                )
+            }
+            Message::EnvLoaded(s) => {
+                self.env_content = text_editor::Content::with_text(&s);
+                Task::none()
+            }
+            Message::EnvEdit(action) => {
+                self.env_content.perform(action);
+                Task::none()
+            }
+            Message::EnvSaveRestart => {
+                self.log_lines.push("[service] Saving environment, then restarting...".to_string());
+                Task::perform(write_env_file(self.env_content.text()), Message::EnvSaved)
+            }
+            Message::EnvSaved(ok) => {
+                if ok {
+                    self.log_lines.push("[service] Environment saved.".to_string());
+                    return self.update(Message::ServiceRestart);
+                }
+                self.log_lines.push("[service] Couldn't write the environment file.".to_string());
+                Task::none()
+            }
         }
     }
 
@@ -2150,6 +2248,7 @@ impl App {
         let Some(step) = next else {
             // Nothing left to install — we're done!
             self.installing = false;
+            self.step_started = None;
             if let Some((_, s)) = self.steps.iter_mut().find(|(s, _)| *s == Step::Done) {
                 *s = StepStatus::Done("Sapphire is ready! Hit Launch.".to_string());
             }
@@ -2161,6 +2260,7 @@ impl App {
         if let Some((_, s)) = self.steps.iter_mut().find(|(st, _)| *st == step) {
             *s = StepStatus::Installing;
         }
+        self.step_started = Some(Instant::now());
         self.log_lines.push(format!("[install] {}...", step_label(step)));
 
         let path = self.install_path.clone();
@@ -2185,7 +2285,7 @@ impl App {
             Step::Clone => Task::perform(install_clone(path, branch), |(s, st, log)| {
                 Message::InstallStepResult(s, st, log)
             }),
-            Step::Deps => Task::perform(install_deps(path), |(s, st, log)| {
+            Step::Deps => Task::perform(install_deps(path, self.install_output.clone()), |(s, st, log)| {
                 Message::InstallStepResult(s, st, log)
             }),
             Step::Done => unreachable!(),

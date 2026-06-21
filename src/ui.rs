@@ -1,6 +1,7 @@
 // View rendering — split out of main.rs (modular source, single output binary).
 use crate::*;
-use iced::widget::{button, column, container, horizontal_space, pick_list, row, scrollable, text, text_input, Column};
+use crate::platform::sapphire_env_python;
+use iced::widget::{button, column, container, horizontal_space, pick_list, row, scrollable, text, text_editor, text_input, Column};
 use iced::{color, Element, Font, Length, Padding};
 use std::path::PathBuf;
 
@@ -129,9 +130,12 @@ impl App {
         ]
         .spacing(0);
 
-        // Service tab appears only when a systemd --user unit is detected (Linux).
-        if self.service.is_some() {
-            tabs = tabs.push(self.tab_button("Service", Tab::Service));
+        // Autostart tab (Linux only for now): shown when a unit exists OR Sapphire
+        // is installed (so an orphaned unit stays removable after an uninstall).
+        let show_autostart = cfg!(not(windows))
+            && (self.service.is_some() || PathBuf::from(&self.install_path).join("main.py").exists());
+        if show_autostart {
+            tabs = tabs.push(self.tab_button("Autostart", Tab::Service));
         }
 
         container(tabs)
@@ -217,6 +221,16 @@ impl App {
                         .size(12)
                         .color(color!(0x7f849c)),
                 );
+            }
+
+            // Live elapsed timer on the in-progress step — proves it's alive even
+            // during a long silent download.
+            if matches!(status, StepStatus::Installing) {
+                if let Some(start) = self.step_started {
+                    let secs = start.elapsed().as_secs();
+                    let t = if secs < 60 { format!("{}s", secs) } else { format!("{}m{:02}s", secs / 60, secs % 60) };
+                    row_items = row_items.push(text(t).size(12).color(color!(0x3d85c6)));
+                }
             }
 
             steps_col = steps_col.push(row_items);
@@ -512,42 +526,113 @@ impl App {
 
     fn view_service_tab(&self) -> Element<Message> {
         let bold = Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT };
+        let muted = color!(0x7f849c);
+        let divider = || container(text("")).width(Length::Fill).height(1).style(|_t| container::Style {
+            background: Some(iced::Background::Color(color!(0x313244))),
+            ..Default::default()
+        });
 
-        let (status_txt, status_color) = match &self.service {
-            Some(i) if i.active => (format!("active ({})", i.sub_state), color!(0x4caf50)),
-            Some(i) => (format!("inactive ({})", i.sub_state), color!(0x7f849c)),
-            None => ("no service detected".to_string(), color!(0x7f849c)),
+        // ── Manage view: a unit already exists ──────────────────────────────
+        if let Some(info) = &self.service {
+            let (status_txt, status_color) = if info.active {
+                (format!("active ({})", info.sub_state), color!(0x4caf50))
+            } else {
+                (format!("inactive ({})", info.sub_state), muted)
+            };
+            let workdir = info.working_dir.clone().unwrap_or_else(|| "unknown".to_string());
+
+            let run_row = if info.active {
+                row![
+                    button(text("Stop").size(13)).on_press(Message::ServiceStop).style(button::danger).padding([4, 14]),
+                    button(text("Restart").size(13)).on_press(Message::ServiceRestart).style(button::primary).padding([4, 14]),
+                ].spacing(10)
+            } else {
+                row![
+                    button(text("Start").size(13)).on_press(Message::ServiceStart).style(button::success).padding([4, 14]),
+                ].spacing(10)
+            };
+
+            let remove_label = if self.confirm_remove_service { "Click again to confirm removal" } else { "Remove service" };
+            let remove_btn = button(text(remove_label).size(13))
+                .on_press(Message::ServiceRemoveClick).style(button::danger).padding([4, 14]);
+
+            return column![
+                text("Autostart").size(18).font(bold),
+                text("Sapphire runs as a systemd user service — starts at sign-in, restarts on crash. The header Launch/Stop control it too.")
+                    .size(11).color(muted),
+                row![text("Status:").size(14), text(status_txt).size(14).color(status_color)]
+                    .spacing(8).align_y(iced::Alignment::Center),
+                run_row,
+                row![
+                    button(text("Start at sign-in").size(13)).on_press(Message::ServiceEnable).style(button::secondary).padding([4, 14]),
+                    button(text("Don't start at sign-in").size(13)).on_press(Message::ServiceDisable).style(button::secondary).padding([4, 14]),
+                ].spacing(10),
+                text(format!("Folder: {}", workdir)).size(11).color(muted),
+                text("Live logs are in the Log tab.").size(11).color(muted),
+                divider(),
+                text("Environment variables  (one KEY=VALUE per line)").size(13).font(bold),
+                text("e.g. ANTHROPIC_API_KEY=…, OPENAI_API_KEY=… — one per line.").size(11).color(muted),
+                text_editor(&self.env_content).on_action(Message::EnvEdit).height(Length::Fixed(120.0)),
+                button(text("Save & restart").size(13)).on_press(Message::EnvSaveRestart).style(button::primary).padding([4, 14]),
+                text("Written privately to ~/.config/sapphire/service.env (chmod 600).").size(11).color(muted),
+                divider(),
+                remove_btn,
+                text("Backs up the unit to sapphire.service.bak, then deletes it.").size(11).color(muted),
+            ].spacing(12).into();
+        }
+
+        // ── Pre-install view: no unit yet ───────────────────────────────────
+        let main_py = PathBuf::from(&self.install_path).join("main.py").exists();
+        let env_py = sapphire_env_python();
+        let installed = main_py && env_py.is_some();
+
+        let systemd_row = {
+            let (mark, c, t) = if self.systemd_available {
+                ("[ok]", color!(0x4caf50), "systemd user services: available".to_string())
+            } else {
+                ("[ ]", color!(0xf9e154), "systemd user services: not available on this system".to_string())
+            };
+            row![text(mark).size(13).color(c), text(t).size(13)].spacing(8).align_y(iced::Alignment::Center)
+        };
+        let install_row = {
+            let (mark, c, t) = if installed {
+                ("[ok]", color!(0x4caf50), format!("Sapphire install: found at {}", self.install_path))
+            } else {
+                ("[ ]", color!(0xf9e154), "Sapphire install: not found — install it first (Install tab)".to_string())
+            };
+            row![text(mark).size(13).color(c), text(t).size(13)].spacing(8).align_y(iced::Alignment::Center)
         };
 
-        let start_btn = button(text("Start").size(13))
-            .on_press(Message::ServiceStart).style(button::success).padding([4, 14]);
-        let stop_btn = button(text("Stop").size(13))
-            .on_press(Message::ServiceStop).style(button::danger).padding([4, 14]);
-        let restart_btn = button(text("Restart").size(13))
-            .on_press(Message::ServiceRestart).style(button::primary).padding([4, 14]);
-        let enable_btn = button(text("Enable at login").size(13))
-            .on_press(Message::ServiceEnable).style(button::secondary).padding([4, 14]);
-        let disable_btn = button(text("Disable at login").size(13))
-            .on_press(Message::ServiceDisable).style(button::secondary).padding([4, 14]);
+        // Don't let users enable a service mid-install (it'd point at a half-installed Sapphire).
+        let can_enable = self.systemd_available && installed && !self.installing && !self.scanning;
+        let enable_btn = button(text("Enable Sapphire service").font(bold))
+            .on_press_maybe(if can_enable { Some(Message::ServiceInstall) } else { None })
+            .style(button::success);
 
-        let workdir = self.service.as_ref()
-            .and_then(|i| i.working_dir.clone())
-            .unwrap_or_else(|| "unknown".to_string());
+        let will_run = if self.installing {
+            "Finishing install — the button unlocks when it's done.".to_string()
+        } else {
+            match &env_py {
+                Some(p) => format!("Will run:  {} main.py", p),
+                None => "Will run:  (Sapphire environment not found)".to_string(),
+            }
+        };
 
         column![
-            text("Service Control").size(18).font(bold),
-            text("Sapphire runs as a systemd --user service on this machine. The Launch/Stop buttons control the service.")
-                .size(11).color(color!(0x7f849c)),
-            row![
-                text("sapphire.service:").size(14),
-                text(status_txt).size(14).color(status_color),
-            ].spacing(8).align_y(iced::Alignment::Center),
-            row![start_btn, stop_btn, restart_btn].spacing(10),
-            row![enable_btn, disable_btn].spacing(10),
-            text(format!("Working directory: {}", workdir)).size(11).color(color!(0x7f849c)),
-            text("Live logs are in the Log tab.").size(11).color(color!(0x7f849c)),
+            text("Autostart").size(18).font(bold),
+            row![text("Sapphire service:").size(14), text("not set up").size(14).color(muted)]
+                .spacing(8).align_y(iced::Alignment::Center),
+            systemd_row,
+            install_row,
+            divider(),
+            text("Run Sapphire as a background service").size(14).font(bold),
+            text("systemd can start Sapphire when you sign in (and restart it if it crashes), running without the launcher open. Stops when you sign out.")
+                .size(11).color(muted),
+            text(will_run).size(11).color(muted),
+            text("Locks in this folder — settle it first; re-create the service if you move Sapphire.").size(11).color(muted),
+            enable_btn,
         ]
-        .spacing(12)
+        .spacing(10)
         .into()
     }
 

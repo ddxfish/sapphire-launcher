@@ -8,6 +8,21 @@ use std::process::Command;
 // preserve existing behavior byte-for-byte; the Linux branches are the new path.
 // (find_git / find_conda / find_conda_pip live further down, also #[cfg]-split.)
 
+/// Absolute path to the sapphire env's python (for a systemd ExecStart). None if
+/// the env isn't there. Linux only (the service tab is Linux for now).
+#[cfg(not(windows))]
+pub(crate) fn sapphire_env_python() -> Option<String> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    [
+        format!("{}/miniconda3/envs/sapphire/bin/python", home),
+        format!("{}/anaconda3/envs/sapphire/bin/python", home),
+    ]
+    .into_iter()
+    .find(|p| PathBuf::from(p).exists())
+}
+#[cfg(windows)]
+pub(crate) fn sapphire_env_python() -> Option<String> { None }
+
 /// Base config dir, shared with Sapphire. Mirrors core/setup.py::get_config_dir():
 /// Windows %APPDATA%\Sapphire, Linux $XDG_CONFIG_HOME/sapphire or ~/.config/sapphire.
 pub(crate) fn app_config_dir() -> PathBuf {
