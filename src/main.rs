@@ -671,16 +671,29 @@ async fn check_clone(install_path: String) -> (Step, StepStatus) {
 
 async fn check_deps(install_path: String) -> (Step, StepStatus) {
     let req_file = PathBuf::from(&install_path).join("requirements.txt");
-    if req_file.exists() {
-        (
-            Step::Deps,
-            StepStatus::Found("requirements.txt found — will verify deps".to_string()),
-        )
-    } else {
-        (
-            Step::Deps,
-            StepStatus::NotFound("Will install after cloning".to_string()),
-        )
+    if !req_file.exists() {
+        return (Step::Deps, StepStatus::NotFound("Will install after cloning".to_string()));
+    }
+
+    // requirements.txt existing isn't enough — the env (and its packages) may be
+    // gone (e.g. after removing the conda env). Probe the env's pip for the first
+    // real package to confirm deps are actually installed.
+    let first_pkg = tokio::fs::read_to_string(&req_file).await.ok().and_then(|c| {
+        c.lines()
+            .map(|l| l.trim())
+            .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('-'))
+            .map(|l| l.split(&['>', '<', '=', '!', '[', ';', ' '][..]).next().unwrap_or(l).trim().to_string())
+    });
+
+    let Some(pkg) = first_pkg.filter(|p| !p.is_empty()) else {
+        return (Step::Deps, StepStatus::Found("requirements.txt is empty — nothing to install".to_string()));
+    };
+
+    let (program, mut args) = find_conda_pip();
+    args.extend(["show".into(), pkg.clone()]);
+    match run_cmd_full_async(program, args).await {
+        Ok(_) => (Step::Deps, StepStatus::Found("Dependencies installed".to_string())),
+        Err(_) => (Step::Deps, StepStatus::NotFound(format!("Dependencies missing (no '{}') — will install", pkg))),
     }
 }
 

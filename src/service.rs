@@ -6,7 +6,9 @@ use tokio::io::BufReader;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ServiceInfo {
-    pub(crate) active: bool,
+    pub(crate) active: bool,            // ActiveState == "active" (running now)
+    pub(crate) active_state: String,    // raw ActiveState (active/failed/activating/inactive)
+    pub(crate) enabled: bool,           // UnitFileState == "enabled" (autostart at sign-in)
     pub(crate) sub_state: String,
     pub(crate) working_dir: Option<String>,
 }
@@ -19,17 +21,18 @@ pub(crate) fn detect_sapphire_service() -> Option<ServiceInfo> {
     let out = std::process::Command::new("systemctl")
         .args([
             "--user", "show", "sapphire",
-            "-p", "LoadState", "-p", "ActiveState",
-            "-p", "SubState", "-p", "WorkingDirectory",
+            "-p", "LoadState", "-p", "ActiveState", "-p", "SubState",
+            "-p", "UnitFileState", "-p", "WorkingDirectory",
         ])
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let (mut load, mut active, mut sub, mut wd) = ("", "", "", "");
+    let (mut load, mut active, mut sub, mut ufs, mut wd) = ("", "", "", "", "");
     for line in text.lines() {
         if let Some(v) = line.strip_prefix("LoadState=") { load = v; }
         else if let Some(v) = line.strip_prefix("ActiveState=") { active = v; }
         else if let Some(v) = line.strip_prefix("SubState=") { sub = v; }
+        else if let Some(v) = line.strip_prefix("UnitFileState=") { ufs = v; }
         else if let Some(v) = line.strip_prefix("WorkingDirectory=") { wd = v; }
     }
     if load != "loaded" {
@@ -37,6 +40,8 @@ pub(crate) fn detect_sapphire_service() -> Option<ServiceInfo> {
     }
     Some(ServiceInfo {
         active: active == "active",
+        active_state: active.to_string(),
+        enabled: ufs == "enabled",
         sub_state: sub.to_string(),
         working_dir: if wd.is_empty() { None } else { Some(wd.to_string()) },
     })

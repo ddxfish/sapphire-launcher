@@ -534,10 +534,20 @@ impl App {
 
         // ── Manage view: a unit already exists ──────────────────────────────
         if let Some(info) = &self.service {
-            let (status_txt, status_color) = if info.active {
-                (format!("active ({})", info.sub_state), color!(0x4caf50))
+            // Running state (honest about crash-loops/failure), separate from autostart.
+            let (status_txt, status_color) = if info.active_state == "active" {
+                ("running", color!(0x4caf50))
+            } else if info.active_state == "failed" {
+                ("failed", color!(0xe74c3c))
+            } else if info.active_state == "activating" || info.sub_state == "auto-restart" {
+                ("restarting...", color!(0xf9e154))
             } else {
-                (format!("inactive ({})", info.sub_state), muted)
+                ("stopped", muted)
+            };
+            let (auto_txt, auto_color) = if info.enabled {
+                ("on", color!(0x4caf50))
+            } else {
+                ("off", muted)
             };
             let workdir = info.working_dir.clone().unwrap_or_else(|| "unknown".to_string());
 
@@ -562,13 +572,14 @@ impl App {
                     .size(11).color(muted),
                 row![text("Status:").size(14), text(status_txt).size(14).color(status_color)]
                     .spacing(8).align_y(iced::Alignment::Center),
+                row![text("Autostart:").size(14), text(auto_txt).size(14).color(auto_color)]
+                    .spacing(8).align_y(iced::Alignment::Center),
                 run_row,
                 row![
                     button(text("Start at sign-in").size(13)).on_press(Message::ServiceEnable).style(button::secondary).padding([4, 14]),
                     button(text("Don't start at sign-in").size(13)).on_press(Message::ServiceDisable).style(button::secondary).padding([4, 14]),
                 ].spacing(10),
                 text(format!("Folder: {}", workdir)).size(11).color(muted),
-                text("Live logs are in the Log tab.").size(11).color(muted),
                 divider(),
                 text("Environment variables  (one KEY=VALUE per line)").size(13).font(bold),
                 text("e.g. ANTHROPIC_API_KEY=…, OPENAI_API_KEY=… — one per line.").size(11).color(muted),
