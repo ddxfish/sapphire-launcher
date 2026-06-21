@@ -253,11 +253,22 @@ fn save_config(install_path: &str, branch: Branch) {
 }
 
 fn main() -> iced::Result {
+    // Linux: register the app with the desktop (apps menu / dock icon).
+    #[cfg(not(windows))]
+    install_desktop_entry();
+
     let icon = load_window_icon();
 
     let win_settings = window::Settings {
         size: iced::Size::new(700.0, 500.0),
         icon,
+        // Linux only: app_id must match the .desktop StartupWMClass so the
+        // compositor shows our icon. (The field doesn't exist on Windows.)
+        #[cfg(not(windows))]
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: "sapphire-launcher".to_string(),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -314,6 +325,62 @@ fn load_window_icon() -> Option<window::Icon> {
     let rgba = img.to_rgba8();
     let (w, h) = rgba.dimensions();
     window::icon::from_rgba(rgba.into_raw(), w, h).ok()
+}
+
+/// Register the launcher with the Linux desktop: install the icon into the
+/// hicolor theme at several sizes and write a `.desktop` entry, so it shows up
+/// in the apps menu / dock with our icon. Idempotent (skips if already done for
+/// this binary path). XDG user dirs — no root needed.
+#[cfg(not(windows))]
+fn install_desktop_entry() {
+    use std::io::Write;
+    let Ok(home) = std::env::var("HOME") else { return };
+    let Ok(exe) = std::env::current_exe() else { return };
+    let exe_str = exe.display().to_string();
+
+    let desktop_path = format!("{}/.local/share/applications/sapphire-launcher.desktop", home);
+    // Skip if we've already installed for this exact binary location.
+    if let Ok(existing) = std::fs::read_to_string(&desktop_path) {
+        if existing.contains(&format!("Exec={}", exe_str)) {
+            return;
+        }
+    }
+
+    // Icons at common sizes into the hicolor theme.
+    if let Ok(img) = image::load_from_memory(include_bytes!("../icon-512.png")) {
+        for size in [512u32, 256, 128, 64, 48, 32, 16] {
+            let dir = format!("{}/.local/share/icons/hicolor/{}x{}/apps", home, size, size);
+            if std::fs::create_dir_all(&dir).is_ok() {
+                let resized = img.resize_exact(size, size, image::imageops::FilterType::Lanczos3);
+                let _ = resized.save(format!("{}/sapphire-launcher.png", dir));
+            }
+        }
+    }
+
+    // The .desktop entry. StartupWMClass matches the window app_id set in main().
+    let apps_dir = format!("{}/.local/share/applications", home);
+    if std::fs::create_dir_all(&apps_dir).is_ok() {
+        let entry = format!(
+            "[Desktop Entry]\n\
+             Type=Application\n\
+             Name=Sapphire Launcher\n\
+             Comment=Install and manage Sapphire\n\
+             Exec={}\n\
+             Icon=sapphire-launcher\n\
+             Terminal=false\n\
+             Categories=Utility;\n\
+             StartupWMClass=sapphire-launcher\n",
+            exe_str
+        );
+        if let Ok(mut f) = std::fs::File::create(&desktop_path) {
+            let _ = f.write_all(entry.as_bytes());
+        }
+    }
+
+    // Best-effort icon cache refresh (GNOME usually picks up ~/.local without it).
+    let _ = hidden_cmd("gtk-update-icon-cache")
+        .args(["-f", "-t", &format!("{}/.local/share/icons/hicolor", home)])
+        .output();
 }
 
 // ── Step tracking ──────────────────────────────────────────────────────────
@@ -623,14 +690,38 @@ async fn run_cmd_async(program: String, args: Vec<String>) -> Result<String, Str
 }
 
 // These return (Step, StepStatus) after checking the system
+#[cfg(windows)]
 async fn check_git() -> (Step, StepStatus) {
     match run_cmd_async(find_git(), vec!["--version".into()]).await {
         Ok(ver) => (Step::Git, StepStatus::Found(ver)),
-        Err(_) => (
-            Step::Git,
-            StepStatus::NotFound("Git not found — we'll install it".to_string()),
-        ),
+        Err(_) => (Step::Git, StepStatus::NotFound("Git not found — we'll install it".to_string())),
     }
+}
+
+/// Linux: the "Git" step covers all system prerequisites — git (to clone) plus
+/// libportaudio (Sapphire's audio at runtime). Both must be present, even if git
+/// alone already is, so we check both here.
+#[cfg(not(windows))]
+async fn check_git() -> (Step, StepStatus) {
+    let git_ok = run_cmd_async(find_git(), vec!["--version".into()]).await.is_ok();
+    let audio_ok = run_cmd_async(
+        "sh".into(),
+        vec!["-c".into(), "ldconfig -p 2>/dev/null | grep -qi portaudio".into()],
+    ).await.is_ok();
+
+    if git_ok && audio_ok {
+        return (Step::Git, StepStatus::Found("git and audio libraries present".to_string()));
+    }
+    let mut missing = Vec::new();
+    if !git_ok { missing.push("git"); }
+    if !audio_ok { missing.push("audio libs (libportaudio)"); }
+    (
+        Step::Git,
+        StepStatus::NotFound(format!(
+            "Missing {} — Go opens your system's own password prompt to install",
+            missing.join(", ")
+        )),
+    )
 }
 
 async fn check_conda() -> (Step, StepStatus) {
@@ -775,6 +866,7 @@ async fn run_cmd_full_async(program: String, args: Vec<String>) -> Result<String
     result.map_err(|e| e.to_string())?
 }
 
+#[cfg(windows)]
 async fn install_git() -> (Step, StepStatus, String) {
     match run_cmd_full_async("winget".into(), vec!["install".into(), "Git.Git".into(), "--accept-source-agreements".into(), "--accept-package-agreements".into()]).await {
         Ok(out) => (Step::Git, StepStatus::Done("Git installed! You may need to restart the launcher for PATH to update.".to_string()), out),
@@ -788,6 +880,60 @@ async fn install_git() -> (Step, StepStatus, String) {
     }
 }
 
+/// Pick the package-manager install of Sapphire's system prerequisites from
+/// /etc/os-release: git (to clone) + portaudio (audio runtime) + python dev
+/// headers. Returns (pkexec args, human-readable manual command).
+/// Empty args = unknown distro. Package names per the Sapphire docs (libportaudio2).
+#[cfg(not(windows))]
+fn system_packages_plan() -> (Vec<String>, String) {
+    let osr = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
+    let mut id = String::new();
+    let mut id_like = String::new();
+    for line in osr.lines() {
+        if let Some(v) = line.strip_prefix("ID=") { id = v.trim_matches('"').to_lowercase(); }
+        else if let Some(v) = line.strip_prefix("ID_LIKE=") { id_like = v.trim_matches('"').to_lowercase(); }
+    }
+    let hay = format!("{} {}", id, id_like);
+    let v = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    if hay.contains("debian") || hay.contains("ubuntu") {
+        (v(&["apt-get", "install", "-y", "git", "libportaudio2", "python3-dev"]),
+         "sudo apt install git libportaudio2 python3-dev".into())
+    } else if hay.contains("fedora") || hay.contains("rhel") || hay.contains("centos") {
+        (v(&["dnf", "install", "-y", "git", "portaudio", "python3-devel"]),
+         "sudo dnf install git portaudio python3-devel".into())
+    } else if hay.contains("arch") {
+        (v(&["pacman", "-S", "--noconfirm", "git", "portaudio"]),
+         "sudo pacman -S git portaudio".into())
+    } else if hay.contains("suse") {
+        (v(&["zypper", "install", "-y", "git", "libportaudio2", "python3-devel"]),
+         "sudo zypper install git libportaudio2 python3-devel".into())
+    } else {
+        (vec![], "install git, portaudio, and python dev headers with your package manager".into())
+    }
+}
+
+#[cfg(not(windows))]
+async fn install_git() -> (Step, StepStatus, String) {
+    let (pm_args, manual) = system_packages_plan();
+    if pm_args.is_empty() {
+        return (
+            Step::Git,
+            StepStatus::Failed(format!("Couldn't detect your package manager. Run this yourself, then Re-scan:  {}", manual)),
+            String::new(),
+        );
+    }
+    // pkexec hands off to polkit — the desktop's OWN password dialog, not ours.
+    match run_cmd_full_async("pkexec".into(), pm_args).await {
+        Ok(out) => (Step::Git, StepStatus::Done("System packages installed (git, audio libs).".to_string()), out),
+        Err(e) => (
+            Step::Git,
+            StepStatus::Failed(format!("Couldn't install system packages automatically. Run this in a terminal, then Re-scan:  {}", manual)),
+            e,
+        ),
+    }
+}
+
+#[cfg(windows)]
 async fn install_conda() -> (Step, StepStatus, String) {
     match run_cmd_full_async("winget".into(), vec!["install".into(), "Anaconda.Miniconda3".into(), "--accept-source-agreements".into(), "--accept-package-agreements".into()]).await {
         Ok(out) => (Step::Conda, StepStatus::Done("Miniconda installed! You may need to restart the launcher for PATH to update.".to_string()), out),
@@ -801,10 +947,54 @@ async fn install_conda() -> (Step, StepStatus, String) {
     }
 }
 
+/// Linux Miniconda install: download the official installer and run it unattended
+/// into ~/miniconda3 (no root, identical across distros).
+#[cfg(not(windows))]
+async fn install_conda() -> (Step, StepStatus, String) {
+    let arch = run_cmd_async("uname".into(), vec!["-m".into()]).await.unwrap_or_default();
+    let installer_arch = match arch.trim() {
+        "aarch64" | "arm64" => "aarch64",
+        _ => "x86_64",
+    };
+    let url = format!("https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-{}.sh", installer_arch);
+    let tmp = std::env::temp_dir().join("miniconda-installer.sh").to_string_lossy().to_string();
+
+    // Download with curl, fall back to wget.
+    let dl = match run_cmd_full_async("curl".into(), vec!["-fsSL".into(), "-o".into(), tmp.clone(), url.clone()]).await {
+        Ok(o) => Ok(o),
+        Err(_) => run_cmd_full_async("wget".into(), vec!["-qO".into(), tmp.clone(), url.clone()]).await,
+    };
+    if let Err(e) = dl {
+        return (Step::Conda, StepStatus::Failed(format!("Couldn't download the Miniconda installer (need curl or wget): {}", e)), e);
+    }
+
+    let home = std::env::var("HOME").unwrap_or_default();
+    let prefix = format!("{}/miniconda3", home);
+    match run_cmd_full_async("bash".into(), vec![tmp, "-b".into(), "-p".into(), prefix]).await {
+        Ok(out) => (Step::Conda, StepStatus::Done("Miniconda installed into ~/miniconda3".to_string()), out),
+        Err(e) => {
+            if e.contains("already exists") {
+                (Step::Conda, StepStatus::Done("Miniconda already installed".to_string()), e)
+            } else {
+                (Step::Conda, StepStatus::Failed(format!("Miniconda install failed: {}", e)), e)
+            }
+        }
+    }
+}
+
 async fn install_conda_init() -> (Step, StepStatus, String) {
-    // Accept Anaconda ToS automatically (required since mid-2025)
     let conda = find_conda();
-    let _ = run_cmd_full_async(conda.clone(), vec!["tos".into(), "accept".into()]).await;
+    // Accept Anaconda ToS for the default channels (required since 2025-07-15).
+    for ch in [
+        "https://repo.anaconda.com/pkgs/main",
+        "https://repo.anaconda.com/pkgs/r",
+        "https://repo.anaconda.com/pkgs/msys2",
+    ] {
+        let _ = run_cmd_full_async(conda.clone(), vec![
+            "tos".into(), "accept".into(), "--override-channels".into(),
+            "--channel".into(), ch.to_string(),
+        ]).await;
+    }
 
     match run_cmd_full_async(conda, vec!["init".into()]).await {
         Ok(out) => (Step::CondaInit, StepStatus::Done("Conda initialized".to_string()), out),
@@ -1972,11 +2162,17 @@ impl App {
             Message::InstallStepResult(step, status, log_output) => {
                 let label = step_label(step);
 
-                // Log the output
+                // Log the output — strip ANSI, collapse \r progress bars, drop blanks.
                 if !log_output.is_empty() {
-                    for line in log_output.lines() {
-                        self.log_lines.push(format!("  {}", line));
+                    for raw in log_output.lines() {
+                        let mut s = strip_ansi(raw);
+                        if let Some(i) = s.rfind('\r') { s = s[i + 1..].to_string(); }
+                        let s = s.trim_end();
+                        if !s.is_empty() {
+                            self.log_lines.push(format!("  {}", s));
+                        }
                     }
+                    self.cap_log_lines();
                 }
 
                 let failed = matches!(status, StepStatus::Failed(_));
@@ -1999,20 +2195,10 @@ impl App {
             }
 
             Message::CopyRunLog => {
+                // iced's own clipboard — works on Wayland/X11/Windows/macOS, no subprocess.
                 let log_text = self.sapphire_log.join("\n");
-                // Use clip.exe on Windows, xclip on Linux
-                let _ = hidden_cmd("clip")
-                    .stdin(std::process::Stdio::piped())
-                    .spawn()
-                    .and_then(|mut child| {
-                        use std::io::Write;
-                        if let Some(ref mut stdin) = child.stdin {
-                            stdin.write_all(log_text.as_bytes())?;
-                        }
-                        child.wait()
-                    });
                 self.log_lines.push("Copied to clipboard.".to_string());
-                Task::none()
+                iced::clipboard::write(log_text)
             }
             Message::OpenRunLog => {
                 // Write log to temp file and open in Notepad for selection/copying
@@ -2319,6 +2505,15 @@ impl App {
         }
     }
 
+    /// Keep the launcher log bounded (install output can be verbose).
+    fn cap_log_lines(&mut self) {
+        const CAP: usize = 1000;
+        if self.log_lines.len() > CAP {
+            let excess = self.log_lines.len() - CAP;
+            self.log_lines.drain(..excess);
+        }
+    }
+
     /// Kill sapphire — the systemd unit in service mode, else the process tree.
     /// (The journalctl follower is a Subscription; it dies when streaming_journal
     /// goes false and iced drops it.)
@@ -2425,11 +2620,23 @@ impl App {
     // ── Header bar ─────────────────────────────────────────────────────────
 
     fn view_header(&self) -> Element<Message> {
-        let path_input = text_input("C:\\Users\\You\\Sapphire", &self.install_path)
+        let placeholder = if cfg!(windows) { "C:\\Users\\You\\Sapphire" } else { "/home/you/sapphire" };
+        let path_input = text_input(placeholder, &self.install_path)
             .on_input(Message::PathChanged)
             .width(Length::FillPortion(3));
 
         let browse_btn = button("Browse").on_press(Message::BrowsePath);
+
+        // At-a-glance: does the chosen folder actually hold a Sapphire install?
+        let p = PathBuf::from(&self.install_path);
+        let (hint_txt, hint_color) = if p.join("main.py").exists() {
+            ("installed", color!(0x4caf50))
+        } else if p.exists() {
+            ("no install here", color!(0xf9e154))
+        } else {
+            ("empty path", color!(0x7f849c))
+        };
+        let path_hint = text(hint_txt).size(11).color(hint_color);
 
         let branch_picker = pick_list(
             BRANCHES,
@@ -2441,6 +2648,7 @@ impl App {
         let mut header = row![
             path_input,
             browse_btn,
+            path_hint,
             horizontal_space(),
             branch_picker,
         ]
@@ -2452,7 +2660,7 @@ impl App {
         if let Some(n) = self.updates_available {
             if n > 0 {
                 let badge = button(
-                    text(format!("{}↑", n)).size(12).color(color!(0x3d85c6))
+                    text(format!("{} new", n)).size(12).color(color!(0x3d85c6))
                 )
                 .on_press(Message::TabSelected(Tab::Update))
                 .style(button::text)
@@ -2508,7 +2716,7 @@ impl App {
     // ── Tab bar ────────────────────────────────────────────────────────────
 
     fn view_tab_bar(&self) -> Element<Message> {
-        let running_label = if self.sapphire_running { "Log •" } else { "Log" };
+        let running_label = if self.sapphire_running { "Log *" } else { "Log" };
         let mut tabs = row![
             self.tab_button("Install", Tab::Install),
             self.tab_button("Update", Tab::Update),
@@ -2922,7 +3130,7 @@ impl App {
 
         let workdir = self.service.as_ref()
             .and_then(|i| i.working_dir.clone())
-            .unwrap_or_else(|| "—".to_string());
+            .unwrap_or_else(|| "unknown".to_string());
 
         column![
             text("Service Control").size(18).font(bold),
@@ -2955,12 +3163,13 @@ impl App {
             .style(button::secondary)
             .padding([2, 8]);
 
-        let open_btn = button(text("Open in Notepad").size(11))
+        let open_label = if cfg!(windows) { "Open in Notepad" } else { "Open log" };
+        let open_btn = button(text(open_label).size(11))
             .on_press_maybe(if self.sapphire_log.is_empty() { None } else { Some(Message::OpenRunLog) })
             .style(button::secondary)
             .padding([2, 8]);
 
-        let bottom_btn = button(text("↓ Bottom").size(11))
+        let bottom_btn = button(text("Bottom").size(11))
             .on_press(Message::ScrollRunLog)
             .style(button::secondary)
             .padding([2, 8]);
@@ -3010,7 +3219,7 @@ impl App {
     // ── Log panel ──────────────────────────────────────────────────────────
 
     fn view_log_panel(&self) -> Element<Message> {
-        let toggle = button(if self.log_visible { "▼ Log" } else { "▶ Log" })
+        let toggle = button(if self.log_visible { "[-] Log" } else { "[+] Log" })
             .on_press(Message::ToggleLog)
             .style(button::text)
             .padding([2, 8]);
@@ -3059,7 +3268,10 @@ impl App {
 
 fn step_label(step: Step) -> &'static str {
     match step {
+        #[cfg(windows)]
         Step::Git => "Check for Git",
+        #[cfg(not(windows))]
+        Step::Git => "Check system packages (git, audio libs)",
         Step::Conda => "Check for Miniconda",
         Step::CondaInit => "Initialize conda",
         Step::PythonEnv => "Create Python environment",
