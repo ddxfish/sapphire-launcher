@@ -130,10 +130,14 @@ impl App {
         ]
         .spacing(0);
 
-        // Autostart tab (Linux only for now): shown when a unit exists OR Sapphire
-        // is installed (so an orphaned unit stays removable after an uninstall).
-        let show_autostart = cfg!(not(windows))
-            && (self.service.is_some() || PathBuf::from(&self.install_path).join("main.py").exists());
+        // Autostart tab: shown when autostart is set up OR Sapphire is installed (so an
+        // orphaned setup stays removable after an uninstall). Linux = systemd unit;
+        // Windows = our autostart wrapper .cmd existing.
+        let main_py = PathBuf::from(&self.install_path).join("main.py").exists();
+        #[cfg(not(windows))]
+        let show_autostart = self.service.is_some() || main_py;
+        #[cfg(windows)]
+        let show_autostart = main_py || crate::platform::autostart_marker_path().exists();
         if show_autostart {
             tabs = tabs.push(self.tab_button("Autostart", Tab::Service));
         }
@@ -524,6 +528,7 @@ impl App {
         .into()
     }
 
+    #[cfg(not(windows))]
     fn view_service_tab(&self) -> Element<Message> {
         let bold = Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT };
         let muted = color!(0x7f849c);
@@ -641,6 +646,67 @@ impl App {
                 .size(11).color(muted),
             text(will_run).size(11).color(muted),
             text("Locks in this folder — settle it first; re-create the service if you move Sapphire.").size(11).color(muted),
+            enable_btn,
+        ]
+        .spacing(10)
+        .into()
+    }
+
+    /// Windows autostart: a decoupled "start at sign-in" toggle (a logon Scheduled
+    /// Task), separate from the header's Launch/Stop. Enabled-state = our wrapper .cmd
+    /// existing. No process-ownership takeover like the Linux systemd path.
+    #[cfg(windows)]
+    fn view_service_tab(&self) -> Element<Message> {
+        let bold = Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT };
+        let muted = color!(0x7f849c);
+        let enabled = crate::platform::autostart_marker_path().exists();
+
+        if enabled {
+            let (run_txt, run_color) = if self.sapphire_running {
+                ("running", color!(0x4caf50))
+            } else {
+                ("stopped", muted)
+            };
+            let remove_label = if self.confirm_remove_service {
+                "Click again to confirm"
+            } else {
+                "Turn off autostart"
+            };
+            return column![
+                text("Autostart").size(18).font(bold),
+                text("Sapphire starts automatically when you sign in to Windows, with no console window. Use Launch / Stop (or the Log tab) to control it while it's running.")
+                    .size(11).color(muted),
+                row![text("Start at sign-in:").size(14), text("on").size(14).color(color!(0x4caf50))]
+                    .spacing(8).align_y(iced::Alignment::Center),
+                row![text("Sapphire:").size(14), text(run_txt).size(14).color(run_color)]
+                    .spacing(8).align_y(iced::Alignment::Center),
+                button(text(remove_label).size(13)).on_press(Message::ServiceRemoveClick).style(button::danger).padding([4, 14]),
+                text("Windows will ask for permission (admin) to change this.").size(11).color(muted),
+            ].spacing(12).into();
+        }
+
+        // Not set up yet.
+        let installed = PathBuf::from(&self.install_path).join("main.py").exists()
+            && crate::platform::sapphire_pythonw().is_some();
+        let (mark, c, t) = if installed {
+            ("[ok]", color!(0x4caf50), format!("Sapphire install: found at {}", self.install_path))
+        } else {
+            ("[ ]", color!(0xf9e154), "Sapphire install: not found — install it first (Install tab)".to_string())
+        };
+        let can_enable = installed && !self.installing && !self.scanning;
+        let enable_btn = button(text("Enable at sign-in").font(bold))
+            .on_press_maybe(if can_enable { Some(Message::ServiceInstall) } else { None })
+            .style(button::success);
+
+        column![
+            text("Autostart").size(18).font(bold),
+            row![text("Start at sign-in:").size(14), text("not set up").size(14).color(muted)]
+                .spacing(8).align_y(iced::Alignment::Center),
+            row![text(mark).size(13).color(c), text(t).size(13)].spacing(8).align_y(iced::Alignment::Center),
+            text("Start Sapphire automatically when you sign in").size(14).font(bold),
+            text("Runs Sapphire in the background at sign-in with no console window, and lets it restart itself if it crashes. Stops when you sign out.")
+                .size(11).color(muted),
+            text("Windows will ask for permission (admin) the first time you set this up.").size(11).color(muted),
             enable_btn,
         ]
         .spacing(10)

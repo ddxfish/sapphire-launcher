@@ -47,6 +47,10 @@ pub(crate) fn detect_sapphire_service() -> Option<ServiceInfo> {
     })
 }
 
+// Windows: stays None until the control seam (ServiceStart/Stop/Restart) and the
+// logfile-tail follower are wired — returning Some would flip the app into service
+// mode and route Launch through the still-systemctl ServiceStart, breaking launch.
+// The schtasks-query / wrapper-file detection is drafted in install_service's notes.
 #[cfg(windows)]
 pub(crate) fn detect_sapphire_service() -> Option<ServiceInfo> {
     None
@@ -105,9 +109,58 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
         Err(e) => (format!("Unit written, but enabling it failed: {}", e), false),
     }
 }
+/// Windows: enable autostart. Registers a per-user logon Scheduled Task that runs the
+/// env's windowless `pythonw main.py` directly (no console window), with the install
+/// dir as the working directory. We use PowerShell `Register-ScheduledTask` (not bare
+/// `schtasks.exe`) so we control the settings `schtasks` defaults wrong:
+///   • trigger scoped to THIS user's logon (not "any user")
+///   • runs on battery and doesn't stop on battery (laptop-friendly)
+///   • no execution time limit (`schtasks` defaults to stop after 3 days)
+/// Registration needs admin, so we elevate a generated `.ps1` via `Start-Process
+/// -Verb RunAs` (one UAC prompt). The trigger/principal user is captured from OUR
+/// (non-elevated) process, so it's correct even if UAC elevates a different admin.
 #[cfg(windows)]
-pub(crate) async fn install_service(_install_path: String) -> (String, bool) {
-    ("Service install isn't available on Windows yet.".to_string(), false)
+pub(crate) async fn install_service(install_path: String) -> (String, bool) {
+    let Some(pyw) = sapphire_pythonw() else {
+        return ("Couldn't find Sapphire's environment (pythonw.exe) — install Sapphire first.".to_string(), false);
+    };
+    let user = format!(
+        "{}\\{}",
+        std::env::var("USERDOMAIN").unwrap_or_default(),
+        std::env::var("USERNAME").unwrap_or_default(),
+    );
+    let esc = |s: &str| s.replace('\'', "''"); // PowerShell single-quote escaping
+
+    // Registration script — normal PS single-quoted strings we control (dodges the
+    // nested-ArgumentList quoting hell of passing this inline to an elevated shell).
+    let script = format!(
+        "$ErrorActionPreference='Stop'\r\n\
+         $a = New-ScheduledTaskAction -Execute '{pyw}' -Argument 'main.py' -WorkingDirectory '{cwd}'\r\n\
+         $t = New-ScheduledTaskTrigger -AtLogOn -User '{user}'\r\n\
+         $p = New-ScheduledTaskPrincipal -UserId '{user}' -LogonType Interactive\r\n\
+         $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable\r\n\
+         Register-ScheduledTask -TaskName Sapphire -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null\r\n",
+        pyw = esc(&pyw), cwd = esc(&install_path), user = esc(&user),
+    );
+    let ps1 = std::env::temp_dir().join("sapphire-enable.ps1");
+    if let Err(e) = tokio::fs::write(&ps1, script).await {
+        return (format!("Couldn't write the setup script: {}", e), false);
+    }
+    // Elevate (UAC) and run the .ps1.
+    let outer = format!(
+        "$ErrorActionPreference='Stop'; try {{ $p = Start-Process powershell -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'; exit $p.ExitCode }} catch {{ exit 1223 }}",
+        ps1.display().to_string().replace('\'', "''"),
+    );
+    match run_cmd_full_async("powershell".into(), vec!["-NoProfile".into(), "-Command".into(), outer]).await {
+        Ok(_) => {
+            // No-admin "enabled" marker (detection avoids querying the task).
+            let marker = autostart_marker_path();
+            if let Some(parent) = marker.parent() { let _ = tokio::fs::create_dir_all(parent).await; }
+            let _ = tokio::fs::write(marker, "on").await;
+            ("Autostart enabled — Sapphire will start when you sign in.".to_string(), true)
+        }
+        Err(_) => ("Couldn't enable autostart — the admin prompt may have been declined. Try again and choose Yes.".to_string(), false),
+    }
 }
 
 /// Stop, disable, back up (.bak), and delete the systemd --user unit.
@@ -125,9 +178,21 @@ pub(crate) async fn remove_service() -> (String, bool) {
     let _ = run_cmd_full_async("systemctl".into(), vec!["--user".into(), "daemon-reload".into()]).await;
     ("Service stopped, disabled, and removed (kept a .bak copy).".to_string(), true)
 }
+/// Windows: disable autostart. Unregisters the logon task (admin → UAC) and clears our
+/// "enabled" marker.
 #[cfg(windows)]
 pub(crate) async fn remove_service() -> (String, bool) {
-    ("No service to remove on Windows yet.".to_string(), false)
+    let outer = "$ErrorActionPreference='Stop'; try { $p = Start-Process powershell -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList '-NoProfile','-Command','Unregister-ScheduledTask -TaskName Sapphire -Confirm:$false'; exit $p.ExitCode } catch { exit 1223 }".to_string();
+    let result = run_cmd_full_async("powershell".into(), vec!["-NoProfile".into(), "-Command".into(), outer]).await;
+    match result {
+        Ok(_) => {
+            // Only clear the "enabled" marker once the task is actually gone — a
+            // declined UAC must NOT flip the UI to "off" while the task lives on.
+            let _ = tokio::fs::remove_file(autostart_marker_path()).await;
+            ("Autostart removed.".to_string(), true)
+        }
+        Err(_) => ("Couldn't remove autostart — the admin prompt may have been declined. Nothing was changed.".to_string(), false),
+    }
 }
 
 /// Read the service EnvironmentFile (KEY=VALUE per line). Empty if absent.
@@ -270,103 +335,146 @@ pub(crate) fn journal_log_stream() -> impl futures::Stream<Item = Message> {
     })
 }
 
-pub(crate) fn launch_sapphire_stream(install_path: String, pid_store: Arc<AtomicU32>) -> impl futures::Stream<Item = Message> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+/// One message from the spawned Sapphire process: a log line, or the final exit notice.
+enum SpawnItem {
+    Line(String),
+    Exited(String),
+}
 
-    tokio::task::spawn(async move {
-        // Resolve the env's python directly (avoids conda-run buffering) or conda run.
-        let (program, mut args) = sapphire_python_cmd();
-        let is_direct = args.is_empty();
-        args.push("-u".to_string());
-        args.push("main.py".to_string());
+/// Spawn `python -u main.py` and pump its stdout+stderr (lossy UTF-8, ANSI-stripped,
+/// `\r` progress bars collapsed) as `SpawnItem::Line`s into `tx`, then one final
+/// `SpawnItem::Exited`. `kill_on_drop` means dropping the follower subscription also
+/// tears the process down (the explicit Stop sweep reaps the child workers).
+async fn spawn_reader(
+    install_path: String,
+    pid_store: Arc<AtomicU32>,
+    tx: tokio::sync::mpsc::UnboundedSender<SpawnItem>,
+) {
+    // Resolve the env's python directly (avoids conda-run buffering) or conda run.
+    let (program, mut args) = sapphire_python_cmd();
+    let is_direct = args.is_empty();
+    args.push("-u".to_string());
+    args.push("main.py".to_string());
 
-        let mut cmd = tokio::process::Command::new(&program);
-        cmd.args(&args)
-            .current_dir(&install_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .env("PYTHONIOENCODING", "utf-8")
-            .env("PYTHONUTF8", "1");
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args)
+        .current_dir(&install_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PYTHONUTF8", "1")
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    { cmd.creation_flags(CREATE_NO_WINDOW); }
+    #[cfg(unix)]
+    {
+        // Own process group so Stop can kill the whole tree (child workers).
+        cmd.process_group(0);
+    }
+
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = tx.send(SpawnItem::Exited(format!("Failed to start: {}", e)));
+            return;
         }
-        #[cfg(unix)]
-        {
-            // Own process group so Stop can kill the whole tree (child workers).
-            cmd.process_group(0);
-        }
+    };
 
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                let _ = tx.send(Message::SapphireExited(format!("Failed to start: {}", e)));
-                return;
+    // Store PID for the Stop button.
+    if let Some(pid) = child.id() {
+        pid_store.store(pid, Ordering::Relaxed);
+    }
+
+    if is_direct {
+        let _ = tx.send(SpawnItem::Line(format!("Using {}", program)));
+    }
+
+    async fn pump(
+        r: impl tokio::io::AsyncRead + Unpin,
+        tx: tokio::sync::mpsc::UnboundedSender<SpawnItem>,
+    ) {
+        use tokio::io::AsyncBufReadExt;
+        let mut reader = BufReader::new(r);
+        let mut buf = Vec::new();
+        while reader.read_until(b'\n', &mut buf).await.unwrap_or(0) > 0 {
+            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') { buf.pop(); }
+            let mut s = strip_ansi(&String::from_utf8_lossy(&buf));
+            if let Some(i) = s.rfind('\r') { s = s[i + 1..].to_string(); }
+            buf.clear();
+            if tx.send(SpawnItem::Line(s)).is_err() { break; }
+        }
+    }
+
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let a = tokio::spawn(pump(stdout, tx.clone()));
+    let b = tokio::spawn(pump(stderr, tx.clone()));
+    let (_, _, status) = tokio::join!(a, b, child.wait());
+
+    let msg = match status {
+        Ok(s) if s.success() => "Sapphire exited.".to_string(),
+        Ok(s) if s.code() == Some(42) => "Sapphire is restarting...".to_string(),
+        Ok(s) => format!("Sapphire exited (code {}).", s.code().unwrap_or(-1)),
+        Err(e) => format!("Error: {}", e),
+    };
+    let _ = tx.send(SpawnItem::Exited(msg));
+}
+
+/// `Subscription`-driven follower of a spawned Sapphire process. **Lazy** — the
+/// process starts on first poll (inside the tokio runtime), so building the stream
+/// repeatedly in `subscription()` is cheap and iced parks it when idle. That's the
+/// fix for the `Task::stream` redraw-spin (idle ~55% CPU). Each poll drains all
+/// queued lines into one `SapphireLines` batch (one redraw per burst), then emits a
+/// final `SapphireExited`.
+pub(crate) fn spawn_log_stream(install_path: String, pid_store: Arc<AtomicU32>) -> impl futures::Stream<Item = Message> {
+    enum St {
+        Start,
+        Run(tokio::sync::mpsc::UnboundedReceiver<SpawnItem>),
+        ExitPending(String),
+        Done,
+    }
+    futures::stream::unfold(St::Start, move |state| {
+        let install_path = install_path.clone();
+        let pid_store = pid_store.clone();
+        async move {
+            let mut rx = match state {
+                St::Start => {
+                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                    // Spawned here (inside the polled stream → tokio runtime context).
+                    tokio::spawn(spawn_reader(install_path, pid_store, tx));
+                    rx
+                }
+                St::Run(rx) => rx,
+                St::ExitPending(msg) => return Some((Message::SapphireExited(msg), St::Done)),
+                St::Done => return None,
+            };
+            let first = rx.recv().await?;
+            let mut batch = Vec::new();
+            let mut exit = None;
+            match first {
+                SpawnItem::Line(l) => batch.push(l),
+                SpawnItem::Exited(m) => exit = Some(m),
             }
-        };
-
-        // Store PID for stop button
-        if let Some(pid) = child.id() {
-            pid_store.store(pid, Ordering::Relaxed);
-        }
-
-        if is_direct {
-            let _ = tx.send(Message::SapphireLine(format!("Using {}", program)));
-        }
-
-        let stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let tx_out = tx.clone();
-        let tx_err = tx.clone();
-
-        // Read stdout — buffered line reading with lossy UTF-8
-        let stdout_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stdout);
-            let mut buf = Vec::new();
-            use tokio::io::AsyncBufReadExt;
-            while reader.read_until(b'\n', &mut buf).await.unwrap_or(0) > 0 {
-                // Strip \r\n
-                while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
-                    buf.pop();
-                }
-                let line = strip_ansi(&String::from_utf8_lossy(&buf));
-                buf.clear();
-                if tx_out.send(Message::SapphireLine(line)).is_err() {
-                    break;
+            if exit.is_none() {
+                loop {
+                    match rx.try_recv() {
+                        Ok(SpawnItem::Line(l)) => {
+                            batch.push(l);
+                            if batch.len() >= 2000 { break; }
+                        }
+                        Ok(SpawnItem::Exited(m)) => { exit = Some(m); break; }
+                        Err(_) => break,
+                    }
                 }
             }
-        });
-
-        // Read stderr
-        let stderr_task = tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut buf = Vec::new();
-            use tokio::io::AsyncBufReadExt;
-            while reader.read_until(b'\n', &mut buf).await.unwrap_or(0) > 0 {
-                while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
-                    buf.pop();
-                }
-                let line = strip_ansi(&String::from_utf8_lossy(&buf));
-                buf.clear();
-                if tx_err.send(Message::SapphireLine(line)).is_err() {
-                    break;
-                }
+            // One Message per step: if a poll caught both lines and the exit, emit the
+            // lines now and the exit next (St::ExitPending).
+            match exit {
+                Some(m) if batch.is_empty() => Some((Message::SapphireExited(m), St::Done)),
+                Some(m) => Some((Message::SapphireLines(batch), St::ExitPending(m))),
+                None => Some((Message::SapphireLines(batch), St::Run(rx))),
             }
-        });
-
-        // Wait for everything concurrently — don't deadlock
-        let (_, _, status) = tokio::join!(stdout_task, stderr_task, child.wait());
-
-        let msg = match status {
-            Ok(s) if s.success() => "Sapphire exited.".to_string(),
-            Ok(s) if s.code() == Some(42) => "Sapphire is restarting...".to_string(),
-            Ok(s) => format!("Sapphire exited (code {}).", s.code().unwrap_or(-1)),
-            Err(e) => format!("Error: {}", e),
-        };
-        let _ = tx.send(Message::SapphireExited(msg));
-    });
-
-    tokio_stream::wrappers::UnboundedReceiverStream::new(rx)
+        }
+    })
 }
 

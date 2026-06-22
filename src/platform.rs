@@ -23,6 +23,29 @@ pub(crate) fn sapphire_env_python() -> Option<String> {
 #[cfg(windows)]
 pub(crate) fn sapphire_env_python() -> Option<String> { None }
 
+/// Windows: the env's windowless interpreter (pythonw.exe) for the autostart wrapper —
+/// no console flashes at logon. None if the env isn't there.
+#[cfg(windows)]
+pub(crate) fn sapphire_pythonw() -> Option<String> {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    [
+        format!("{}\\miniconda3\\envs\\sapphire\\pythonw.exe", home),
+        format!("{}\\Miniconda3\\envs\\sapphire\\pythonw.exe", home),
+        format!("{}\\anaconda3\\envs\\sapphire\\pythonw.exe", home),
+        format!("{}\\Anaconda3\\envs\\sapphire\\pythonw.exe", home),
+    ]
+    .into_iter()
+    .find(|p| PathBuf::from(p).exists())
+}
+
+/// Windows: our no-admin "autostart is on" marker. Written when the logon task is
+/// registered, deleted on removal — detection reads this instead of querying the task
+/// (sidesteps the schtasks query-permission question). Lives in our config dir.
+#[cfg(windows)]
+pub(crate) fn autostart_marker_path() -> PathBuf {
+    app_config_dir().join("autostart.on")
+}
+
 /// Base config dir, shared with Sapphire. Mirrors core/setup.py::get_config_dir():
 /// Windows %APPDATA%\Sapphire, Linux $XDG_CONFIG_HOME/sapphire or ~/.config/sapphire.
 pub(crate) fn app_config_dir() -> PathBuf {
@@ -124,23 +147,18 @@ pub(crate) fn null_device() -> &'static str {
 pub(crate) fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
+        // If we spawned it, the stored PID gives a fast, complete tree kill.
         if pid > 0 {
             let _ = hidden_cmd("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
         }
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        let env_path = format!("{}\\miniconda3\\envs\\sapphire", home);
-        if let Ok(output) = hidden_cmd("wmic")
-            .args(["process", "where", &format!("name='python.exe' and executablepath like '%{}%'", env_path.replace('\\', "\\\\")),
-                "get", "processid"])
-            .output()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                if let Ok(p) = line.trim().parse::<u32>() {
-                    let _ = hidden_cmd("taskkill").args(["/F", "/PID", &p.to_string()]).output();
-                }
-            }
-        }
+        // Sweep every Sapphire-env interpreter — BOTH python.exe AND pythonw.exe. The
+        // autostart task runs pythonw.exe (windowless); the old python.exe-only sweep
+        // missed it, so Stop did nothing for task-started instances. Matching by an
+        // env-path substring also covers miniconda3/anaconda3/Anaconda3 variants. This
+        // kills main.py too, so its supervisor can't relaunch sapphire.py. Uses CIM, not
+        // the deprecated wmic (removed-by-default on Win11 24H2+).
+        let ps = "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" | Where-Object { $_.ExecutablePath -like '*\\envs\\sapphire\\*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+        let _ = hidden_cmd("powershell").args(["-NoProfile", "-Command", ps]).output();
     }
     #[cfg(not(windows))]
     {

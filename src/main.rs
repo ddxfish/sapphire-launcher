@@ -224,6 +224,10 @@ enum Step {
     CondaInit,
     PythonEnv,
     Clone,
+    // Windows-only: Sapphire's native wheels (numpy/torch/…) need the VC++ runtime.
+    // Runs before Deps. A first-class step (like Git/Conda), gated off other OSes.
+    #[cfg(windows)]
+    VcRedist,
     Deps,
     Done,
 }
@@ -234,6 +238,8 @@ const ALL_STEPS: &[Step] = &[
     Step::CondaInit,
     Step::PythonEnv,
     Step::Clone,
+    #[cfg(windows)]
+    Step::VcRedist,
     Step::Deps,
     Step::Done,
 ];
@@ -320,6 +326,11 @@ struct App {
     streaming_journal: bool,
     // Bumped on each (re)start so iced treats the follower as a fresh subscription.
     journal_epoch: usize,
+    // Spawn-mode log follower (when WE launched Sapphire, not a systemd unit). Same
+    // shape as the journal one: a Subscription (so iced parks it when idle), with an
+    // epoch bumped on each launch to force a fresh follower.
+    streaming_spawn: bool,
+    spawn_epoch: usize,
     // Autostart tab (Linux): whether systemd --user is available; remove confirm.
     systemd_available: bool,
     confirm_remove_service: bool,
@@ -373,6 +384,8 @@ impl Default for App {
             service: None,
             streaming_journal: false,
             journal_epoch: 0,
+            streaming_spawn: false,
+            spawn_epoch: 0,
             systemd_available: false,
             confirm_remove_service: false,
             env_content: text_editor::Content::new(),
@@ -436,10 +449,11 @@ enum Message {
     ScrollRunLog,
     // Launch
     LaunchPreCheck(bool, bool),   // (already_running, user_initiated)
-    SapphireLine(String),   // a single line of output from sapphire
+    HealthPoll,             // periodic: is an out-of-band Sapphire up? (e.g. autostart)
+    HealthResult(bool),     // result of the periodic health poll
     SapphireLines(Vec<String>), // a coalesced batch of log lines (burst-safe)
     SapphireExited(String), // process ended
-    SapphireStopConfirmed,  // process is actually dead
+    SapphireStopConfirmed(bool),  // (stopped_ok) — false = kill didn't take, still up
     // Uninstall flow (two-click confirmation)
     ResetPassword,
     ResetCredentials,
@@ -736,6 +750,46 @@ async fn install_git() -> (Step, StepStatus, String) {
                 (Step::Git, StepStatus::Done("Git is already installed".to_string()), e)
             } else {
                 (Step::Git, StepStatus::Failed(format!("Couldn't install Git — try installing it manually. {}", e)), e)
+            }
+        }
+    }
+}
+
+/// Windows-only: is the VC++ 2015-2022 x64 runtime present? Cheap presence check via
+/// the registry key the redist writes (both the native and WOW6432Node views). We
+/// don't version-match — Go's installer is idempotent — this just lets an already-set-up
+/// box show green instead of re-running winget. A miss here is harmless (Go no-ops).
+#[cfg(windows)]
+async fn check_vcredist() -> (Step, StepStatus) {
+    for key in [
+        "HKLM\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64",
+        "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64",
+    ] {
+        if let Ok(out) = run_cmd_async("reg".into(), vec![
+            "query".into(), key.into(), "/v".into(), "Installed".into(),
+        ]).await {
+            if out.contains("0x1") {
+                return (Step::VcRedist, StepStatus::Found("Visual C++ runtime is installed".to_string()));
+            }
+        }
+    }
+    (Step::VcRedist, StepStatus::NotFound("We'll install the Visual C++ runtime — Sapphire's components need it".to_string()))
+}
+
+/// Windows-only: install the VC++ redistributable via winget. Idempotent — no-ops if a
+/// same/newer version is already present (same pattern as the git/conda steps).
+#[cfg(windows)]
+async fn install_vcredist() -> (Step, StepStatus, String) {
+    match run_cmd_full_async("winget".into(), vec![
+        "install".into(), "Microsoft.VCRedist.2015+.x64".into(),
+        "--accept-source-agreements".into(), "--accept-package-agreements".into(),
+    ]).await {
+        Ok(out) => (Step::VcRedist, StepStatus::Done("Visual C++ runtime installed".to_string()), out),
+        Err(e) => {
+            if e.contains("already installed") || e.contains("No newer") || e.contains("up to date") {
+                (Step::VcRedist, StepStatus::Done("Visual C++ runtime is already installed".to_string()), e)
+            } else {
+                (Step::VcRedist, StepStatus::Failed(format!("Couldn't install the Visual C++ runtime — you can get it from https://aka.ms/vc14/vc_redist.x64.exe. {}", e)), e)
             }
         }
     }
@@ -1414,6 +1468,7 @@ impl App {
                     self.log_lines.push("Stopping Sapphire for branch switch...".to_string());
                     self.kill_sapphire_processes();
                     self.sapphire_stopping = true;
+                    self.streaming_spawn = false;
                 }
 
                 let path = self.install_path.clone();
@@ -1510,29 +1565,37 @@ impl App {
                     }
                     Task::none()
                 } else if user_initiated {
-                    // Not running, user clicked Launch — start it
+                    // Not running, user clicked Launch — start it. The follower is a
+                    // Subscription keyed on spawn_epoch; flipping streaming_spawn on
+                    // (and bumping the epoch) starts a fresh process + log stream.
                     self.sapphire_running = true;
                     self.sapphire_log.clear();
                     self.active_tab = Tab::Running;
                     self.log_lines.push("Launching Sapphire...".to_string());
-                    let path = self.install_path.clone();
-                    let pid = self.sapphire_pid.clone();
-                    Task::stream(launch_sapphire_stream(path, pid))
+                    self.streaming_spawn = true;
+                    self.spawn_epoch += 1;
+                    Task::none()
                 } else {
                     // Startup check — not running, nothing to do
                     Task::none()
                 }
             }
             Message::StopSapphire => {
+                // Ignore repeat clicks while a stop is already in flight.
+                if self.sapphire_stopping {
+                    return Task::none();
+                }
                 // Service mode: stop the unit (and refresh status) instead of pkill.
                 if self.service.is_some() {
                     return self.update(Message::ServiceStop);
                 }
                 self.sapphire_stopping = true;
+                self.streaming_spawn = false; // drop the follower; kill reaps the tree
                 self.log_lines.push("Stopping Sapphire...".to_string());
                 self.kill_sapphire_processes();
 
-                // Poll until health endpoint stops responding
+                // Poll until the health endpoint stops responding. Report whether it
+                // actually went down (false = still up after the grace window).
                 Task::perform(async {
                     for _ in 0..20 {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1541,10 +1604,11 @@ impl App {
                             "https://localhost:8073/api/health".into(),
                         ]).await.map(|b| b.contains("ok")).unwrap_or(false);
                         if !still_up {
-                            return;
+                            return true;
                         }
                     }
-                }, |_| Message::SapphireStopConfirmed)
+                    false
+                }, Message::SapphireStopConfirmed)
             }
             Message::OpenBrowser => {
                 open_url("https://localhost:8073");
@@ -1602,6 +1666,7 @@ impl App {
                     self.log_lines.push("[update] Stopping Sapphire first...".to_string());
                     self.kill_sapphire_processes();
                     self.sapphire_stopping = true;
+                    self.streaming_spawn = false;
                     // Poll until dead, then trigger update
                     return Task::perform(async {
                         for _ in 0..20 {
@@ -1690,11 +1755,6 @@ impl App {
                 self.updates_available = Some(0);
                 Task::none()
             }
-            Message::SapphireLine(line) => {
-                self.sapphire_log.push(line);
-                self.cap_sapphire_log();
-                Task::none()
-            }
             Message::SapphireLines(lines) => {
                 self.sapphire_log.extend(lines);
                 self.cap_sapphire_log();
@@ -1703,14 +1763,44 @@ impl App {
             Message::SapphireExited(msg) => {
                 self.sapphire_running = false;
                 self.sapphire_stopping = false;
+                self.streaming_spawn = false;
+                self.sapphire_pid.store(0, Ordering::Relaxed); // clear stale PID on self-exit
                 self.sapphire_log.push(format!("--- {} ---", msg));
                 self.log_lines.push(msg);
                 Task::none()
             }
-            Message::SapphireStopConfirmed => {
-                self.sapphire_running = false;
+            Message::SapphireStopConfirmed(stopped) => {
                 self.sapphire_stopping = false;
-                self.log_lines.push("Sapphire stopped.".to_string());
+                if stopped {
+                    self.sapphire_running = false;
+                    self.log_lines.push("Sapphire stopped.".to_string());
+                } else {
+                    // Kill didn't take it down (e.g. an elevated instance) — keep it
+                    // shown as running so the button stays Stop, not Launch.
+                    self.sapphire_running = true;
+                    self.log_lines.push("Sapphire didn't stop — it may be running with admin rights. Try Stop again.".to_string());
+                }
+                Task::none()
+            }
+            Message::HealthPoll => {
+                // Skip when our own flows already own the running-state.
+                if self.streaming_spawn || self.sapphire_stopping || self.service.is_some() {
+                    return Task::none();
+                }
+                Task::perform(
+                    async {
+                        run_cmd_full_async("curl".into(), vec![
+                            "-sk".into(), "--max-time".into(), "3".into(),
+                            "https://localhost:8073/api/health".into(),
+                        ]).await.map(|b| b.contains("ok")).unwrap_or(false)
+                    },
+                    Message::HealthResult,
+                )
+            }
+            Message::HealthResult(running) => {
+                if !self.streaming_spawn && !self.sapphire_stopping && self.service.is_none() {
+                    self.sapphire_running = running;
+                }
                 Task::none()
             }
             Message::TabSelected(tab) => {
@@ -1748,7 +1838,7 @@ impl App {
                 let path = self.install_path.clone();
 
                 // Fire off all checks in parallel
-                Task::batch(vec![
+                let mut checks = vec![
                     Task::perform(check_git(), |(step, status)| {
                         Message::StepResult(step, status)
                     }),
@@ -1767,7 +1857,12 @@ impl App {
                     Task::perform(check_deps(path), |(step, status)| {
                         Message::StepResult(step, status)
                     }),
-                ])
+                ];
+                #[cfg(windows)]
+                checks.push(Task::perform(check_vcredist(), |(step, status)| {
+                    Message::StepResult(step, status)
+                }));
+                Task::batch(checks)
             }
 
             Message::StepResult(step, status) => {
@@ -2155,17 +2250,23 @@ impl App {
                 Task::none()
             }
             Message::ServiceInstall => {
-                self.log_lines.push("[service] Creating systemd --user unit...".to_string());
+                self.log_lines.push("[service] Setting up autostart...".to_string());
                 let path = self.install_path.clone();
                 Task::perform(install_service(path), |(m, ok)| Message::ServiceInstallResult(m, ok))
             }
             Message::ServiceInstallResult(msg, ok) => {
                 self.log_lines.push(format!("[service] {}", msg));
                 if ok {
-                    self.sapphire_running = true;
-                    self.streaming_journal = true;
-                    self.journal_epoch += 1;
-                    self.sapphire_log.clear();
+                    // Linux `enable --now` also starts it + streams journal. On Windows,
+                    // enabling autostart only registers the logon task — it runs at the
+                    // next sign-in, so we don't touch running/streaming state here.
+                    #[cfg(not(windows))]
+                    {
+                        self.sapphire_running = true;
+                        self.streaming_journal = true;
+                        self.journal_epoch += 1;
+                        self.sapphire_log.clear();
+                    }
                 }
                 // Re-detect so the tab flips to the manage view.
                 Task::perform(
@@ -2186,8 +2287,13 @@ impl App {
             Message::ServiceRemoveResult(msg, ok) => {
                 self.log_lines.push(format!("[service] {}", msg));
                 if ok {
-                    self.sapphire_running = false;
-                    self.sapphire_stopping = false;
+                    // Linux removes the running unit too. On Windows, turning off
+                    // autostart shouldn't change whatever's running right now.
+                    #[cfg(not(windows))]
+                    {
+                        self.sapphire_running = false;
+                        self.sapphire_stopping = false;
+                    }
                 }
                 Task::perform(
                     async { tokio::task::spawn_blocking(detect_sapphire_service).await.unwrap_or(None) },
@@ -2298,6 +2404,10 @@ impl App {
             Step::Clone => Task::perform(install_clone(path, branch), |(s, st, log)| {
                 Message::InstallStepResult(s, st, log)
             }),
+            #[cfg(windows)]
+            Step::VcRedist => Task::perform(install_vcredist(), |(s, st, log)| {
+                Message::InstallStepResult(s, st, log)
+            }),
             Step::Deps => Task::perform(install_deps(path, self.install_output.clone()), |(s, st, log)| {
                 Message::InstallStepResult(s, st, log)
             }),
@@ -2322,6 +2432,22 @@ impl App {
             subs.push(Subscription::run_with_id(self.journal_epoch, journal_log_stream()));
         }
 
+        // Spawn-mode follower (when WE launched Sapphire). A Subscription, not a
+        // Task::stream, so iced parks it when idle — fixes the redraw CPU-spin.
+        if self.streaming_spawn {
+            subs.push(Subscription::run_with_id(
+                ("spawn", self.spawn_epoch),
+                spawn_log_stream(self.install_path.clone(), self.sapphire_pid.clone()),
+            ));
+        }
+
+        // Periodically detect an out-of-band Sapphire (e.g. started by the Windows
+        // autostart task) so the header's Launch/Stop stays accurate. Skipped while we
+        // own the process (spawn follower), while stopping, and in Linux service mode.
+        if self.service.is_none() && !self.streaming_spawn && !self.sapphire_stopping {
+            subs.push(iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::HealthPoll));
+        }
+
         Subscription::batch(subs)
     }
 
@@ -2339,6 +2465,8 @@ fn step_label(step: Step) -> &'static str {
         Step::CondaInit => "Initialize conda",
         Step::PythonEnv => "Create Python environment",
         Step::Clone => "Clone Sapphire",
+        #[cfg(windows)]
+        Step::VcRedist => "Check Visual C++ runtime",
         Step::Deps => "Install dependencies",
         Step::Done => "Done!",
     }
