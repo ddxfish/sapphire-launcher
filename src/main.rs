@@ -1439,38 +1439,51 @@ async fn ts_fix_plugins(install_path: String) -> (TsCheck, String, bool) {
 /// Returns (plugin name, [pip specifiers]) for enabled plugins that declare any. Fully
 /// graceful: a missing state file, non-plugin folder, or garbled manifest is just skipped.
 async fn enabled_plugin_deps(install_path: &str) -> Vec<(String, Vec<String>)> {
-    let plugins_dir = PathBuf::from(install_path).join("plugins");
-    let state_path = PathBuf::from(install_path).join("user").join("webui").join("plugins.json");
+    let root = PathBuf::from(install_path);
 
     let str_list = |v: &serde_json::Value, key: &str| -> Vec<String> {
         v.get(key).and_then(|x| x.as_array())
             .map(|arr| arr.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
             .unwrap_or_default()
     };
-    let (enabled_list, disabled_list) = match tokio::fs::read_to_string(&state_path).await {
-        Ok(txt) => {
+    // Enabled/disabled state: prefer the user's web-UI config; fall back to the static
+    // default shipped in the repo (the only file present on a fresh clone). Mirrors
+    // Sapphire's plugin_loader.py read order, so we don't see empty lists on a clone.
+    let state_paths = [
+        root.join("user").join("webui").join("plugins.json"),
+        root.join("interfaces").join("web").join("static").join("core-ui").join("plugins.json"),
+    ];
+    let (mut enabled_list, mut disabled_list) = (Vec::new(), Vec::new());
+    for sp in &state_paths {
+        if let Ok(txt) = tokio::fs::read_to_string(sp).await {
             let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
-            (str_list(&v, "enabled"), str_list(&v, "disabled"))
+            enabled_list = str_list(&v, "enabled");
+            disabled_list = str_list(&v, "disabled");
+            break;
         }
-        Err(_) => (Vec::new(), Vec::new()),
-    };
+    }
 
+    // Scan BOTH plugin roots Sapphire loads from: system (plugins/) and user
+    // (user/plugins/). A user-installed plugin with pip deps lives only in the latter.
+    let plugin_dirs = [root.join("plugins"), root.join("user").join("plugins")];
     let mut out: Vec<(String, Vec<String>)> = Vec::new();
-    let Ok(mut entries) = tokio::fs::read_dir(&plugins_dir).await else { return out; };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        let Ok(txt) = tokio::fs::read_to_string(entry.path().join("plugin.json")).await else { continue };
-        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
-        let name = manifest.get("name").and_then(|n| n.as_str()).map(str::to_string)
-            .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
-        let default_enabled = manifest.get("default_enabled").and_then(|b| b.as_bool()).unwrap_or(false);
-        let is_enabled = enabled_list.iter().any(|e| e == &name)
-            || (default_enabled && !disabled_list.iter().any(|d| d == &name));
-        if !is_enabled { continue; }
-        let specs: Vec<String> = manifest.get("pip_dependencies").and_then(|d| d.as_array())
-            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
-            .unwrap_or_default();
-        if !specs.is_empty() {
-            out.push((name, specs));
+    for dir in &plugin_dirs {
+        let Ok(mut entries) = tokio::fs::read_dir(dir).await else { continue; };
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let Ok(txt) = tokio::fs::read_to_string(entry.path().join("plugin.json")).await else { continue };
+            let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+            let name = manifest.get("name").and_then(|n| n.as_str()).map(str::to_string)
+                .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+            let default_enabled = manifest.get("default_enabled").and_then(|b| b.as_bool()).unwrap_or(false);
+            let is_enabled = enabled_list.iter().any(|e| e == &name)
+                || (default_enabled && !disabled_list.iter().any(|d| d == &name));
+            if !is_enabled { continue; }
+            let specs: Vec<String> = manifest.get("pip_dependencies").and_then(|d| d.as_array())
+                .map(|arr| arr.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            if !specs.is_empty() {
+                out.push((name, specs));
+            }
         }
     }
     out

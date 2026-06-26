@@ -218,7 +218,11 @@ pub(crate) async fn remove_service() -> (String, bool) {
 /// "enabled" marker.
 #[cfg(windows)]
 pub(crate) async fn remove_service() -> (String, bool) {
-    let outer = "$ErrorActionPreference='Stop'; try { $p = Start-Process powershell -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList '-NoProfile','-Command','Unregister-ScheduledTask -TaskName Sapphire -Confirm:$false'; exit $p.ExitCode } catch { exit 1223 }".to_string();
+    // Inner command: if the task exists, unregister it with -ErrorAction Stop so a real
+    // failure becomes a non-zero exit (→ Err → marker kept). If it's already gone, do
+    // nothing and exit 0 (idempotent success). This makes "removed" mean it's truly gone,
+    // matching the marker-clear comment below — not just "UAC wasn't declined".
+    let outer = "$ErrorActionPreference='Stop'; try { $p = Start-Process powershell -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList '-NoProfile','-Command','if (Get-ScheduledTask -TaskName Sapphire -ErrorAction SilentlyContinue) { Unregister-ScheduledTask -TaskName Sapphire -Confirm:$false -ErrorAction Stop }'; exit $p.ExitCode } catch { exit 1223 }".to_string();
     let result = run_cmd_full_async("powershell".into(), vec!["-NoProfile".into(), "-Command".into(), outer]).await;
     match result {
         Ok(_) => {

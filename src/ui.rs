@@ -132,7 +132,7 @@ impl App {
 
         // Autostart tab: shown when autostart is set up OR Sapphire is installed (so an
         // orphaned setup stays removable after an uninstall). Linux = systemd unit;
-        // Windows = our autostart wrapper .cmd existing.
+        // Windows = our autostart marker file (autostart.on) existing.
         let main_py = PathBuf::from(&self.install_path).join("main.py").exists();
         #[cfg(not(windows))]
         let show_autostart = self.service.is_some() || main_py;
