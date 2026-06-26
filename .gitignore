@@ -4,3 +4,5 @@ target
 user
 TODO.md
 plans
+build
+*.AppImage
