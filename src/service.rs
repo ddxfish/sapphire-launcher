@@ -129,18 +129,54 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
         std::env::var("USERDOMAIN").unwrap_or_default(),
         std::env::var("USERNAME").unwrap_or_default(),
     );
+
+    // Write the launch shim the task runs (instead of `pythonw main.py` directly).
+    // Under pythonw there's no console, so sys.stdout/stderr are None and Sapphire's
+    // startup logging crashes the child → supervisor gives up → task exits 1. The shim
+    // redirects output to a logfile first (valid handles, no crash) then runs main.py.
+    // See platform::autostart_shim_path for the full why.
+    let shim = autostart_shim_path();
+    let log = autostart_log_path();
+    if let Some(parent) = shim.parent() {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            return (format!("Couldn't create the autostart folder: {}", e), false);
+        }
+    }
+    // Poor-man's log rotation: truncate the logfile on each Enable so it can't grow
+    // unboundedly across re-enables. The shim still opens it in append mode, so logs
+    // accumulate within a single logon session (across main.py's crash-restarts).
+    let _ = tokio::fs::write(&log, "").await;
+    // Python string literal: escape backslashes then double-quotes (handles spaces and
+    // any path safely — avoids raw-string's can't-end-in-backslash gotcha).
+    let py_lit = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let shim_src = format!(
+        "import runpy, sys, os\r\n\
+         os.chdir(\"{cwd}\")\r\n\
+         _log = \"{log}\"\r\n\
+         os.makedirs(os.path.dirname(_log), exist_ok=True)\r\n\
+         sys.stdout = sys.stderr = open(_log, \"a\", buffering=1, encoding=\"utf-8\", errors=\"replace\")\r\n\
+         runpy.run_path(\"main.py\", run_name=\"__main__\")\r\n",
+        cwd = py_lit(&install_path),
+        log = py_lit(&log.to_string_lossy()),
+    );
+    if let Err(e) = tokio::fs::write(&shim, shim_src).await {
+        return (format!("Couldn't write the autostart launcher: {}", e), false);
+    }
+
     let esc = |s: &str| s.replace('\'', "''"); // PowerShell single-quote escaping
 
     // Registration script — normal PS single-quoted strings we control (dodges the
     // nested-ArgumentList quoting hell of passing this inline to an elevated shell).
+    // The action runs pythonw on the shim; the shim path is wrapped in literal double
+    // quotes inside the argument so a path with spaces stays a single argument.
     let script = format!(
         "$ErrorActionPreference='Stop'\r\n\
-         $a = New-ScheduledTaskAction -Execute '{pyw}' -Argument 'main.py' -WorkingDirectory '{cwd}'\r\n\
+         $a = New-ScheduledTaskAction -Execute '{pyw}' -Argument '\"{shim}\"' -WorkingDirectory '{cwd}'\r\n\
          $t = New-ScheduledTaskTrigger -AtLogOn -User '{user}'\r\n\
          $p = New-ScheduledTaskPrincipal -UserId '{user}' -LogonType Interactive\r\n\
          $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable\r\n\
          Register-ScheduledTask -TaskName Sapphire -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null\r\n",
-        pyw = esc(&pyw), cwd = esc(&install_path), user = esc(&user),
+        pyw = esc(&pyw), shim = esc(&shim.to_string_lossy()), cwd = esc(&install_path), user = esc(&user),
     );
     let ps1 = std::env::temp_dir().join("sapphire-enable.ps1");
     if let Err(e) = tokio::fs::write(&ps1, script).await {

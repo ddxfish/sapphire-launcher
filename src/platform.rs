@@ -46,6 +46,24 @@ pub(crate) fn autostart_marker_path() -> PathBuf {
     app_config_dir().join("autostart.on")
 }
 
+/// Windows: the autostart launch shim the logon task runs (via pythonw). Why a shim
+/// instead of `pythonw main.py` directly: under pythonw there is NO console, so
+/// `sys.stdout`/`sys.stderr` are None — Sapphire's first startup log write throws,
+/// main.py's supervisor retries, then gives up after 5 crashes (~17s) and the task
+/// exits 1. The shim redirects stdout/stderr to a real logfile before running main.py,
+/// which gives pythonw valid handles (no crash) AND captures logs for later tailing.
+/// Still windowless — it's pythonw, no cmd.exe console flash.
+#[cfg(windows)]
+pub(crate) fn autostart_shim_path() -> PathBuf {
+    app_config_dir().join("autostart_shim.py")
+}
+
+/// Windows: the logfile the autostart shim redirects Sapphire's output into.
+#[cfg(windows)]
+pub(crate) fn autostart_log_path() -> PathBuf {
+    app_config_dir().join("sapphire-launcher.log")
+}
+
 /// Base config dir, shared with Sapphire. Mirrors core/setup.py::get_config_dir():
 /// Windows %APPDATA%\Sapphire, Linux $XDG_CONFIG_HOME/sapphire or ~/.config/sapphire.
 pub(crate) fn app_config_dir() -> PathBuf {
