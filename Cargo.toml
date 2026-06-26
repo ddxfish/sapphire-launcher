@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-iced = { version = "0.13", features = ["image", "tokio"] }
+# Software renderer only (tiny-skia, no wgpu): one render path on every platform,
+# no GPU-driver dependency. Plenty for a static launcher UI, and it makes the Linux
+# AppImage portable (no Vulkan/GL libs to bundle/match). Re-add the non-wgpu defaults
+# (tiny-skia, fira-sans bundled font, auto-detect-theme) since default-features=false.
+iced = { version = "0.13", default-features = false, features = ["tiny-skia", "fira-sans", "auto-detect-theme", "image", "tokio"] }
 image = "0.24"
 tokio = { version = "1", features = ["rt", "process", "sync", "io-util", "macros", "fs"] }
 tokio-stream = "0.1"

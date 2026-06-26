@@ -168,7 +168,12 @@ fn install_desktop_entry() {
     use std::io::Write;
     let Ok(home) = std::env::var("HOME") else { return };
     let Ok(exe) = std::env::current_exe() else { return };
-    let exe_str = exe.display().to_string();
+    // Under an AppImage, current_exe() points into the ephemeral mount
+    // (/tmp/.mount_*) that vanishes on exit — a menu entry pointing there would be
+    // dead, and the mount's random suffix would defeat the "already installed" check
+    // below (rewriting on every launch). $APPIMAGE is the persistent path to the
+    // .AppImage the user launched; prefer it when present.
+    let exe_str = std::env::var("APPIMAGE").unwrap_or_else(|_| exe.display().to_string());
 
     let desktop_path = format!("{}/.local/share/applications/sapphire-launcher.desktop", home);
     // Skip if we've already installed for this exact binary location.
