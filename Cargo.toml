@@ -10,6 +10,7 @@ tokio = { version = "1", features = ["rt", "process", "sync", "io-util", "macros
 tokio-stream = "0.1"
 futures = "0.3"
 rfd = "0.15"
+serde_json = "1"
 
 [build-dependencies]
 winres = "0.1"

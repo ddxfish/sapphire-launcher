@@ -371,6 +371,7 @@ impl Default for App {
                 (TsCheck::WebUi, TsStatus::NotChecked),
                 (TsCheck::DepsHealth, TsStatus::NotChecked),
                 (TsCheck::Plugins, TsStatus::NotChecked),
+                (TsCheck::PluginDeps, TsStatus::NotChecked),
                 (TsCheck::Gpu, TsStatus::NotChecked),
             ],
             ts_running: false,
@@ -499,6 +500,7 @@ enum TsCheck {
     WebUi,
     DepsHealth,
     Plugins,
+    PluginDeps,
     Gpu,
 }
 
@@ -1430,6 +1432,100 @@ async fn ts_fix_plugins(install_path: String) -> (TsCheck, String, bool) {
     }
 }
 
+/// Read enabled Sapphire plugins and their declared pip specifiers. A plugin is enabled
+/// if it's listed in `user/webui/plugins.json` `enabled`, OR its manifest sets
+/// `default_enabled` and it's not in `disabled` (so we must read every manifest, not just
+/// the enabled list — that's how default-on system plugins like memory/email count).
+/// Returns (plugin name, [pip specifiers]) for enabled plugins that declare any. Fully
+/// graceful: a missing state file, non-plugin folder, or garbled manifest is just skipped.
+async fn enabled_plugin_deps(install_path: &str) -> Vec<(String, Vec<String>)> {
+    let plugins_dir = PathBuf::from(install_path).join("plugins");
+    let state_path = PathBuf::from(install_path).join("user").join("webui").join("plugins.json");
+
+    let str_list = |v: &serde_json::Value, key: &str| -> Vec<String> {
+        v.get(key).and_then(|x| x.as_array())
+            .map(|arr| arr.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
+            .unwrap_or_default()
+    };
+    let (enabled_list, disabled_list) = match tokio::fs::read_to_string(&state_path).await {
+        Ok(txt) => {
+            let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
+            (str_list(&v, "enabled"), str_list(&v, "disabled"))
+        }
+        Err(_) => (Vec::new(), Vec::new()),
+    };
+
+    let mut out: Vec<(String, Vec<String>)> = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(&plugins_dir).await else { return out; };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let Ok(txt) = tokio::fs::read_to_string(entry.path().join("plugin.json")).await else { continue };
+        let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
+        let name = manifest.get("name").and_then(|n| n.as_str()).map(str::to_string)
+            .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
+        let default_enabled = manifest.get("default_enabled").and_then(|b| b.as_bool()).unwrap_or(false);
+        let is_enabled = enabled_list.iter().any(|e| e == &name)
+            || (default_enabled && !disabled_list.iter().any(|d| d == &name));
+        if !is_enabled { continue; }
+        let specs: Vec<String> = manifest.get("pip_dependencies").and_then(|d| d.as_array())
+            .map(|arr| arr.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
+            .unwrap_or_default();
+        if !specs.is_empty() {
+            out.push((name, specs));
+        }
+    }
+    out
+}
+
+/// Troubleshoot check: for each ENABLED plugin, verify its `pip_dependencies` are
+/// installed (via `pip show`). Disabled plugins and dep-free plugins are ignored.
+async fn ts_check_plugin_deps(install_path: String) -> (TsCheck, TsStatus) {
+    let plugins = enabled_plugin_deps(&install_path).await;
+    if plugins.is_empty() {
+        return (TsCheck::PluginDeps, TsStatus::Ok("No enabled plugins need extra packages".into()));
+    }
+    let (pip_program, pip_base) = find_conda_pip();
+    let mut report: Vec<String> = Vec::new();
+    for (name, specs) in &plugins {
+        let mut missing: Vec<String> = Vec::new();
+        for spec in specs {
+            // Strip the version/extras specifier to the bare package name (mirrors
+            // Sapphire's own re.split(r'[><=!~\[]', spec) in plugin_loader.py).
+            let pkg = spec.split(&['>', '<', '=', '!', '~', '[', ' '][..]).next().unwrap_or(spec).trim();
+            if pkg.is_empty() { continue; }
+            let mut args = pip_base.clone();
+            args.extend(["show".into(), pkg.into()]);
+            if run_cmd_full_async(pip_program.clone(), args).await.is_err() {
+                missing.push(spec.clone());
+            }
+        }
+        if !missing.is_empty() {
+            report.push(format!("{}: missing {}", name, missing.join(", ")));
+        }
+    }
+    if report.is_empty() {
+        (TsCheck::PluginDeps, TsStatus::Ok("All enabled plugins have their dependencies".into()))
+    } else {
+        (TsCheck::PluginDeps, TsStatus::Problem(report.join(" | ")))
+    }
+}
+
+/// The "Install" button for plugin deps: pip-install every enabled plugin's specifiers
+/// in one call (pip skips already-satisfied ones, so we don't need to pre-filter).
+async fn ts_fix_plugin_deps(install_path: String) -> (TsCheck, String, bool) {
+    let specs: Vec<String> = enabled_plugin_deps(&install_path).await
+        .into_iter().flat_map(|(_, s)| s).collect();
+    if specs.is_empty() {
+        return (TsCheck::PluginDeps, "No plugin dependencies to install.".into(), true);
+    }
+    let (program, mut args) = find_conda_pip();
+    args.push("install".into());
+    args.extend(specs);
+    match run_cmd_full_async(program, args).await {
+        Ok(_) => (TsCheck::PluginDeps, "Plugin dependencies installed. Restart Sapphire to apply.".into(), true),
+        Err(e) => (TsCheck::PluginDeps, format!("Install failed: {}", e), false),
+    }
+}
+
 // ── Update ─────────────────────────────────────────────────────────────────
 
 impl App {
@@ -2085,7 +2181,8 @@ impl App {
                     Task::perform(ts_check_running(), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_webui(), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_deps(), |(c, s)| Message::TroubleshootResult(c, s)),
-                    Task::perform(ts_check_plugins(path), |(c, s)| Message::TroubleshootResult(c, s)),
+                    Task::perform(ts_check_plugins(path.clone()), |(c, s)| Message::TroubleshootResult(c, s)),
+                    Task::perform(ts_check_plugin_deps(path), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_gpu(), |(c, s)| Message::TroubleshootResult(c, s)),
                 ])
             }
@@ -2111,6 +2208,9 @@ impl App {
                         Message::TroubleshootFixResult(c, msg, ok)
                     }),
                     TsCheck::Plugins => Task::perform(ts_fix_plugins(path), |(c, msg, ok)| {
+                        Message::TroubleshootFixResult(c, msg, ok)
+                    }),
+                    TsCheck::PluginDeps => Task::perform(ts_fix_plugin_deps(path), |(c, msg, ok)| {
                         Message::TroubleshootFixResult(c, msg, ok)
                     }),
                     _ => Task::none(),
@@ -2479,6 +2579,7 @@ fn ts_label(check: TsCheck) -> &'static str {
         TsCheck::WebUi => "Web UI loading",
         TsCheck::DepsHealth => "Package health",
         TsCheck::Plugins => "Optional features",
+        TsCheck::PluginDeps => "Plugin dependencies",
         TsCheck::Gpu => "GPU",
     }
 }

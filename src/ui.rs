@@ -494,8 +494,9 @@ impl App {
                 (check, status),
                 (TsCheck::DepsHealth, TsStatus::Problem(_))
                     | (TsCheck::Plugins, TsStatus::Problem(_))
+                    | (TsCheck::PluginDeps, TsStatus::Problem(_))
             );
-            let fix_label = if *check == TsCheck::Plugins { "Install" } else { "Fix" };
+            let fix_label = if matches!(check, TsCheck::Plugins | TsCheck::PluginDeps) { "Install" } else { "Fix" };
             if is_fixable {
                 check_row = check_row.push(horizontal_space());
                 check_row = check_row.push(

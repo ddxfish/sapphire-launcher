@@ -3187,6 +3187,7 @@ dependencies = [
  "iced",
  "image",
  "rfd",
+ "serde_json",
  "tokio",
  "tokio-stream",
  "winres",
