@@ -78,6 +78,19 @@ fn save_config(install_path: &str, branch: Branch) {
 }
 
 fn main() -> iced::Result {
+    // iced 0.13 on native Wayland spawns a phantom second toplevel (default title,
+    // no app_id) that shows as a stray "unknown" icon in the dock — upstream bug
+    // iced-rs/iced#2564. Force XWayland by clearing WAYLAND_DISPLAY before the event
+    // loop starts: winit then falls back to X11, where the phantom doesn't occur and
+    // the window's WM_CLASS matches the .desktop StartupWMClass (one clean icon).
+    // Temporary bridge — revisit when we move to iced 0.14 (fixed there). Safe here:
+    // first statement in main(), before any threads spawn.
+    #[cfg(not(windows))]
+    unsafe {
+        std::env::remove_var("WAYLAND_DISPLAY");
+        std::env::remove_var("WAYLAND_SOCKET");
+    }
+
     // Linux: register the app with the desktop (apps menu / dock icon).
     #[cfg(not(windows))]
     install_desktop_entry();
@@ -85,7 +98,7 @@ fn main() -> iced::Result {
     let icon = load_window_icon();
 
     let win_settings = window::Settings {
-        size: iced::Size::new(700.0, 500.0),
+        size: iced::Size::new(800.0, 550.0),
         icon,
         // Linux only: app_id must match the .desktop StartupWMClass so the
         // compositor shows our icon. (The field doesn't exist on Windows.)
