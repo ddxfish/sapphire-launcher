@@ -14,12 +14,12 @@ Sapphire Launcher handles everything so you don't have to touch a terminal. One 
 - **Launch** — Start Sapphire and see its live output in the Log tab. Open Browser button takes you straight to the web UI.
 - **Branch Switching** — Switch between Stable (main) and Development (dev) branches from the dropdown. Auto-stops and restarts Sapphire if needed.
 - **Autostart** — Optionally launch Sapphire when you log in. On Linux it can install Sapphire as a systemd user service with custom environment variables.
-- **Troubleshoot** — Checks if Sapphire is responding, verifies package versions (catches the starlette issue), checks dependency health, scans optional voice features (STT/TTS/Wake Word), and detects your GPU. Fix buttons for common issues.
+- **Troubleshoot** — Checks if Sapphire is responding and the web UI loads, runs `pip check` on her packages, scans optional voice features (STT/TTS/Wake Word), checks that every enabled plugin has its packages, and detects your GPU(s). Install/Fix buttons stream their output into the log; they wait for Sapphire to be stopped.
 - **Uninstall** — Quick resets for password and API keys. Danger zone for removing the conda environment, user data, or the entire install.
 
 ## Features
 
-- Single ~5 MB file, no installer needed
+- Single file, no installer needed
 - Finds Git, Conda, and pip on disk automatically (no PATH dependency)
 - Detects if Sapphire is already running on startup
 - Update checker with badge indicator

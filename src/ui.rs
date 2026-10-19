@@ -115,7 +115,7 @@ impl App {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
             }))
-            .on_press(Message::Launch)
+            .on_press_maybe(if self.updating || self.installing { None } else { Some(Message::Launch) })
             .style(button::success);
 
             header = header.push(launch_btn);
@@ -253,11 +253,12 @@ impl App {
             steps_col = steps_col.push(row_items);
         }
 
-        // Action buttons
+        // Action buttons. A failed step counts as work to do: Go retries it.
         let has_not_found = self
             .steps
             .iter()
-            .any(|(s, st)| *s != Step::Done && matches!(st, StepStatus::NotFound(_)));
+            .any(|(s, st)| *s != Step::Done && matches!(st, StepStatus::NotFound(_) | StepStatus::Failed(_)));
+        let any_failed = self.steps.iter().any(|(_, st)| matches!(st, StepStatus::Failed(_)));
 
         let all_not_started = self.steps.iter().all(|(_, st)| *st == StepStatus::NotStarted);
 
@@ -277,7 +278,7 @@ impl App {
         // Go button — only if scan found stuff to install
         if has_not_found {
             let go_btn = button(
-                text("Go — Install Missing").font(Font {
+                text(if any_failed { "Retry — Install Missing" } else { "Go — Install Missing" }).font(Font {
                     weight: iced::font::Weight::Bold,
                     ..Font::DEFAULT
                 }),
@@ -335,7 +336,7 @@ impl App {
         };
 
         let update_btn = button(text(update_label))
-            .on_press_maybe(if self.updating || self.sapphire_stopping {
+            .on_press_maybe(if self.updating || self.installing || self.sapphire_stopping {
                 None
             } else {
                 Some(Message::UpdateClicked)
@@ -381,7 +382,10 @@ impl App {
     }
 
     fn view_uninstall_tab(&self) -> Element<'_, Message> {
-        let busy = self.uninstalling;
+        // Nothing here runs while she is up: a live Sapphire rewrites credentials.json
+        // from memory, and deleting folders under her is how installs get half-eaten.
+        let blocked = self.sapphire_running || self.sapphire_stopping;
+        let busy = self.uninstalling || blocked;
 
         // ═══════════════════════════════════════════════════════════
         // Quick Resets — safe, non-destructive to the install
@@ -392,10 +396,20 @@ impl App {
             .style(button::primary)
             .padding([4, 12]);
 
-        let reset_creds_btn = button(text("Reset API Keys").size(13))
-            .on_press(Message::ResetCredentials)
-            .style(button::primary)
+        let keys_label = if self.confirm_reset_keys { "YES, clear API keys" } else { "Reset API Keys" };
+        let reset_creds_btn = button(text(keys_label).size(13))
+            .on_press_maybe(if blocked { None } else { Some(Message::ResetCredentials) })
+            .style(if self.confirm_reset_keys { button::danger } else { button::primary })
             .padding([4, 12]);
+        let keys_desc = if self.confirm_reset_keys {
+            text("Click again to confirm. Only the LLM/service API keys are cleared — accounts, wallets and passwords stay.")
+                .size(11).color(color!(0xe74c3c))
+        } else if blocked {
+            text("Stop Sapphire first — she rewrites this file while running.").size(11).color(color!(0xf9e154))
+        } else {
+            text("Clears saved API keys (Claude, OpenAI, etc). You'll re-enter them in Sapphire.")
+                .size(11).color(color!(0x7f849c))
+        };
 
         let resets_section = column![
             text("Quick Resets").size(16).font(Font {
@@ -408,11 +422,7 @@ impl App {
                     text("Forgot your password? This clears it so Sapphire asks for a new one.")
                         .size(11).color(color!(0x7f849c)),
                 ].spacing(3).width(Length::FillPortion(1)),
-                column![
-                    reset_creds_btn,
-                    text("Clears saved API keys (Claude, OpenAI, etc). You'll re-enter them in Sapphire.")
-                        .size(11).color(color!(0x7f849c)),
-                ].spacing(3).width(Length::FillPortion(1)),
+                column![reset_creds_btn, keys_desc].spacing(3).width(Length::FillPortion(1)),
             ].spacing(16),
         ].spacing(8);
 
@@ -463,6 +473,7 @@ impl App {
                 ..Font::DEFAULT
             }).color(color!(0xe74c3c)),
             text("These actions are destructive. Won't touch Git or Miniconda.").size(11).color(color!(0x7f849c)),
+            text(if blocked { "Stop Sapphire before using these." } else { "" }).size(11).color(color!(0xf9e154)),
             column![remove_env_btn, env_desc].spacing(2),
             column![delete_ud_btn, ud_desc].spacing(2),
             column![delete_folder_btn, folder_desc].spacing(2),
@@ -488,6 +499,10 @@ impl App {
 
     fn view_troubleshoot_tab(&self) -> Element<'_, Message> {
         let mut checks_col = Column::new().spacing(8);
+        // Fixes pip-install into her env: one at a time, and only while she is down
+        // (Windows keeps the files she has open locked — half-installed packages).
+        let fix_blocked = self.ts_running || self.ts_fixing || self.sapphire_running || self.sapphire_stopping;
+        let mut any_fixable = false;
 
         for (check, status) in &self.ts_checks {
             const SPINNER: &[&str] = &["/", "-", "\\", "|"];
@@ -528,10 +543,11 @@ impl App {
             );
             let fix_label = if matches!(check, TsCheck::Plugins | TsCheck::PluginDeps) { "Install" } else { "Fix" };
             if is_fixable {
+                any_fixable = true;
                 check_row = check_row.push(horizontal_space());
                 check_row = check_row.push(
                     button(text(fix_label).size(11))
-                        .on_press(Message::TroubleshootFix(*check))
+                        .on_press_maybe(if fix_blocked { None } else { Some(Message::TroubleshootFix(*check)) })
                         .style(button::success)
                         .padding([2, 10])
                 );
@@ -541,8 +557,14 @@ impl App {
         }
 
         let check_btn = button(text("Check Sapphire"))
-            .on_press_maybe(if self.ts_running { None } else { Some(Message::TroubleshootCheck) })
+            .on_press_maybe(if self.ts_running || self.ts_fixing { None } else { Some(Message::TroubleshootCheck) })
             .style(button::primary);
+
+        let note = if any_fixable && (self.sapphire_running || self.sapphire_stopping) {
+            "Stop Sapphire to install or repair packages."
+        } else {
+            ""
+        };
 
         column![
             row![
@@ -554,6 +576,7 @@ impl App {
                 check_btn,
             ].align_y(iced::Alignment::Center),
             checks_col,
+            text(note).size(11).color(color!(0xf9e154)),
         ]
         .spacing(10)
         .into()
@@ -602,7 +625,7 @@ impl App {
             let remove_btn = button(text(remove_label).size(13))
                 .on_press(Message::ServiceRemoveClick).style(button::danger).padding([4, 14]);
 
-            return column![
+            let mut col = column![
                 text("Autostart").size(18).font(bold),
                 text("Sapphire runs as a systemd user service — starts at sign-in, restarts on crash. The header Launch/Stop control it too.")
                     .size(11).color(muted),
@@ -616,16 +639,50 @@ impl App {
                     button(text("Don't start at sign-in").size(13)).on_press(Message::ServiceDisable).style(button::secondary).padding([4, 14]),
                 ].spacing(10),
                 text(format!("Folder: {}", workdir)).size(11).color(muted),
-                divider(),
-                text("Environment variables  (one KEY=VALUE per line)").size(13).font(bold),
-                text("e.g. ANTHROPIC_API_KEY=…, OPENAI_API_KEY=… — one per line.").size(11).color(muted),
-                text_editor(&self.env_content).on_action(Message::EnvEdit).height(Length::Fixed(120.0)),
-                button(text("Save & restart").size(13)).on_press(Message::EnvSaveRestart).style(button::primary).padding([4, 14]),
-                text("Written privately to ~/.config/sapphire/service.env (chmod 600).").size(11).color(muted),
-                divider(),
-                remove_btn,
-                text("Backs up the unit to sapphire.service.bak, then deletes it.").size(11).color(muted),
-            ].spacing(12).into();
+            ].spacing(12);
+
+            // Unit health: an older or hand-written unit that is missing the stop
+            // rules gets a one-click patch; a unit pointing at nothing gets told.
+            if let Some(i) = &self.unit_issues {
+                let warn = color!(0xf9e154);
+                let mut block = column![text("Service file needs attention").size(13).font(bold).color(warn)].spacing(6);
+                for b in &i.broken {
+                    block = block.push(text(format!("{} Remove the service and set it up again here.", b)).size(11).color(muted));
+                }
+                if !i.missing.is_empty() {
+                    block = block.push(text(format!(
+                        "It predates Sapphire's stop rules (missing {}): a second Sapphire or a config error would restart in a loop, and a slow stop could be cut off.",
+                        i.missing.join(" and ")
+                    )).size(11).color(muted));
+                    match &i.fragment {
+                        Some(_) => block = block.push(
+                            button(text("Update service file").size(13)).on_press(Message::UnitPatch).style(button::primary).padding([4, 14])
+                        ),
+                        None => block = block.push(
+                            text("Add those lines to the [Service] section of your unit, then run: systemctl --user daemon-reload").size(11).color(muted)
+                        ),
+                    }
+                }
+                col = col.push(block);
+            }
+
+            // The env editor edits the file the UNIT names (a hand-written unit may use
+            // any path); no EnvironmentFile= line, no editor.
+            if let Some(env_path) = &info.env_file {
+                col = col
+                    .push(divider())
+                    .push(text("Environment variables  (one KEY=VALUE per line)").size(13).font(bold))
+                    .push(text("e.g. ANTHROPIC_API_KEY=…, OPENAI_API_KEY=… — one per line.").size(11).color(muted))
+                    .push(text_editor(&self.env_content).on_action(Message::EnvEdit).height(Length::Fixed(120.0)))
+                    .push(button(text("Save & restart").size(13)).on_press(Message::EnvSaveRestart).style(button::primary).padding([4, 14]))
+                    .push(text(format!("Written privately to {} (chmod 600).", env_path)).size(11).color(muted));
+            }
+
+            return col
+                .push(divider())
+                .push(remove_btn)
+                .push(text("Backs up the unit to sapphire.service.bak, then deletes it.").size(11).color(muted))
+                .into();
         }
 
         // ── Pre-install view: no unit yet ───────────────────────────────────
@@ -650,14 +707,19 @@ impl App {
             row![text(mark).size(13).color(c), text(t).size(13)].spacing(8).align_y(iced::Alignment::Center)
         };
 
-        // Don't let users enable a service mid-install (it'd point at a half-installed Sapphire).
-        let can_enable = self.systemd_available && installed && !self.installing && !self.scanning;
+        // Not mid-install (it'd point at a half-installed Sapphire), and not while she
+        // is running: `enable --now` would start a twin under the one we follow, wipe
+        // her log and leave the first one orphaned when the window closes.
+        let running = self.sapphire_running || self.sapphire_stopping;
+        let can_enable = self.systemd_available && installed && !self.installing && !self.scanning && !running;
         let enable_btn = button(text("Enable Sapphire service").font(bold))
             .on_press_maybe(if can_enable { Some(Message::ServiceInstall) } else { None })
             .style(button::success);
 
         let will_run = if self.installing {
             "Finishing install — the button unlocks when it's done.".to_string()
+        } else if running {
+            "Stop Sapphire first — the service takes over running her.".to_string()
         } else {
             match &env_py {
                 Some(p) => format!("Will run:  {} main.py", p),

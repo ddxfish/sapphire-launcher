@@ -8,32 +8,66 @@ use std::process::Command;
 // (run_cmd_* exec helpers and find_git / find_conda / find_conda_pip live at the
 // bottom, also #[cfg]-split.)
 
+/// Where a conda install might live, most likely first. Everything that looks for
+/// conda itself or for a file inside the sapphire env goes through this one list —
+/// a new location (miniforge, a machine-wide ProgramData install) is added here once.
+fn conda_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    #[cfg(windows)]
+    {
+        let bases = [
+            std::env::var("USERPROFILE").unwrap_or_default(),
+            std::env::var("LOCALAPPDATA").unwrap_or_default(),
+            std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".into()),
+        ];
+        for base in bases.iter().filter(|b| !b.is_empty()) {
+            for name in ["miniconda3", "Miniconda3", "anaconda3", "Anaconda3", "miniforge3", "Miniforge3", "mambaforge"] {
+                roots.push(PathBuf::from(base).join(name));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let home = std::env::var("HOME").unwrap_or_default();
+        for name in ["miniconda3", "anaconda3", "miniforge3", "mambaforge"] {
+            roots.push(PathBuf::from(&home).join(name));
+        }
+        for p in ["/opt/miniconda3", "/opt/anaconda3", "/opt/conda", "/opt/miniforge3", "/usr/local/miniconda3"] {
+            roots.push(PathBuf::from(p));
+        }
+    }
+    roots
+}
+
+/// A file inside the sapphire env (`<root>/envs/sapphire/<rel>`), from the first conda
+/// root that has it. None = no env anywhere we know of.
+fn sapphire_env_file(rel: &str) -> Option<String> {
+    conda_roots()
+        .into_iter()
+        .map(|r| r.join("envs").join("sapphire").join(rel))
+        .find(|p| p.exists())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Absolute path to the sapphire env's python (for a systemd ExecStart). None if
 /// the env isn't there. Linux only (the service tab is Linux for now).
 #[cfg(not(windows))]
 pub(crate) fn sapphire_env_python() -> Option<String> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    [
-        format!("{}/miniconda3/envs/sapphire/bin/python", home),
-        format!("{}/anaconda3/envs/sapphire/bin/python", home),
-    ]
-    .into_iter()
-    .find(|p| PathBuf::from(p).exists())
+    sapphire_env_file("bin/python")
 }
 
 /// Windows: the env's windowless interpreter (pythonw.exe) for the autostart wrapper —
 /// no console flashes at logon. None if the env isn't there.
 #[cfg(windows)]
 pub(crate) fn sapphire_pythonw() -> Option<String> {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    [
-        format!("{}\\miniconda3\\envs\\sapphire\\pythonw.exe", home),
-        format!("{}\\Miniconda3\\envs\\sapphire\\pythonw.exe", home),
-        format!("{}\\anaconda3\\envs\\sapphire\\pythonw.exe", home),
-        format!("{}\\Anaconda3\\envs\\sapphire\\pythonw.exe", home),
-    ]
-    .into_iter()
-    .find(|p| PathBuf::from(p).exists())
+    sapphire_env_file("pythonw.exe")
+}
+
+/// `conda run` prefix for the sapphire env, when the env's own binaries can't be
+/// found. `--no-capture-output`: conda run otherwise swallows the child's output
+/// until it exits — no live log, no streamed pip.
+fn conda_run(tool: &str) -> (String, Vec<String>) {
+    (find_conda(), vec!["run".into(), "--no-capture-output".into(), "-n".into(), "sapphire".into(), tool.into()])
 }
 
 /// Windows: our no-admin "autostart is on" marker. Written when the logon task is
@@ -106,31 +140,10 @@ pub(crate) fn default_install_path() -> String {
 /// Resolve how to run Sapphire's Python: the env's interpreter directly if we can
 /// find it, else fall back to `conda run`. Returns (program, args-before-script).
 pub(crate) fn sapphire_python_cmd() -> (String, Vec<String>) {
-    #[cfg(windows)]
-    {
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        let cands = [
-            format!("{}\\miniconda3\\envs\\sapphire\\python.exe", home),
-            format!("{}\\Miniconda3\\envs\\sapphire\\python.exe", home),
-            format!("{}\\anaconda3\\envs\\sapphire\\python.exe", home),
-            format!("{}\\Anaconda3\\envs\\sapphire\\python.exe", home),
-        ];
-        for p in &cands {
-            if PathBuf::from(p).exists() { return (p.clone(), vec![]); }
-        }
-        ("conda".to_string(), vec!["run".into(), "-n".into(), "sapphire".into(), "python".into()])
-    }
-    #[cfg(not(windows))]
-    {
-        let home = std::env::var("HOME").unwrap_or_default();
-        let cands = [
-            format!("{}/miniconda3/envs/sapphire/bin/python", home),
-            format!("{}/anaconda3/envs/sapphire/bin/python", home),
-        ];
-        for p in &cands {
-            if PathBuf::from(p).exists() { return (p.clone(), vec![]); }
-        }
-        ("conda".to_string(), vec!["run".into(), "-n".into(), "sapphire".into(), "python".into()])
+    let rel = if cfg!(windows) { "python.exe" } else { "bin/python" };
+    match sapphire_env_file(rel) {
+        Some(p) => (p, vec![]),
+        None => conda_run("python"),
     }
 }
 
@@ -222,9 +235,10 @@ pub(crate) fn signal_stop(pid: u32) -> bool {
 
 /// Hard stop — the fallback when `signal_stop` can't be sent or Sapphire ignores it,
 /// and the only option for an instance we didn't spawn (pid 0: sweep only).
-/// Windows: taskkill the tree + sweep env pythons. Linux: SIGTERM the process group
-/// (we spawn Sapphire in its own group) + sweep. The sweep hits EVERY sapphire-env
-/// python (a user's own script too), which is why it is not the first move.
+/// Windows: taskkill the tree + sweep env pythons. Linux: SIGKILL the process group
+/// (we spawn Sapphire in its own group; SIGTERM already went unanswered) + a SIGTERM
+/// sweep. The sweep hits EVERY sapphire-env python (a user's own script too), which
+/// is why it is not the first move.
 pub(crate) fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
@@ -245,8 +259,8 @@ pub(crate) fn kill_process_tree(pid: u32) {
     {
         if pid > 0 {
             // Whole process group (Sapphire is spawned into its own group at launch),
-            // reaping child STT/TTS workers too. Direct syscall — see signal_group.
-            signal_group(pid, libc::SIGTERM);
+            // child STT/TTS workers too. Direct syscall — see signal_group.
+            signal_group(pid, libc::SIGKILL);
         }
         // Sweep any stray python running the sapphire env (e.g. started outside us).
         let _ = hidden_cmd("pkill").args(["-TERM", "-f", "envs/sapphire/bin/python"]).output();
@@ -306,11 +320,13 @@ pub(crate) async fn run_cmd_async(program: String, args: Vec<String>) -> Result<
 
 
 
-/// Run a command on a background thread, returning combined stdout+stderr for logging
+/// Run a command on a background thread, returning combined stdout+stderr for logging.
+/// Conda's terms-of-service gate (2025-07) would otherwise stall `conda create` on a
+/// pre-existing conda with no terminal to say yes in; the variable is harmless elsewhere.
 pub(crate) async fn run_cmd_full_async(program: String, args: Vec<String>) -> Result<String, String> {
     let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new(&program);
-        cmd.args(&args);
+        cmd.args(&args).env("CONDA_PLUGINS_AUTO_ACCEPT_TOS", "yes");
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
@@ -382,80 +398,33 @@ pub(crate) fn find_git() -> String {
     "git".into() // final fallback
 }
 
-/// Find conda executable on disk
-#[cfg(windows)]
+/// The conda executable: a known install root first, then PATH (`where`/`which`),
+/// else the bare name and hope.
 pub(crate) fn find_conda() -> String {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    let conda_paths = [
-        format!("{}\\miniconda3\\Scripts\\conda.exe", home),
-        format!("{}\\Miniconda3\\Scripts\\conda.exe", home),
-        format!("{}\\anaconda3\\Scripts\\conda.exe", home),
-        format!("{}\\Anaconda3\\Scripts\\conda.exe", home),
-    ];
-    for p in &conda_paths {
-        if PathBuf::from(p).exists() {
-            return p.clone();
-        }
+    let rel = if cfg!(windows) { "Scripts\\conda.exe" } else { "bin/conda" };
+    if let Some(p) = conda_roots().into_iter().map(|r| r.join(rel)).find(|p| p.exists()) {
+        return p.to_string_lossy().into_owned();
     }
-    "conda".into() // fallback to PATH
-}
-
-/// Find conda executable on disk (Linux locations, then PATH).
-#[cfg(not(windows))]
-pub(crate) fn find_conda() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let conda_paths = [
-        format!("{}/miniconda3/bin/conda", home),
-        format!("{}/anaconda3/bin/conda", home),
-        "/opt/miniconda3/bin/conda".to_string(),
-        "/opt/anaconda3/bin/conda".to_string(),
-    ];
-    for p in &conda_paths {
-        if PathBuf::from(p).exists() {
-            return p.clone();
-        }
-    }
-    if let Ok(out) = std::process::Command::new("which").arg("conda").output()
+    #[cfg(windows)]
+    let probe = hidden_cmd("cmd").args(["/c", "where", "conda"]).output();
+    #[cfg(not(windows))]
+    let probe = hidden_cmd("which").arg("conda").output();
+    if let Ok(out) = probe
         && out.status.success()
     {
-        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let p = String::from_utf8_lossy(&out.stdout).lines().next().unwrap_or("").trim().to_string();
         if !p.is_empty() && PathBuf::from(&p).exists() {
             return p;
         }
     }
-    "conda".into() // fallback to PATH
+    "conda".into()
 }
 
-#[cfg(windows)]
+/// pip for the sapphire env: the env's own pip directly, else `conda run`.
 pub(crate) fn find_conda_pip() -> (String, Vec<String>) {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    let pip_paths = [
-        format!("{}\\miniconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
-        format!("{}\\Miniconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
-        format!("{}\\anaconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
-    ];
-    for p in &pip_paths {
-        if PathBuf::from(p).exists() {
-            return (p.clone(), vec![]);
-        }
+    let rel = if cfg!(windows) { "Scripts\\pip.exe" } else { "bin/pip" };
+    match sapphire_env_file(rel) {
+        Some(p) => (p, vec![]),
+        None => conda_run("pip"),
     }
-    // Fallback to conda run
-    (find_conda(), vec!["run".into(), "-n".into(), "sapphire".into(), "pip".into()])
-}
-
-/// Find pip in the conda sapphire env directly (Linux), else `conda run`.
-#[cfg(not(windows))]
-pub(crate) fn find_conda_pip() -> (String, Vec<String>) {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let pip_paths = [
-        format!("{}/miniconda3/envs/sapphire/bin/pip", home),
-        format!("{}/anaconda3/envs/sapphire/bin/pip", home),
-    ];
-    for p in &pip_paths {
-        if PathBuf::from(p).exists() {
-            return (p.clone(), vec![]);
-        }
-    }
-    // Fallback to conda run
-    (find_conda(), vec!["run".into(), "-n".into(), "sapphire".into(), "pip".into()])
 }

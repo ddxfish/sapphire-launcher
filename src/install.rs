@@ -94,9 +94,12 @@ pub(crate) async fn check_git() -> (Step, StepStatus) {
 #[cfg(not(windows))]
 pub(crate) async fn check_git() -> (Step, StepStatus) {
     let git_ok = run_cmd_async(find_git(), vec!["--version".into()]).await.is_ok();
+    // ldconfig lives in /sbin, which a Debian user's PATH lacks — try it by full path,
+    // then look for the library file itself.
     let audio_ok = run_cmd_async(
         "sh".into(),
-        vec!["-c".into(), "ldconfig -p 2>/dev/null | grep -qi portaudio".into()],
+        vec!["-c".into(), "{ /sbin/ldconfig -p 2>/dev/null || ldconfig -p 2>/dev/null; } | grep -qi portaudio \
+             || ls /usr/lib/*/libportaudio.so.2 /usr/lib64/libportaudio.so.2 /usr/lib/libportaudio.so.2 >/dev/null 2>&1".into()],
     ).await.is_ok();
     // curl is used by the launcher's health/troubleshoot checks (not preinstalled on a fresh box).
     let curl_ok = run_cmd_async(
@@ -121,42 +124,13 @@ pub(crate) async fn check_git() -> (Step, StepStatus) {
 }
 
 pub(crate) async fn check_conda() -> (Step, StepStatus) {
-    match run_cmd_async(find_conda(), vec!["--version".into()]).await {
+    let conda = find_conda();
+    match run_cmd_async(conda.clone(), vec!["--version".into()]).await {
         Ok(ver) => (Step::Conda, StepStatus::Found(ver)),
-        Err(_) => {
-            #[cfg(windows)]
-            let paths = {
-                let home = std::env::var("USERPROFILE").unwrap_or_default();
-                [
-                    format!("{}\\miniconda3\\Scripts\\conda.exe", home),
-                    format!("{}\\anaconda3\\Scripts\\conda.exe", home),
-                    format!("{}\\Miniconda3\\Scripts\\conda.exe", home),
-                    format!("{}\\Anaconda3\\Scripts\\conda.exe", home),
-                ]
-            };
-            #[cfg(not(windows))]
-            let paths = {
-                let home = std::env::var("HOME").unwrap_or_default();
-                [
-                    format!("{}/miniconda3/bin/conda", home),
-                    format!("{}/anaconda3/bin/conda", home),
-                    "/opt/miniconda3/bin/conda".to_string(),
-                    "/opt/anaconda3/bin/conda".to_string(),
-                ]
-            };
-            for p in &paths {
-                if PathBuf::from(p).exists() {
-                    return (
-                        Step::Conda,
-                        StepStatus::Found(format!("Found at {}", p)),
-                    );
-                }
-            }
-            (
-                Step::Conda,
-                StepStatus::NotFound("Miniconda not found — we'll install it".to_string()),
-            )
-        }
+        // The binary is there but won't answer (a half-finished install, a broken base
+        // env): still "found" — Go's installer would only say "already installed".
+        Err(_) if conda != "conda" => (Step::Conda, StepStatus::Found(format!("Found at {}", conda))),
+        Err(_) => (Step::Conda, StepStatus::NotFound("Miniconda not found — we'll install it".to_string())),
     }
 }
 
@@ -249,16 +223,9 @@ pub(crate) async fn pip_run(args: Vec<String>) -> Result<String, String> {
     run_cmd_full_async(program, base).await
 }
 
-/// `pip install <args…>`: `-r <file>` or bare specifiers. pip skips what is already
-/// satisfied, so callers need not pre-filter.
-pub(crate) async fn pip_install(args: Vec<String>) -> Result<String, String> {
-    let mut a = vec!["install".to_string()];
-    a.extend(args);
-    pip_run(a).await
-}
-
-/// Same, streaming output live into `sink` (the install tab's multi-GB torch download
-/// must show progress instead of looking frozen).
+/// `pip install <args…>`: `-r <file>` or bare specifiers, output streamed live into
+/// `sink` (a multi-GB torch download must show progress, not a frozen spinner). pip
+/// skips what is already satisfied, so callers need not pre-filter.
 pub(crate) async fn pip_install_streamed(args: Vec<String>, sink: Arc<std::sync::Mutex<Vec<String>>>) -> Result<String, String> {
     let (program, mut base) = find_conda_pip();
     base.push("install".into());
@@ -570,6 +537,13 @@ pub(crate) async fn install_deps(install_path: String, sink: Arc<std::sync::Mute
 
 // ── Async uninstall logic ───────────────────────────────────────────────────
 
+/// Does this folder hold a Sapphire checkout (main.py + .git)? The delete actions
+/// refuse anything else, so a mistyped path can't take Documents with it.
+pub(crate) fn looks_like_install(path: &str) -> bool {
+    let p = PathBuf::from(path);
+    p.join("main.py").is_file() && p.join(".git").exists()
+}
+
 pub(crate) async fn uninstall_conda_env() -> (String, bool) {
     match run_cmd_full_async(find_conda(), vec!["remove".into(), "-n".into(), "sapphire".into(), "--all".into(), "-y".into()]).await {
         Ok(out) => (format!("Removed conda environment 'sapphire'.\n{}", out), true),
@@ -590,6 +564,9 @@ pub(crate) async fn uninstall_delete_folder(install_path: String) -> (String, bo
         if !p.exists() {
             return (format!("Folder {} doesn't exist — nothing to delete.", path), true);
         }
+        if !looks_like_install(&path) {
+            return (format!("{} doesn't look like a Sapphire install (no main.py and .git) — not deleting it.", path), false);
+        }
         match std::fs::remove_dir_all(&p) {
             Ok(()) => (format!("Deleted {}", path), true),
             Err(e) => (format!("Couldn't delete {}: {}", path, e), false),
@@ -605,6 +582,9 @@ pub(crate) async fn uninstall_delete_userdata(install_path: String) -> (String, 
         let user_dir = PathBuf::from(&path).join("user");
         if !user_dir.exists() {
             return (format!("No user folder found at {}\\user — nothing to delete.", path), true);
+        }
+        if !looks_like_install(&path) {
+            return (format!("{} doesn't look like a Sapphire install (no main.py and .git) — not touching its user folder.", path), false);
         }
         match std::fs::remove_dir_all(&user_dir) {
             Ok(()) => (format!("Deleted {}\\user — your settings and data are gone.", path), true),
@@ -627,10 +607,16 @@ pub(crate) async fn check_for_updates(install_path: String, branch: Branch) -> O
         Branch::Stable => "main",
     };
 
-    // Fetch latest from remote
-    let _ = run_cmd_full_async(find_git(), vec![
-        "-C".into(), install_path.clone(), "fetch".into(), "origin".into(),
-    ]).await;
+    // Fetch latest from remote. Offline (or a dead network) must read as "couldn't
+    // check", never as "up to date" against a stale origin/ — and a hung fetch must
+    // not leave the tab on "Checking..." forever.
+    let fetch = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        run_cmd_full_async(find_git(), vec!["-C".into(), install_path.clone(), "fetch".into(), "origin".into()]),
+    ).await;
+    if !matches!(fetch, Ok(Ok(_))) {
+        return None;
+    }
 
     // Count commits behind
     match run_cmd_full_async(find_git(), vec![
@@ -690,11 +676,13 @@ pub(crate) fn newer_release(json: &str, local: &str) -> Option<LauncherRelease> 
         .filter_map(|r| {
             let tag = r.get("tag_name")?.as_str()?;
             let url = r.get("html_url")?.as_str()?.to_string();
-            Some((parse_version(tag)?, LauncherRelease { version: tag.trim_start_matches(['v', 'V']).to_string(), url }))
+            let rel = LauncherRelease { version: tag.trim_start_matches(['v', 'V']).to_string(), url };
+            Some((parse_version(tag)?, !flag(r, "prerelease"), rel))
         })
-        .filter(|(v, _)| *v > local_v)
-        .max_by_key(|(v, _)| *v)
-        .map(|(_, rel)| rel)
+        .filter(|(v, _, _)| *v > local_v)
+        // Same version as beta and final: the final wins the tie.
+        .max_by_key(|(v, is_final, _)| (*v, *is_final))
+        .map(|(_, _, rel)| rel)
 }
 
 /// One small GitHub API call (at startup and on the Update tab's check): is there a
@@ -827,6 +815,11 @@ mod tests {
         let got = newer_release(listing, "0.9.6").expect("something newer than 0.9.6");
         assert_eq!(got, LauncherRelease { version: "0.9.8-beta".into(), url: "https://x/beta".into() });
         assert_eq!(newer_release(listing, "0.9.8"), None, "equal is not newer");
+        let tie = r#"[
+            {"tag_name":"v0.9.9-beta","draft":false,"prerelease":true,"html_url":"https://x/beta9"},
+            {"tag_name":"v0.9.9","draft":false,"prerelease":false,"html_url":"https://x/final9"}
+        ]"#;
+        assert_eq!(newer_release(tie, "0.9.6").unwrap().url, "https://x/final9", "final beats beta at the same version");
         assert_eq!(newer_release(listing, "1.0.0"), None, "drafts never count");
         assert_eq!(newer_release("not json", "0.9.6"), None);
         assert_eq!(newer_release(r#"{"message":"API rate limit exceeded"}"#, "0.9.6"), None);
@@ -840,6 +833,29 @@ mod tests {
         let check = check_launcher_release().await;
         assert_ne!(check, LauncherCheck::Failed, "GitHub listing unreadable or offline");
         assert_ne!(check, LauncherCheck::Pending);
+    }
+
+    #[tokio::test]
+    async fn delete_actions_refuse_a_folder_that_is_not_an_install() {
+        let d = std::env::temp_dir().join(format!("sapphire-launcher-test-{}-notinstall", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("user")).unwrap();
+        std::fs::write(d.join("user").join("precious.txt"), "docs").unwrap();
+        let path = d.to_string_lossy().into_owned();
+        assert!(!looks_like_install(&path));
+        let (msg, ok) = uninstall_delete_folder(path.clone()).await;
+        assert!(!ok && msg.contains("doesn't look like a Sapphire install"), "{}", msg);
+        let (msg, ok) = uninstall_delete_userdata(path.clone()).await;
+        assert!(!ok && msg.contains("doesn't look like a Sapphire install"), "{}", msg);
+        assert!(d.join("user").join("precious.txt").exists(), "nothing was deleted");
+        // A real-looking install is deleted.
+        std::fs::write(d.join("main.py"), "").unwrap();
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        assert!(looks_like_install(&path));
+        let (_, ok) = uninstall_delete_userdata(path.clone()).await;
+        assert!(ok && !d.join("user").exists());
+        let (_, ok) = uninstall_delete_folder(path).await;
+        assert!(ok && !d.exists());
     }
 
     #[tokio::test]

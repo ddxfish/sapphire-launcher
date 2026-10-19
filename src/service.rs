@@ -14,6 +14,7 @@ pub(crate) struct ServiceInfo {
     pub(crate) enabled: bool,           // UnitFileState == "enabled" (autostart at sign-in)
     pub(crate) sub_state: String,
     pub(crate) working_dir: Option<String>,
+    pub(crate) env_file: Option<String>,    // first EnvironmentFile= (what the env editor edits)
 }
 
 /// Detect a systemd --user `sapphire.service`. Returns None if no such unit
@@ -25,18 +26,19 @@ pub(crate) fn detect_sapphire_service() -> Option<ServiceInfo> {
         .args([
             "--user", "show", "sapphire",
             "-p", "LoadState", "-p", "ActiveState", "-p", "SubState",
-            "-p", "UnitFileState", "-p", "WorkingDirectory",
+            "-p", "UnitFileState", "-p", "WorkingDirectory", "-p", "EnvironmentFiles",
         ])
         .output()
         .ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    let (mut load, mut active, mut sub, mut ufs, mut wd) = ("", "", "", "", "");
+    let (mut load, mut active, mut sub, mut ufs, mut wd, mut envf) = ("", "", "", "", "", "");
     for line in text.lines() {
         if let Some(v) = line.strip_prefix("LoadState=") { load = v; }
         else if let Some(v) = line.strip_prefix("ActiveState=") { active = v; }
         else if let Some(v) = line.strip_prefix("SubState=") { sub = v; }
         else if let Some(v) = line.strip_prefix("UnitFileState=") { ufs = v; }
         else if let Some(v) = line.strip_prefix("WorkingDirectory=") { wd = v; }
+        else if let Some(v) = line.strip_prefix("EnvironmentFiles=") && envf.is_empty() { envf = v; }
     }
     if load != "loaded" {
         return None; // unit doesn't exist
@@ -47,7 +49,16 @@ pub(crate) fn detect_sapphire_service() -> Option<ServiceInfo> {
         enabled: ufs == "enabled",
         sub_state: sub.to_string(),
         working_dir: if wd.is_empty() { None } else { Some(wd.to_string()) },
+        env_file: env_file_from_show(envf),
     })
+}
+
+/// `EnvironmentFiles=/home/k/.config/sapphire/env (ignore_errors=no)` → the path.
+/// A hand-written unit names whatever file it likes; the editor must edit THAT one.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn env_file_from_show(value: &str) -> Option<String> {
+    let path = value.split(" (ignore_errors=").next().unwrap_or(value).trim().trim_start_matches('-');
+    (!path.is_empty()).then(|| path.to_string())
 }
 
 // Windows: stays None until the control seam (ServiceStart/Stop/Restart) and the
@@ -150,24 +161,7 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
         && let Err(e) = tokio::fs::create_dir_all(parent).await {
             return (format!("Couldn't create the autostart folder: {}", e), false);
         }
-    // Poor-man's log rotation: truncate the logfile on each Enable so it can't grow
-    // unboundedly across re-enables. The shim still opens it in append mode, so logs
-    // accumulate within a single logon session (across main.py's crash-restarts).
-    let _ = tokio::fs::write(&log, "").await;
-    // Python string literal: escape backslashes then double-quotes (handles spaces and
-    // any path safely — avoids raw-string's can't-end-in-backslash gotcha).
-    let py_lit = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    let shim_src = format!(
-        "import runpy, sys, os\r\n\
-         os.chdir(\"{cwd}\")\r\n\
-         _log = \"{log}\"\r\n\
-         os.makedirs(os.path.dirname(_log), exist_ok=True)\r\n\
-         sys.stdout = sys.stderr = open(_log, \"a\", buffering=1, encoding=\"utf-8\", errors=\"replace\")\r\n\
-         runpy.run_path(\"main.py\", run_name=\"__main__\")\r\n",
-        cwd = py_lit(&install_path),
-        log = py_lit(&log.to_string_lossy()),
-    );
-    if let Err(e) = tokio::fs::write(&shim, shim_src).await {
+    if let Err(e) = tokio::fs::write(&shim, shim_source(&install_path, &log.to_string_lossy())).await {
         return (format!("Couldn't write the autostart launcher: {}", e), false);
     }
 
@@ -176,23 +170,34 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
     // Registration script — normal PS single-quoted strings we control (dodges the
     // nested-ArgumentList quoting hell of passing this inline to an elevated shell).
     // The action runs pythonw on the shim; the shim path is wrapped in literal double
-    // quotes inside the argument so a path with spaces stays a single argument.
+    // quotes inside the argument so a path with spaces stays a single argument. The
+    // elevated window is hidden and its stderr can't be captured across the UAC
+    // boundary, so the script writes its own error to a file we read back.
+    let err_file = std::env::temp_dir().join("sapphire-enable.err");
+    let _ = tokio::fs::remove_file(&err_file).await;
     let script = format!(
         "$ErrorActionPreference='Stop'\r\n\
+         try {{\r\n\
          $a = New-ScheduledTaskAction -Execute '{pyw}' -Argument '\"{shim}\"' -WorkingDirectory '{cwd}'\r\n\
          $t = New-ScheduledTaskTrigger -AtLogOn -User '{user}'\r\n\
          $p = New-ScheduledTaskPrincipal -UserId '{user}' -LogonType Interactive\r\n\
          $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable\r\n\
-         Register-ScheduledTask -TaskName Sapphire -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null\r\n",
+         Register-ScheduledTask -TaskName Sapphire -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null\r\n\
+         }} catch {{ $_ | Out-String | Set-Content -Path '{err}' -Encoding UTF8; exit 1 }}\r\n",
         pyw = esc(&pyw), shim = esc(&shim.to_string_lossy()), cwd = esc(&install_path), user = esc(&user),
+        err = esc(&err_file.to_string_lossy()),
     );
     let ps1 = std::env::temp_dir().join("sapphire-enable.ps1");
-    if let Err(e) = tokio::fs::write(&ps1, script).await {
+    // With a BOM: Windows PowerShell reads a BOM-less .ps1 as ANSI and mangles a
+    // non-ASCII user name or path into a task that can never run.
+    if let Err(e) = tokio::fs::write(&ps1, format!("\u{feff}{}", script)).await {
         return (format!("Couldn't write the setup script: {}", e), false);
     }
-    // Elevate (UAC) and run the .ps1.
+    // Elevate (UAC) and run the .ps1. Start-Process joins -ArgumentList with spaces
+    // and no quoting, so the path carries its own double quotes (a user named
+    // "Krem Bander" has a space in %TEMP%).
     let outer = format!(
-        "$ErrorActionPreference='Stop'; try {{ $p = Start-Process powershell -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'; exit $p.ExitCode }} catch {{ exit 1223 }}",
+        "$ErrorActionPreference='Stop'; try {{ $p = Start-Process powershell -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{}\"'; exit $p.ExitCode }} catch {{ exit 1223 }}",
         ps1.display().to_string().replace('\'', "''"),
     );
     match run_cmd_full_async("powershell".into(), vec!["-NoProfile".into(), "-Command".into(), outer]).await {
@@ -203,7 +208,15 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
             let _ = tokio::fs::write(marker, "on").await;
             ("Autostart enabled — Sapphire will start when you sign in.".to_string(), true)
         }
-        Err(_) => ("Couldn't enable autostart — the admin prompt may have been declined. Try again and choose Yes.".to_string(), false),
+        Err(_) => {
+            let detail = tokio::fs::read_to_string(&err_file).await.ok()
+                .map(|t| strip_bom(&t).trim().lines().next().unwrap_or("").to_string())
+                .filter(|t| !t.is_empty());
+            match detail {
+                Some(d) => (format!("Couldn't enable autostart: {}", d), false),
+                None => ("Couldn't enable autostart — the admin prompt may have been declined. Try again and choose Yes.".to_string(), false),
+            }
+        }
     }
 }
 
@@ -243,22 +256,278 @@ pub(crate) async fn remove_service() -> (String, bool) {
     }
 }
 
-/// Read the service EnvironmentFile (KEY=VALUE per line). Empty if absent.
-#[cfg(not(windows))]
-pub(crate) async fn read_env_file() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    tokio::fs::read_to_string(format!("{}/.config/sapphire/service.env", home)).await.unwrap_or_default()
-}
-#[cfg(windows)]
-pub(crate) async fn read_env_file() -> String { String::new() }
+// ── Windows autostart shim ─────────────────────────────────────────────────
+// Platform-neutral string code (so the tests run everywhere); only the file I/O
+// around it is Windows-only.
 
-/// Write the service EnvironmentFile (chmod 600 — it can hold API keys).
+/// Bumped whenever the shim's shape changes; the header carries it so a launcher
+/// can tell a stale shim from a current one and regenerate it.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows shim repair calls these
+pub(crate) const SHIM_VERSION: u32 = 2;
+
+/// The autostart shim the logon task runs under pythonw. Why each line is there:
+/// the log first (pythonw has no console — without real handles Sapphire's first
+/// print crashes; and if the chdir below fails, the error has somewhere to go),
+/// "w" so each sign-in starts a fresh log (main.py's own restarts within one session
+/// still accumulate), then the install dir on sys.path: core's runner does
+/// `from core.single_instance import …` unconditionally (2026-10-16), and runpy does
+/// NOT put a script's folder on the path — without this line autostart dies at
+/// import. Absolute main.py path so `__file__` (the lock's anchor) is absolute too.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows shim repair calls these
+pub(crate) fn shim_source(cwd: &str, log: &str) -> String {
+    // Python string literal: escape backslashes then double-quotes (handles spaces
+    // and any path safely — avoids raw-string's can't-end-in-backslash gotcha).
+    let py_lit = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!(
+        "# sapphire-launcher autostart shim v{v} (regenerated by the launcher; edits are overwritten)\r\n\
+         import runpy, sys, os\r\n\
+         _cwd = \"{cwd}\"\r\n\
+         _log = \"{log}\"\r\n\
+         os.makedirs(os.path.dirname(_log), exist_ok=True)\r\n\
+         sys.stdout = sys.stderr = open(_log, \"w\", buffering=1, encoding=\"utf-8\", errors=\"replace\")\r\n\
+         os.chdir(_cwd)\r\n\
+         sys.path.insert(0, _cwd)\r\n\
+         runpy.run_path(os.path.join(_cwd, \"main.py\"), run_name=\"__main__\")\r\n",
+        v = SHIM_VERSION, cwd = py_lit(cwd), log = py_lit(log),
+    )
+}
+
+/// Is this shim text the current shape? (Header line carries the version.)
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows shim repair calls these
+pub(crate) fn shim_is_current(src: &str) -> bool {
+    src.lines().next()
+        .and_then(|l| l.trim().strip_prefix("# sapphire-launcher autostart shim v"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse::<u32>().ok())
+        .is_some_and(|v| v >= SHIM_VERSION)
+}
+
+/// The install folder a shim (any version) points at: `_cwd = "…"` now,
+/// `os.chdir("…")` in v1. Python-literal escapes undone.
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows shim repair calls these
+pub(crate) fn shim_cwd(src: &str) -> Option<String> {
+    let lit = src.lines().find_map(|l| {
+        let l = l.trim();
+        l.strip_prefix("_cwd = \"").or_else(|| l.strip_prefix("os.chdir(\""))
+    })?;
+    let mut out = String::new();
+    let mut chars = lit.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => out.push(chars.next()?),
+            '"' => return Some(out),
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+/// Startup check (Windows): if autostart is on but its shim predates the current
+/// shape, rewrite it in place — same folder, same log, no admin needed (the logon
+/// task points at the shim's path, which doesn't change). Returns a line for the
+/// launcher log when something was done or is wrong; None when all is well.
+#[cfg(windows)]
+pub(crate) fn repair_autostart_shim(install_path: &str) -> Option<String> {
+    if !autostart_marker_path().exists() {
+        return None;
+    }
+    let shim = autostart_shim_path();
+    let Ok(old) = std::fs::read_to_string(&shim) else {
+        return Some("Autostart is turned on, but its launcher file is missing — turn autostart off and on again in the Autostart tab.".to_string());
+    };
+    if shim_is_current(&old) {
+        return None;
+    }
+    let has_main = |d: &str| PathBuf::from(d).join("main.py").is_file();
+    let cwd = shim_cwd(&old).filter(|d| has_main(d))
+        .or_else(|| has_main(install_path).then(|| install_path.to_string()));
+    let Some(cwd) = cwd else {
+        return Some("Autostart is turned on, but points at a folder with no Sapphire in it — turn it off and on again once the path is right.".to_string());
+    };
+    match std::fs::write(&shim, shim_source(&cwd, &autostart_log_path().to_string_lossy())) {
+        Ok(()) => Some("Updated the autostart launcher: Sapphire changed how it starts (2026-10-16) and the old one couldn't start her. Takes effect at your next sign-in — hit Launch to start her now.".to_string()),
+        Err(e) => Some(format!("Autostart needs an update but the launcher file couldn't be written: {}", e)),
+    }
+}
+
+// ── Linux unit health ──────────────────────────────────────────────────────
+// A unit from before the stop contract (or a hand-written one) keeps working, but
+// restarts a twin/config-error exit forever and gets SIGKILLed at 90 s on a slow
+// stop. We read the EFFECTIVE properties from systemctl (drop-ins included) and
+// offer to add what's missing to the unit file itself.
+
+/// The unit properties that matter for health, as `systemctl show` reports them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code))] // only the Linux unit check calls these
+pub(crate) struct UnitProps {
+    pub(crate) restart: String,
+    pub(crate) prevent_exit: Vec<String>,
+    pub(crate) timeout_stop_secs: Option<u64>,
+    pub(crate) exec_path: Option<String>,
+    pub(crate) working_dir: Option<String>,
+    pub(crate) fragment: Option<String>,
+}
+
+/// Parse `systemctl show` output (one `Key=value` per line). `ExecStart` comes as
+/// `{ path=/x/python ; argv[]=… }`; USec properties come human-readable ("2min").
+#[cfg_attr(windows, allow(dead_code))] // only the Linux unit check calls these
+pub(crate) fn parse_unit_props(show: &str) -> UnitProps {
+    let mut p = UnitProps::default();
+    let some = |v: &str| if v.is_empty() { None } else { Some(v.to_string()) };
+    for line in show.lines() {
+        let Some((k, v)) = line.split_once('=') else { continue };
+        match k {
+            "Restart" => p.restart = v.to_string(),
+            "RestartPreventExitStatus" => p.prevent_exit = v.split_whitespace().map(str::to_string).collect(),
+            "TimeoutStopUSec" => p.timeout_stop_secs = parse_systemd_duration(v),
+            "WorkingDirectory" => p.working_dir = some(v.trim_start_matches('!')),
+            "FragmentPath" => p.fragment = some(v),
+            "ExecStart" => {
+                p.exec_path = v.split_once("path=")
+                    .map(|(_, rest)| rest.split(" ;").next().unwrap_or(rest).trim())
+                    .and_then(some);
+            }
+            _ => {}
+        }
+    }
+    p
+}
+
+/// systemd's human durations ("2min", "1min 30s", "90s", "infinity") → seconds.
+#[cfg_attr(windows, allow(dead_code))] // only the Linux unit check calls these
+pub(crate) fn parse_systemd_duration(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s == "infinity" { return Some(u64::MAX); }
+    if s.is_empty() { return None; }
+    let mut total = 0u64;
+    for tok in s.split_whitespace() {
+        let split = tok.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+        let (num, unit) = tok.split_at(split);
+        let n: f64 = num.parse().ok()?;
+        let mult = match unit {
+            "us" | "µs" => 0.000_001, "ms" => 0.001, "s" | "sec" => 1.0,
+            "min" | "m" => 60.0, "h" => 3600.0, "d" => 86400.0, "w" => 604800.0,
+            _ => return None,
+        };
+        total += (n * mult) as u64;
+    }
+    Some(total)
+}
+
+/// What is wrong with the unit, split by remedy.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code))] // only the Linux unit check calls these
+pub(crate) struct UnitIssues {
+    pub(crate) missing: Vec<&'static str>, // lines to add to [Service] (we can do it)
+    pub(crate) broken: Vec<String>,        // only removing + re-creating the service fixes these
+    pub(crate) fragment: Option<String>,   // the unit file we would patch
+}
+
+#[cfg_attr(windows, allow(dead_code))] // only the Linux unit check calls these
+impl UnitIssues {
+    pub(crate) fn is_empty(&self) -> bool { self.missing.is_empty() && self.broken.is_empty() }
+}
+
+/// Judge the unit. `python_ok` / `main_py_ok` are the filesystem answers for the
+/// ExecStart interpreter and `<WorkingDirectory>/main.py`.
+#[cfg_attr(windows, allow(dead_code))] // only the Linux unit check calls these
+pub(crate) fn unit_issues(p: &UnitProps, python_ok: bool, main_py_ok: bool) -> UnitIssues {
+    let mut out = UnitIssues { fragment: p.fragment.clone(), ..Default::default() };
+    let has = |code: &str| p.prevent_exit.iter().any(|c| c == code);
+    if p.restart != "no" && !(has("43") && has("44")) {
+        out.missing.push("RestartPreventExitStatus=43 44");
+    }
+    if p.timeout_stop_secs.is_some_and(|t| t < 120) {
+        out.missing.push("TimeoutStopSec=120");
+    }
+    if let Some(py) = &p.exec_path && !python_ok {
+        out.broken.push(format!("It runs {}, which doesn't exist anymore (environment removed or moved).", py));
+    }
+    if let Some(wd) = &p.working_dir && !main_py_ok {
+        out.broken.push(format!("Its folder {} has no main.py (Sapphire moved or was deleted).", wd));
+    }
+    out
+}
+
+/// Append `lines` at the end of the `[Service]` section (so a later-wins key like
+/// TimeoutStopSec= overrides what is there), creating the section if absent.
+#[cfg_attr(windows, allow(dead_code))] // only the Linux unit check calls these
+pub(crate) fn add_service_lines(unit: &str, lines: &[&str]) -> String {
+    let mut out: Vec<String> = unit.lines().map(str::to_string).collect();
+    let start = out.iter().position(|l| l.trim().eq_ignore_ascii_case("[Service]"));
+    let Some(start) = start else {
+        if !out.is_empty() && !out.last().unwrap().trim().is_empty() { out.push(String::new()); }
+        out.push("[Service]".to_string());
+        out.extend(lines.iter().map(|l| l.to_string()));
+        return out.join("\n") + "\n";
+    };
+    // The section ends at the next header; back up over trailing blank lines.
+    let mut end = out[start + 1..].iter().position(|l| l.trim_start().starts_with('['))
+        .map(|i| start + 1 + i).unwrap_or(out.len());
+    while end > start + 1 && out[end - 1].trim().is_empty() { end -= 1; }
+    for (i, l) in lines.iter().enumerate() {
+        out.insert(end + i, l.to_string());
+    }
+    out.join("\n") + "\n"
+}
+
+/// Read the unit's effective properties and judge them. None = no unit or no issues.
 #[cfg(not(windows))]
-pub(crate) async fn write_env_file(content: String) -> bool {
+pub(crate) async fn check_unit() -> Option<UnitIssues> {
+    let show = run_cmd_full_async("systemctl".into(), vec![
+        "--user".into(), "show".into(), "sapphire".into(),
+        "-p".into(), "LoadState".into(), "-p".into(), "Restart".into(),
+        "-p".into(), "RestartPreventExitStatus".into(), "-p".into(), "TimeoutStopUSec".into(),
+        "-p".into(), "ExecStart".into(), "-p".into(), "WorkingDirectory".into(),
+        "-p".into(), "FragmentPath".into(),
+    ]).await.ok()?;
+    if !show.lines().any(|l| l == "LoadState=loaded") {
+        return None;
+    }
+    let p = parse_unit_props(&show);
+    let python_ok = p.exec_path.as_deref().is_none_or(|x| PathBuf::from(x).is_file());
+    let main_py_ok = p.working_dir.as_deref().is_none_or(|w| PathBuf::from(w).join("main.py").is_file());
+    let issues = unit_issues(&p, python_ok, main_py_ok);
+    (!issues.is_empty()).then_some(issues)
+}
+
+/// Add the missing lines to the unit file (backup `.bak` first) and daemon-reload.
+/// Only touches a unit inside the user's home — anything else is told, not edited.
+#[cfg(not(windows))]
+pub(crate) async fn patch_unit(fragment: String, lines: Vec<&'static str>) -> (String, bool) {
     let home = std::env::var("HOME").unwrap_or_default();
-    let dir = format!("{}/.config/sapphire", home);
-    if tokio::fs::create_dir_all(&dir).await.is_err() { return false; }
-    let path = format!("{}/service.env", dir);
+    if home.is_empty() || !fragment.starts_with(&home) {
+        return (format!("The unit lives at {} (outside your home), so add these lines to its [Service] section yourself: {}", fragment, lines.join(", ")), false);
+    }
+    let text = match tokio::fs::read_to_string(&fragment).await {
+        Ok(t) => t,
+        Err(e) => return (format!("Couldn't read {}: {}", fragment, e), false),
+    };
+    if let Err(e) = tokio::fs::copy(&fragment, format!("{}.bak", fragment)).await {
+        return (format!("Couldn't back up {}: {}", fragment, e), false);
+    }
+    if let Err(e) = tokio::fs::write(&fragment, add_service_lines(&text, &lines)).await {
+        return (format!("Couldn't write {}: {}", fragment, e), false);
+    }
+    match run_cmd_full_async("systemctl".into(), vec!["--user".into(), "daemon-reload".into()]).await {
+        Ok(_) => (format!("Service file updated (added {}; backup at {}.bak).", lines.join(" and "), fragment), true),
+        Err(e) => (format!("Service file updated, but daemon-reload failed: {}", e), false),
+    }
+}
+
+/// Read the unit's EnvironmentFile (KEY=VALUE per line). Empty if absent.
+#[cfg(not(windows))]
+pub(crate) async fn read_env_file(path: String) -> String {
+    tokio::fs::read_to_string(path).await.unwrap_or_default()
+}
+
+/// Write the unit's EnvironmentFile (chmod 600 — it can hold API keys).
+#[cfg(not(windows))]
+pub(crate) async fn write_env_file(path: String, content: String) -> bool {
+    if let Some(dir) = std::path::Path::new(&path).parent()
+        && tokio::fs::create_dir_all(dir).await.is_err()
+    {
+        return false;
+    }
     if tokio::fs::write(&path, content).await.is_err() { return false; }
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
@@ -288,7 +557,8 @@ pub(crate) async fn run_cmd_streamed(
     }
 
     let mut cmd = tokio::process::Command::new(&program);
-    cmd.args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    cmd.args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+        .env("CONDA_PLUGINS_AUTO_ACCEPT_TOS", "yes"); // see run_cmd_full_async
     if let Some(d) = cwd { cmd.current_dir(d); }
     #[cfg(windows)]
     { cmd.creation_flags(CREATE_NO_WINDOW); }
@@ -468,7 +738,8 @@ async fn spawn_reader(
     // them a short grace to flush the last teardown lines — but never let a lingering
     // grandchild delay the exit notice.
     let status = child.wait().await;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let grace = if is_direct { 2 } else { 10 }; // `conda run` adds a wrapper between us and her
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(grace), async {
         let _ = a.await;
         let _ = b.await;
     })
@@ -538,6 +809,100 @@ pub(crate) fn spawn_log_stream(install_path: String, pid_store: Arc<AtomicU32>) 
     })
 }
 
+
+// ── Tests: the pure helpers (any OS) ──────────────────────────────────────────
+#[cfg(test)]
+mod pure_tests {
+    use super::*;
+
+    #[test]
+    fn shim_round_trips_awkward_paths_and_is_current() {
+        let cwd = r#"C:\Users\Krem's "lab"\sapphire"#;
+        let log = r#"C:\Users\Krem's "lab"\AppData\Roaming\Sapphire\sapphire-launcher.log"#;
+        let src = shim_source(cwd, log);
+        assert!(shim_is_current(&src));
+        assert_eq!(shim_cwd(&src).as_deref(), Some(cwd));
+        assert!(src.contains("sys.path.insert(0, _cwd)"), "{}", src);
+        assert!(src.contains("open(_log, \"w\""), "{}", src);
+        assert!(src.contains("os.path.join(_cwd, \"main.py\")"), "{}", src);
+        // The log is opened before chdir: a bad folder still leaves a trace.
+        assert!(src.find("open(_log").unwrap() < src.find("os.chdir(").unwrap());
+    }
+
+    #[test]
+    fn v1_shim_is_stale_but_its_folder_is_recoverable() {
+        let v1 = "import runpy, sys, os\r\nos.chdir(\"C:\\\\Users\\\\krem\\\\sapphire\")\r\n_log = \"x\"\r\nrunpy.run_path(\"main.py\", run_name=\"__main__\")\r\n";
+        assert!(!shim_is_current(v1));
+        assert_eq!(shim_cwd(v1).as_deref(), Some(r"C:\Users\krem\sapphire"));
+        assert!(!shim_is_current(""));
+        assert_eq!(shim_cwd("print(1)"), None);
+        assert!(!shim_is_current("# sapphire-launcher autostart shim v1 (old)\n"));
+        assert!(shim_is_current(&format!("# sapphire-launcher autostart shim v{} (newer)\n", SHIM_VERSION + 1)));
+    }
+
+    #[test]
+    fn environment_file_is_read_from_systemctl_show() {
+        assert_eq!(env_file_from_show("/home/k/.config/sapphire/env (ignore_errors=no)").as_deref(), Some("/home/k/.config/sapphire/env"));
+        assert_eq!(env_file_from_show("-/home/k/.config/sapphire/service.env (ignore_errors=yes)").as_deref(), Some("/home/k/.config/sapphire/service.env"));
+        assert_eq!(env_file_from_show(""), None);
+    }
+
+    #[test]
+    fn systemd_durations_parse() {
+        for (s, want) in [
+            ("2min", Some(120)), ("1min 30s", Some(90)), ("90s", Some(90)), ("1h", Some(3600)),
+            ("100ms", Some(0)), ("infinity", Some(u64::MAX)), ("1.5min", Some(90)),
+            ("", None), ("soon", None), ("5 parsecs", None),
+        ] {
+            assert_eq!(parse_systemd_duration(s), want, "duration {:?}", s);
+        }
+    }
+
+    /// Shaped exactly like `systemctl --user show sapphire -p …` output.
+    const SHOW: &str = "Restart=on-failure\nTimeoutStopUSec=2min\nRestartPreventExitStatus=43 44\n\
+        ExecStart={ path=/home/k/miniconda3/envs/sapphire/bin/python ; argv[]=/home/k/miniconda3/envs/sapphire/bin/python main.py ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }\n\
+        WorkingDirectory=/home/k/sapphire\nLoadState=loaded\nFragmentPath=/home/k/.config/systemd/user/sapphire.service\n";
+
+    #[test]
+    fn unit_props_parse_from_systemctl_show() {
+        let p = parse_unit_props(SHOW);
+        assert_eq!(p, UnitProps {
+            restart: "on-failure".into(),
+            prevent_exit: vec!["43".into(), "44".into()],
+            timeout_stop_secs: Some(120),
+            exec_path: Some("/home/k/miniconda3/envs/sapphire/bin/python".into()),
+            working_dir: Some("/home/k/sapphire".into()),
+            fragment: Some("/home/k/.config/systemd/user/sapphire.service".into()),
+        });
+        assert!(unit_issues(&p, true, true).is_empty(), "a current unit has no issues");
+    }
+
+    #[test]
+    fn old_and_broken_units_are_judged() {
+        let old = parse_unit_props("Restart=on-failure\nTimeoutStopUSec=1min 30s\nRestartPreventExitStatus=\nExecStart={ path=/py ; argv[]=/py main.py }\nWorkingDirectory=/w\n");
+        let i = unit_issues(&old, true, true);
+        assert_eq!(i.missing, vec!["RestartPreventExitStatus=43 44", "TimeoutStopSec=120"]);
+        assert!(i.broken.is_empty());
+        let partial = parse_unit_props("Restart=always\nTimeoutStopUSec=3min\nRestartPreventExitStatus=43\n");
+        assert_eq!(unit_issues(&partial, true, true).missing, vec!["RestartPreventExitStatus=43 44"]);
+        let no_restart = parse_unit_props("Restart=no\nTimeoutStopUSec=infinity\nRestartPreventExitStatus=\n");
+        assert!(unit_issues(&no_restart, true, true).is_empty(), "no restarts → nothing to prevent");
+        let b = unit_issues(&old, false, false);
+        assert_eq!(b.broken.len(), 2);
+        assert!(b.broken[0].contains("/py") && b.broken[1].contains("/w"), "{:?}", b.broken);
+    }
+
+    #[test]
+    fn service_lines_land_at_the_end_of_the_section() {
+        let unit = "[Unit]\nDescription=x\n\n[Service]\nType=simple\nTimeoutStopSec=10\n\n[Install]\nWantedBy=default.target\n";
+        let got = add_service_lines(unit, &["RestartPreventExitStatus=43 44", "TimeoutStopSec=120"]);
+        assert_eq!(got, "[Unit]\nDescription=x\n\n[Service]\nType=simple\nTimeoutStopSec=10\nRestartPreventExitStatus=43 44\nTimeoutStopSec=120\n\n[Install]\nWantedBy=default.target\n");
+        // Later wins in systemd, so ours must come after the existing TimeoutStopSec.
+        assert!(got.rfind("TimeoutStopSec=120").unwrap() > got.find("TimeoutStopSec=10").unwrap());
+        assert_eq!(add_service_lines("[Service]\nA=1", &["B=2"]), "[Service]\nA=1\nB=2\n");
+        assert_eq!(add_service_lines("[Unit]\nDescription=x\n", &["B=2"]), "[Unit]\nDescription=x\n\n[Service]\nB=2\n");
+    }
+}
 
 // ── Tests (Linux dev box): the spawn follower + graceful stop, end to end ─────
 // Uses the real sapphire env python to run a throwaway fake main.py, so the whole
