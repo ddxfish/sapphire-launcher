@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Build the Linux AppImage — one double-clickable file that wraps the release
-# binary. Same source tree as the Windows .exe and the plain Linux binary; this
-# script just bundles the Linux binary + icon + metadata into an AppImage.
+# Build the Linux release outputs into dist/: the AppImage (one double-clickable
+# file wrapping the release binary) and the bare Linux binary it contains. Same
+# source tree as the Windows .exe (build-windows.bat drops that into dist\ too), so
+# dist/ is the one folder to attach to a GitHub release.
 #
 # The binary is compiled INSIDE an Ubuntu 22.04 container (needs Docker). Why:
 # a binary's glibc floor is set by the machine that links it. Built on a newer
@@ -24,6 +25,7 @@ RUST_VERSION="1.93.0"                          # pin; bump together with the hos
 IMAGE="sapphire-launcher-build:ubuntu22.04-rust$RUST_VERSION"
 GLIBC_MAX="2.35"                               # Ubuntu 22.04's glibc — the floor we promise
 BIN="build/target/release/sapphire-launcher"   # container output (kept apart from target/)
+DIST="dist"                                    # release outputs (gitignored)
 APPDIR="build/AppDir"
 TOOLS="build/tools"
 ICON="icon-512.png"
@@ -72,6 +74,8 @@ if [ "$(printf '%s\n' "$need" "GLIBC_$GLIBC_MAX" | sort -V | tail -1)" != "GLIBC
   exit 1
 fi
 echo "==> glibc floor: $need (runs on Ubuntu 22.04+)"
+mkdir -p "$DIST"
+cp "$BIN" "$DIST/sapphire-launcher-linux-x86_64"
 
 # 4) Fetch the packaging tools once (cached in build/tools).
 mkdir -p "$TOOLS"
@@ -121,5 +125,7 @@ LDAI_OUTPUT="Sapphire_Launcher-x86_64.AppImage" \
     -d "$DESKTOP" \
     -i build/sapphire-launcher.png \
     --output appimage
+mv -f Sapphire_Launcher-x86_64.AppImage "$DIST/"
 
-echo "==> done: $(ls -1 Sapphire_Launcher-*.AppImage | tail -1)"
+echo "==> done, release outputs in $DIST/:"
+ls -1 "$DIST"

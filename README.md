@@ -53,15 +53,26 @@ cargo build --release
 ```
 
 - Windows requires the Rust toolchain plus MSVC build tools (Visual Studio C++ workload). The exe lands at `target/release/sapphire-launcher.exe`.
-- Linux produces `target/release/sapphire-launcher`.
+- Linux produces `target/release/sapphire-launcher` (for your own machine; its glibc floor is whatever you built on).
 
-To package the Linux AppImage (needs Docker — the binary is compiled in an Ubuntu 22.04 container so the file runs on older systems; packaging happens on your machine):
+Release outputs all land in `dist/` (gitignored), one folder to attach to a GitHub release:
 
 ```
-./build-appimage.sh
+./build-appimage.sh     # Linux: dist/Sapphire_Launcher-x86_64.AppImage + dist/sapphire-launcher-linux-x86_64
+build-windows.bat       # Windows: dist\sapphire-launcher.exe
 ```
 
-Output: `Sapphire_Launcher-x86_64.AppImage`.
+The Linux script needs Docker: the binary is compiled in an Ubuntu 22.04 container so the files run on older systems; packaging happens on your machine.
+
+Publishing a beta (pre-release) from the repo root, after both builds:
+
+```
+gh release create v0.9.6 dist/* --prerelease --title "Sapphire Launcher v0.9.6 (beta)" --generate-notes
+```
+
+Add a file built elsewhere later with `gh release upload v0.9.6 <file>`; promote it with `gh release edit v0.9.6 --prerelease=false`.
+
+CI (`.github/workflows/ci.yml`) runs clippy with warnings-as-errors and the tests on Linux and Windows for every push, and keeps the Windows release exe as a build artifact. The launcher checks the GitHub releases of this repo on start and shows a badge when a newer one exists.
 
 Tests (Linux, needs the sapphire conda env for the two process tests):
 

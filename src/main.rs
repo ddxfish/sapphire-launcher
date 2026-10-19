@@ -139,11 +139,12 @@ fn main() -> iced::Result {
                 Task::perform(read_env_file(), Message::EnvLoaded),
                 // Check if sapphire is already running
                 Task::perform(health_up(port, 3), Message::LaunchPreCheck),
-                // Check for updates
+                // Check for updates (Sapphire's repo, and the launcher's own releases)
                 Task::perform(
                     check_for_updates(path, branch),
                     Message::UpdatesAvailable,
                 ),
+                Task::perform(check_launcher_release(), Message::LauncherReleaseChecked),
                 // Auto-scan install status
                 Task::done(Message::ScanClicked),
             ]);
@@ -268,6 +269,8 @@ struct App {
     after_stop: AfterStop,
     // Sapphire's web port (user/settings.json WEB_UI_PORT); refreshed with the path.
     web_port: u16,
+    // Is there a newer launcher on GitHub? (badge in the header, row on the Update tab)
+    launcher_check: LauncherCheck,
     // Autostart tab (Linux): whether systemd --user is available; remove confirm.
     systemd_available: bool,
     confirm_remove_service: bool,
@@ -328,6 +331,7 @@ impl Default for App {
             stop_epoch: 0,
             after_stop: AfterStop::None,
             web_port: port,
+            launcher_check: LauncherCheck::Pending,
             systemd_available: false,
             confirm_remove_service: false,
             env_content: text_editor::Content::new(),
@@ -422,6 +426,8 @@ enum Message {
     // Update
     CheckForUpdates,
     UpdatesAvailable(Option<u32>), // None = check failed, Some(n) = n commits behind
+    LauncherReleaseChecked(LauncherCheck), // the launcher's own GitHub release check
+    OpenLauncherRelease,                   // open the newer launcher's release page
     UpdateClicked,
     UpdateAfterStop,
     UpdateStepDone(String, bool), // message, success — chains to next step
@@ -652,14 +658,34 @@ impl App {
                 self.checking_updates = true;
                 let path = self.install_path.clone();
                 let branch = self.selected_branch.unwrap_or(Branch::Stable);
-                Task::perform(
-                    check_for_updates(path, branch),
-                    Message::UpdatesAvailable,
-                )
+                Task::batch(vec![
+                    Task::perform(check_for_updates(path, branch), Message::UpdatesAvailable),
+                    Task::perform(check_launcher_release(), Message::LauncherReleaseChecked),
+                ])
             }
             Message::UpdatesAvailable(count) => {
                 self.checking_updates = false;
                 self.updates_available = count;
+                Task::none()
+            }
+            Message::LauncherReleaseChecked(check) => {
+                // Log it once (not on every re-check); the badge and the Update tab
+                // carry it from here.
+                if let LauncherCheck::Available(rel) = &check
+                    && self.launcher_check != check
+                {
+                    self.log_lines.push(format!(
+                        "A newer launcher is available: v{} (you have v{}). The Update tab has the download.",
+                        rel.version, env!("CARGO_PKG_VERSION")
+                    ));
+                }
+                self.launcher_check = check;
+                Task::none()
+            }
+            Message::OpenLauncherRelease => {
+                if let LauncherCheck::Available(rel) = &self.launcher_check {
+                    open_url(&rel.url);
+                }
                 Task::none()
             }
             Message::UpdateClicked => {
@@ -1831,6 +1857,18 @@ mod tests {
         a.sapphire_stopping = true;
         let _ = a.update(Message::SapphireStopConfirmed(false));
         assert!(a.sapphire_running && !a.sapphire_stopping && logged(&a, "didn't stop"));
+    }
+
+    #[test]
+    fn launcher_update_is_logged_once_and_kept() {
+        let mut a = app();
+        let rel = LauncherRelease { version: "9.9.9".into(), url: "https://example.invalid/r".into() };
+        let _ = a.update(Message::LauncherReleaseChecked(LauncherCheck::Available(rel.clone())));
+        let _ = a.update(Message::LauncherReleaseChecked(LauncherCheck::Available(rel.clone())));
+        assert_eq!(a.log_lines.iter().filter(|l| l.contains("newer launcher")).count(), 1);
+        assert_eq!(a.launcher_check, LauncherCheck::Available(rel));
+        let _ = a.update(Message::LauncherReleaseChecked(LauncherCheck::UpToDate));
+        assert_eq!(a.launcher_check, LauncherCheck::UpToDate);
     }
 
     #[test]

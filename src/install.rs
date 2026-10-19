@@ -644,6 +644,81 @@ pub(crate) async fn check_for_updates(install_path: String, branch: Branch) -> O
 }
 
 
+// ── Launcher update check (GitHub releases) ───────────────────────────────
+
+pub(crate) const LAUNCHER_REPO: &str = "ddxfish/sapphire-launcher";
+/// While the launcher is pre-1.0 every release is a beta, so beta users should hear
+/// about the next beta. Flip to false at 1.0 to announce stable releases only.
+const INCLUDE_PRERELEASES: bool = true;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LauncherRelease {
+    pub(crate) version: String, // tag without the leading v, e.g. "0.9.7"
+    pub(crate) url: String,     // the release page (assets + notes)
+}
+
+/// Outcome of the launcher's own update check.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum LauncherCheck {
+    #[default]
+    Pending,
+    UpToDate,
+    Available(LauncherRelease),
+    Failed, // offline, rate-limited, or an answer we couldn't read
+}
+
+/// `v0.9.7`, `0.9.7-beta`, `v1.0` → (major, minor, patch); anything else → None.
+pub(crate) fn parse_version(tag: &str) -> Option<(u32, u32, u32)> {
+    let core = tag.trim().trim_start_matches(['v', 'V']);
+    let core = core.split(['-', '+', ' ']).next().unwrap_or(core);
+    let mut parts = core.split('.').map(|p| p.parse::<u32>());
+    let major = parts.next()?.ok()?;
+    let minor = parts.next().unwrap_or(Ok(0)).ok()?;
+    let patch = parts.next().unwrap_or(Ok(0)).ok()?;
+    Some((major, minor, patch))
+}
+
+/// The newest non-draft release in a GitHub `/releases` listing that is newer than
+/// `local`. Drafts never count; pre-releases per INCLUDE_PRERELEASES. Tags that are
+/// not versions are skipped; a body that is not a release list → None.
+pub(crate) fn newer_release(json: &str, local: &str) -> Option<LauncherRelease> {
+    let local_v = parse_version(local)?;
+    let list: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
+    let flag = |r: &serde_json::Value, key: &str| r.get(key).and_then(|b| b.as_bool()).unwrap_or(false);
+    list.iter()
+        .filter(|r| !flag(r, "draft") && (INCLUDE_PRERELEASES || !flag(r, "prerelease")))
+        .filter_map(|r| {
+            let tag = r.get("tag_name")?.as_str()?;
+            let url = r.get("html_url")?.as_str()?.to_string();
+            Some((parse_version(tag)?, LauncherRelease { version: tag.trim_start_matches(['v', 'V']).to_string(), url }))
+        })
+        .filter(|(v, _)| *v > local_v)
+        .max_by_key(|(v, _)| *v)
+        .map(|(_, rel)| rel)
+}
+
+/// One small GitHub API call (at startup and on the Update tab's check): is there a
+/// newer launcher than this build? Unauthenticated (60 calls/hour/IP is plenty);
+/// GitHub wants a User-Agent. Fails silent offline or when rate-limited.
+pub(crate) async fn check_launcher_release() -> LauncherCheck {
+    let url = format!("https://api.github.com/repos/{}/releases?per_page=10", LAUNCHER_REPO);
+    let body = match run_cmd_full_async("curl".into(), vec![
+        "-sL".into(), "--max-time".into(), "8".into(),
+        "-H".into(), "Accept: application/vnd.github+json".into(),
+        "-H".into(), format!("User-Agent: sapphire-launcher/{}", env!("CARGO_PKG_VERSION")),
+        url,
+    ]).await {
+        Ok(b) => b,
+        Err(_) => return LauncherCheck::Failed,
+    };
+    match newer_release(&body, env!("CARGO_PKG_VERSION")) {
+        Some(rel) => LauncherCheck::Available(rel),
+        // No newer one — but only "up to date" if we actually read a release list.
+        None if serde_json::from_str::<Vec<serde_json::Value>>(&body).is_ok() => LauncherCheck::UpToDate,
+        None => LauncherCheck::Failed,
+    }
+}
+
 // ── Update helpers ─────────────────────────────────────────────────────────
 
 pub(crate) async fn git_stash_and_pull(install_path: String) -> (String, bool) {
@@ -721,6 +796,50 @@ mod tests {
         ] {
             assert_eq!(requirement_name(line).as_deref(), want, "line {:?}", line);
         }
+    }
+
+    #[test]
+    fn version_tags_parse() {
+        for (tag, want) in [
+            ("v0.9.6", Some((0, 9, 6))),
+            ("0.9.6", Some((0, 9, 6))),
+            ("v1.0", Some((1, 0, 0))),
+            ("V2", Some((2, 0, 0))),
+            ("v0.9.8-beta", Some((0, 9, 8))),
+            (" v0.9.8+build7 ", Some((0, 9, 8))),
+            ("nightly", None),
+            ("v0.9.x", None),
+            ("", None),
+        ] {
+            assert_eq!(parse_version(tag), want, "tag {:?}", tag);
+        }
+    }
+
+    #[test]
+    fn newer_release_picks_the_newest_usable_one() {
+        let listing = r#"[
+            {"tag_name":"v2.0.0","draft":true,"prerelease":false,"html_url":"https://x/draft"},
+            {"tag_name":"v0.9.8-beta","draft":false,"prerelease":true,"html_url":"https://x/beta"},
+            {"tag_name":"v0.9.7","draft":false,"prerelease":false,"html_url":"https://x/stable"},
+            {"tag_name":"nightly","draft":false,"prerelease":true,"html_url":"https://x/junk"},
+            {"tag_name":"v0.9.5","draft":false,"prerelease":false,"html_url":"https://x/old"}
+        ]"#;
+        let got = newer_release(listing, "0.9.6").expect("something newer than 0.9.6");
+        assert_eq!(got, LauncherRelease { version: "0.9.8-beta".into(), url: "https://x/beta".into() });
+        assert_eq!(newer_release(listing, "0.9.8"), None, "equal is not newer");
+        assert_eq!(newer_release(listing, "1.0.0"), None, "drafts never count");
+        assert_eq!(newer_release("not json", "0.9.6"), None);
+        assert_eq!(newer_release(r#"{"message":"API rate limit exceeded"}"#, "0.9.6"), None);
+        assert_eq!(newer_release("[]", "0.9.6"), None);
+    }
+
+    /// Hits the real GitHub API: run by hand with `cargo test -- --ignored`.
+    #[tokio::test]
+    #[ignore = "network"]
+    async fn live_github_release_check_answers() {
+        let check = check_launcher_release().await;
+        assert_ne!(check, LauncherCheck::Failed, "GitHub listing unreadable or offline");
+        assert_ne!(check, LauncherCheck::Pending);
     }
 
     #[tokio::test]

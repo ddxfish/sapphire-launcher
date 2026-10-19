@@ -75,6 +75,16 @@ impl App {
             .padding([2, 6]);
             header = header.push(badge);
         }
+        // Newer launcher on GitHub: same pattern, points at the Update tab's row.
+        if let LauncherCheck::Available(rel) = &self.launcher_check {
+            let badge = button(
+                text(format!("Launcher v{}", rel.version)).size(12).color(color!(0x3d85c6))
+            )
+            .on_press(Message::TabSelected(Tab::Update))
+            .style(button::text)
+            .padding([2, 6]);
+            header = header.push(badge);
+        }
 
         if self.sapphire_stopping {
             let stopping_btn = button(text("Stopping...").font(Font {
@@ -340,6 +350,22 @@ impl App {
             None => text("Couldn't check for updates.").size(13).color(color!(0x7f849c)),
         };
 
+        // The launcher's own update: a quiet status line, or a download button.
+        let me = env!("CARGO_PKG_VERSION");
+        let dim = color!(0x7f849c);
+        let launcher_row: Element<'_, Message> = match &self.launcher_check {
+            LauncherCheck::Available(rel) => row![
+                text(format!("Launcher v{} is available (you have v{}).", rel.version, me)).size(13).color(color!(0x3d85c6)),
+                button(text("Download").size(13)).on_press(Message::OpenLauncherRelease).style(button::primary).padding([4, 14]),
+            ]
+            .spacing(10)
+            .align_y(iced::Alignment::Center)
+            .into(),
+            LauncherCheck::UpToDate => text(format!("Launcher v{} — up to date.", me)).size(13).color(dim).into(),
+            LauncherCheck::Pending => text(format!("Launcher v{} — checking for a newer launcher...", me)).size(13).color(dim).into(),
+            LauncherCheck::Failed => text(format!("Launcher v{} — couldn't check for a newer launcher.", me)).size(13).color(dim).into(),
+        };
+
         column![
             text("Update Sapphire").size(18).font(Font {
                 weight: iced::font::Weight::Bold,
@@ -348,6 +374,7 @@ impl App {
             status_text,
             steps_col,
             update_btn,
+            launcher_row,
         ]
         .spacing(10)
         .into()

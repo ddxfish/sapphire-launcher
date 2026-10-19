@@ -1,0 +1,48 @@
+# Every push and PR: clippy with warnings-as-errors and the tests, on Linux and on
+# Windows (real MSVC, the toolchain users run). The Windows job also builds the
+# release exe and keeps it as a downloadable artifact, so a laptop is not the only
+# place an exe can come from. The AppImage is still built locally (build-appimage.sh)
+# because its glibc floor must come from an Ubuntu 22.04 container.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (clippy + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test
+
+  windows:
+    name: Windows (clippy + tests + release exe)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test
+      - name: Release exe (MSVC, same as build-windows.bat)
+        run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sapphire-launcher-windows-x64
+          path: target/release/sapphire-launcher.exe
