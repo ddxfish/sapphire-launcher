@@ -83,6 +83,10 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
     if let Err(e) = tokio::fs::create_dir_all(&unit_dir).await {
         return (format!("Couldn't create {}: {}", unit_dir, e), false);
     }
+    // 43 = another Sapphire already holds this user/ (lock or port), 44 = config
+    // error: a restart would just loop, so neither counts as a failure to retry.
+    // 120 s stop timeout: longer than the runner's own 90 s child-kill, so systemd
+    // never SIGKILLs a stop that is still winding down.
     let unit = format!(
         "[Unit]\n\
          Description=Sapphire AI\n\
@@ -93,6 +97,8 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
          ExecStart={py} main.py\n\
          Restart=on-failure\n\
          RestartSec=3\n\
+         RestartPreventExitStatus=43 44\n\
+         TimeoutStopSec=120\n\
          Environment=PYTHONUNBUFFERED=1\n\
          EnvironmentFile=-{env}\n\n\
          [Install]\n\
@@ -375,16 +381,20 @@ pub(crate) fn journal_log_stream() -> impl futures::Stream<Item = Message> {
     })
 }
 
-/// One message from the spawned Sapphire process: a log line, or the final exit notice.
+/// One message from the spawned Sapphire process: a log line, or the final exit
+/// notice — Ok(exit code; None = killed by a signal) or Err(why it never started).
+/// The wording lives in main.rs, which knows whether WE asked her to stop.
 enum SpawnItem {
     Line(String),
-    Exited(String),
+    Exited(Result<Option<i32>, String>),
 }
 
 /// Spawn `python -u main.py` and pump its stdout+stderr (lossy UTF-8, ANSI-stripped,
 /// `\r` progress bars collapsed) as `SpawnItem::Line`s into `tx`, then one final
-/// `SpawnItem::Exited`. `kill_on_drop` means dropping the follower subscription also
-/// tears the process down (the explicit Stop sweep reaps the child workers).
+/// `SpawnItem::Exited`. Note: this task owns the child, NOT the subscription — so
+/// dropping the follower does not kill her. `kill_on_drop` only fires when the whole
+/// runtime goes away (launcher exit/crash); the Stop flow in main.rs signals first and
+/// only falls back to `kill_process_tree`.
 async fn spawn_reader(
     install_path: String,
     pid_store: Arc<AtomicU32>,
@@ -405,17 +415,21 @@ async fn spawn_reader(
         .env("PYTHONUTF8", "1")
         .kill_on_drop(true);
     #[cfg(windows)]
-    { cmd.creation_flags(CREATE_NO_WINDOW); }
+    {
+        // Own process group (its pid = the group id) so Stop can send CTRL_BREAK to
+        // the runner and everything it spawned; hidden console so nothing flashes.
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+    }
     #[cfg(unix)]
     {
-        // Own process group so Stop can kill the whole tree (child workers).
+        // Own process group so Stop can signal the whole tree (child workers).
         cmd.process_group(0);
     }
 
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            let _ = tx.send(SpawnItem::Exited(format!("Failed to start: {}", e)));
+            let _ = tx.send(SpawnItem::Exited(Err(format!("Failed to start: {}", e))));
             return;
         }
     };
@@ -449,15 +463,21 @@ async fn spawn_reader(
     let stderr = child.stderr.take().unwrap();
     let a = tokio::spawn(pump(stdout, tx.clone()));
     let b = tokio::spawn(pump(stderr, tx.clone()));
-    let (_, _, status) = tokio::join!(a, b, child.wait());
-
-    let msg = match status {
-        Ok(s) if s.success() => "Sapphire exited.".to_string(),
-        Ok(s) if s.code() == Some(42) => "Sapphire is restarting...".to_string(),
-        Ok(s) => format!("Sapphire exited (code {}).", s.code().unwrap_or(-1)),
-        Err(e) => format!("Error: {}", e),
+    // Report the exit as soon as the runner itself is gone. The pumps only end once
+    // every holder of the pipes is gone (sapphire.py, Kokoro inherit them), so give
+    // them a short grace to flush the last teardown lines — but never let a lingering
+    // grandchild delay the exit notice.
+    let status = child.wait().await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        let _ = a.await;
+        let _ = b.await;
+    })
+    .await;
+    let result = match status {
+        Ok(s) => Ok(s.code()),
+        Err(e) => Err(format!("Error: {}", e)),
     };
-    let _ = tx.send(SpawnItem::Exited(msg));
+    let _ = tx.send(SpawnItem::Exited(result));
 }
 
 /// `Subscription`-driven follower of a spawned Sapphire process. **Lazy** — the
@@ -470,7 +490,7 @@ pub(crate) fn spawn_log_stream(install_path: String, pid_store: Arc<AtomicU32>) 
     enum St {
         Start,
         Run(tokio::sync::mpsc::UnboundedReceiver<SpawnItem>),
-        ExitPending(String),
+        ExitPending(Result<Option<i32>, String>),
         Done,
     }
     futures::stream::unfold(St::Start, move |state| {
@@ -518,3 +538,107 @@ pub(crate) fn spawn_log_stream(install_path: String, pid_store: Arc<AtomicU32>) 
     })
 }
 
+
+// ── Tests (Linux dev box): the spawn follower + graceful stop, end to end ─────
+// Uses the real sapphire env python to run a throwaway fake main.py, so the whole
+// chain is exercised: spawn in its own process group, pid stored, lines pumped,
+// SIGTERM via signal_stop, exit code reported, last teardown lines not lost.
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::time::Duration;
+
+    /// A throwaway install dir holding a fake `main.py` with the given body.
+    fn fake_install(name: &str, body: &str) -> String {
+        let dir = std::env::temp_dir()
+            .join(format!("sapphire-launcher-test-{}-{}", std::process::id(), name));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("main.py"), body).unwrap();
+        dir.to_string_lossy().into_owned()
+    }
+
+    /// Drive the follower until it reports the exit. `on_line` sees every log line
+    /// (the test reacts to the fake runner's "starting" line from there).
+    async fn run_until_exit(
+        stream: impl futures::Stream<Item = Message>,
+        mut on_line: impl FnMut(&str),
+    ) -> (Vec<String>, Result<Option<i32>, String>) {
+        futures::pin_mut!(stream);
+        let mut lines = Vec::new();
+        while let Some(msg) = stream.next().await {
+            match msg {
+                Message::SapphireLines(batch) => {
+                    for l in &batch { on_line(l); }
+                    lines.extend(batch);
+                }
+                Message::SapphireExited(r) => return (lines, r),
+                _ => {}
+            }
+        }
+        panic!("follower ended without an exit notice");
+    }
+
+    #[tokio::test]
+    async fn graceful_stop_exits_zero_and_keeps_last_lines() {
+        if sapphire_env_python().is_none() {
+            eprintln!("skipped: no sapphire env python on this box");
+            return;
+        }
+        let dir = fake_install("graceful", r#"
+import signal, sys, time
+stop = False
+def h(sig, frame):
+    global stop
+    stop = True
+signal.signal(signal.SIGTERM, h)
+print("[Runner] fake starting", flush=True)
+while not stop:
+    time.sleep(0.05)
+print("[Runner] fake stopping", flush=True)
+time.sleep(0.3)
+sys.exit(0)
+"#);
+        let pid = Arc::new(AtomicU32::new(0));
+        let p = pid.clone();
+        let mut signaled = false;
+        let fut = run_until_exit(spawn_log_stream(dir, pid.clone()), move |line| {
+            // Signal only once the handler is installed (the fake says so).
+            if !signaled && line.contains("fake starting") {
+                signaled = true;
+                let pid = p.load(Ordering::Relaxed);
+                assert!(pid > 1, "pid not stored before the first line");
+                // The runner must lead its own process group — signal_group refuses
+                // anything else, and this is what keeps the signal off the session.
+                assert_eq!(process_group_of(pid), Some(pid as i32), "runner is not a process-group leader");
+                assert!(signal_stop(pid), "signal_stop could not send SIGTERM");
+            }
+        });
+        let (lines, exit) = tokio::time::timeout(Duration::from_secs(15), fut)
+            .await
+            .expect("follower did not report an exit in time");
+        assert_eq!(exit, Ok(Some(0)));
+        assert!(lines.iter().any(|l| l.contains("fake stopping")), "teardown line lost: {:?}", lines);
+    }
+
+    #[tokio::test]
+    async fn twin_exit_code_is_passed_through() {
+        if sapphire_env_python().is_none() {
+            eprintln!("skipped: no sapphire env python on this box");
+            return;
+        }
+        let dir = fake_install(
+            "twin",
+            "import sys\nprint('[Runner] Another Sapphire is already running (fake)', flush=True)\nsys.exit(43)\n",
+        );
+        let pid = Arc::new(AtomicU32::new(0));
+        let (lines, exit) = tokio::time::timeout(
+            Duration::from_secs(15),
+            run_until_exit(spawn_log_stream(dir, pid), |_| {}),
+        )
+        .await
+        .expect("follower did not report an exit in time");
+        assert_eq!(exit, Ok(Some(43)));
+        assert!(lines.iter().any(|l| l.contains("Another Sapphire")), "runner line lost: {:?}", lines);
+    }
+}

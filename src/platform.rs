@@ -160,8 +160,73 @@ pub(crate) fn null_device() -> &'static str {
     { "/dev/null" }
 }
 
-/// Kill Sapphire and its children. Windows: taskkill the tree + sweep env pythons.
-/// Linux: kill the process group (we spawn Sapphire in its own group) + sweep.
+/// Linux: the process group id of `pid` from /proc, if the process exists.
+#[cfg(not(windows))]
+pub(crate) fn process_group_of(pid: u32) -> Option<i32> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // The comm field can hold spaces and parens; everything after the last ')' is
+    // fixed-format: state ppid pgrp ...
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// Send `sig` to the process group led by `pid` — only if `pid` really is the leader
+/// of its own group (we spawn Sapphire with process_group(0), so it is). Direct
+/// syscall on purpose: NEVER shell out to /usr/bin/kill for this. procps-ng 4.x
+/// parses `kill -TERM -1522700` as kill(-1, SIGTERM), i.e. every process the user
+/// owns — it took Krem's whole desktop session down on 2026-10-19.
+#[cfg(not(windows))]
+fn signal_group(pid: u32, sig: libc::c_int) -> bool {
+    if pid <= 1 || process_group_of(pid) != Some(pid as i32) {
+        return false;
+    }
+    // SAFETY: killpg is a plain syscall wrapper; pid was just verified as a group
+    // leader > 1, so this can only reach that group.
+    unsafe { libc::killpg(pid as libc::pid_t, sig) == 0 }
+}
+
+/// Ask Sapphire to stop gracefully (core tears down in ~8 s, worst case ~100 s).
+/// Windows: CTRL_BREAK to the runner's process group — it is spawned with
+/// CREATE_NEW_PROCESS_GROUP so its pid is the group id, and main.py/sapphire.py
+/// handle SIGBREAK as a stop. The launcher is a GUI app with no console of its own,
+/// so it briefly attaches to the runner's hidden console to send the event.
+/// Linux: SIGTERM to the process group. Returns false if the signal could not be
+/// sent; the caller then falls back to `kill_process_tree`.
+pub(crate) fn signal_stop(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Console::{
+            AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
+            CTRL_BREAK_EVENT,
+        };
+        // SAFETY: plain Win32 calls against our own process; the only pointer argument
+        // is the null handler (None), which is the documented "ignore Ctrl+C" form.
+        unsafe {
+            FreeConsole();
+            if AttachConsole(pid) == 0 {
+                return false;
+            }
+            SetConsoleCtrlHandler(None, 1);
+            let sent = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
+            FreeConsole();
+            SetConsoleCtrlHandler(None, 0);
+            sent
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        signal_group(pid, libc::SIGTERM)
+    }
+}
+
+/// Hard stop — the fallback when `signal_stop` can't be sent or Sapphire ignores it,
+/// and the only option for an instance we didn't spawn (pid 0: sweep only).
+/// Windows: taskkill the tree + sweep env pythons. Linux: SIGTERM the process group
+/// (we spawn Sapphire in its own group) + sweep. The sweep hits EVERY sapphire-env
+/// python (a user's own script too), which is why it is not the first move.
 pub(crate) fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
@@ -181,9 +246,9 @@ pub(crate) fn kill_process_tree(pid: u32) {
     #[cfg(not(windows))]
     {
         if pid > 0 {
-            // Negative pid targets the whole process group (Sapphire is spawned
-            // into its own group at launch), reaping child STT/TTS workers too.
-            let _ = hidden_cmd("kill").args(["-TERM", &format!("-{}", pid)]).output();
+            // Whole process group (Sapphire is spawned into its own group at launch),
+            // reaping child STT/TTS workers too. Direct syscall — see signal_group.
+            signal_group(pid, libc::SIGTERM);
         }
         // Sweep any stray python running the sapphire env (e.g. started outside us).
         let _ = hidden_cmd("pkill").args(["-TERM", "-f", "envs/sapphire/bin/python"]).output();

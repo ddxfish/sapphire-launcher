@@ -33,7 +33,7 @@ Sapphire Launcher handles everything so you don't have to touch a terminal. One 
 ## Requirements
 
 - **Windows 10 (1809+) or Windows 11** — uses winget to install Git and Miniconda.
-- **Linux (x86-64)** — the AppImage runs on a modern glibc (built on Ubuntu 24.04+). Uses your package manager / shipped tools for Git and Miniconda.
+- **Linux (x86-64)** — the AppImage runs on Ubuntu 22.04 or newer (any distro with glibc 2.35+). Uses your package manager / shipped tools for Git and Miniconda.
 - That's it. The launcher installs everything else.
 
 ## Usage
@@ -55,7 +55,7 @@ cargo build --release
 - Windows requires the Rust toolchain plus MSVC build tools (Visual Studio C++ workload). The exe lands at `target/release/sapphire-launcher.exe`.
 - Linux produces `target/release/sapphire-launcher`.
 
-To package the Linux AppImage (bundles the release binary + icon + metadata):
+To package the Linux AppImage (needs Docker — the binary is compiled in an Ubuntu 22.04 container so the file runs on older systems; packaging happens on your machine):
 
 ```
 ./build-appimage.sh

@@ -3186,10 +3186,12 @@ dependencies = [
  "futures",
  "iced",
  "image",
+ "libc",
  "rfd",
  "serde_json",
  "tokio",
  "tokio-stream",
+ "windows-sys 0.59.0",
  "winres",
 ]
 

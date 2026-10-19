@@ -3,9 +3,12 @@
 # binary. Same source tree as the Windows .exe and the plain Linux binary; this
 # script just bundles the Linux binary + icon + metadata into an AppImage.
 #
-# Runs on Ubuntu 24.04+ (the glibc floor is set by THIS build host's glibc).
-# Re-run anytime — the packaging tools are cached in build/tools after the first
-# download, so only the first run hits the network.
+# The binary is compiled INSIDE an Ubuntu 22.04 container (needs Docker). Why:
+# a binary's glibc floor is set by the machine that links it. Built on a newer
+# box, the AppImage dies on Ubuntu 22.04 / Debian 12 with "version GLIBC_2.39
+# not found" (that's how AppImageHub rejected it; they test on 22.04). Packaging
+# (linuxdeploy) still runs on the host. Re-run anytime — the image, the cargo
+# cache and the packaging tools are all cached after the first run.
 #
 #   ./build-appimage.sh
 #
@@ -17,17 +20,60 @@ cd "$(dirname "$0")"
 export APPIMAGE_EXTRACT_AND_RUN=1
 export ARCH=x86_64
 
-BIN="target/release/sapphire-launcher"
+RUST_VERSION="1.93.0"                          # pin; bump together with the host toolchain
+IMAGE="sapphire-launcher-build:ubuntu22.04-rust$RUST_VERSION"
+GLIBC_MAX="2.35"                               # Ubuntu 22.04's glibc — the floor we promise
+BIN="build/target/release/sapphire-launcher"   # container output (kept apart from target/)
 APPDIR="build/AppDir"
 TOOLS="build/tools"
 ICON="icon-512.png"
 DESKTOP="build/sapphire-launcher.desktop"
 
-# 1) Compile the release binary (the one and only source tree).
-echo "==> cargo build --release"
-cargo build --release
+command -v docker >/dev/null 2>&1 || {
+  echo "This script needs Docker: the binary is compiled in an Ubuntu 22.04 container." >&2
+  exit 1
+}
 
-# 2) Fetch the packaging tools once (cached in build/tools).
+# 1) Build image: Ubuntu 22.04 + the pinned Rust toolchain. Built once, reused.
+#    The Dockerfile is inline (stdin), so no build context is uploaded.
+if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "==> building $IMAGE (one time)"
+  docker build -t "$IMAGE" --build-arg RUST_VERSION="$RUST_VERSION" - <<'EOF'
+FROM ubuntu:22.04
+ARG RUST_VERSION
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev binutils \
+ && rm -rf /var/lib/apt/lists/*
+ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
+RUN curl -fsSL https://sh.rustup.rs \
+      | sh -s -- -y --profile minimal --default-toolchain "$RUST_VERSION" --no-modify-path \
+ && chmod -R a+rX /usr/local/rustup
+# Put the real toolchain binaries on PATH (no rustup proxy) so any uid can run them.
+ENV PATH=/usr/local/rustup/toolchains/${RUST_VERSION}-x86_64-unknown-linux-gnu/bin:$PATH
+WORKDIR /src
+EOF
+fi
+
+# 2) Compile in the container as the host user, so everything it writes under
+#    build/ (cargo cache, target dir) is ours. --locked: build exactly Cargo.lock.
+echo "==> cargo build --release (inside $IMAGE)"
+mkdir -p build/cargo-home build/target
+docker run --rm -u "$(id -u):$(id -g)" \
+  -v "$PWD":/src -w /src \
+  -e HOME=/tmp -e CARGO_HOME=/src/build/cargo-home -e CARGO_TARGET_DIR=/src/build/target \
+  "$IMAGE" cargo build --release --locked
+
+# 3) Guard: never package a binary that needs a newer glibc than we promise.
+need=$(docker run --rm -v "$PWD":/src:ro "$IMAGE" \
+  sh -c "objdump -T /src/$BIN | grep -oE 'GLIBC_[0-9.]+' | sort -Vu | tail -1")
+if [ "$(printf '%s\n' "$need" "GLIBC_$GLIBC_MAX" | sort -V | tail -1)" != "GLIBC_$GLIBC_MAX" ]; then
+  echo "ERROR: binary needs $need but the AppImage promises GLIBC_$GLIBC_MAX (Ubuntu 22.04)." >&2
+  exit 1
+fi
+echo "==> glibc floor: $need (runs on Ubuntu 22.04+)"
+
+# 4) Fetch the packaging tools once (cached in build/tools).
 mkdir -p "$TOOLS"
 export PATH="$PWD/$TOOLS:$PATH"   # so linuxdeploy can find its appimage plugin
 fetch() {  # <url> <dest>
@@ -42,10 +88,9 @@ fetch https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/li
 fetch https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage \
       "$TOOLS/linuxdeploy-plugin-appimage-x86_64.AppImage"
 
-# 3) Desktop metadata baked into the AppImage (appimagetool requires a .desktop
+# 5) Desktop metadata baked into the AppImage (appimagetool requires a .desktop
 #    + matching icon). This is separate from the runtime menu entry the launcher
 #    self-installs; keep Name/StartupWMClass identical so they collapse to one.
-mkdir -p build
 cat > "$DESKTOP" <<'EOF'
 [Desktop Entry]
 Type=Application
@@ -58,7 +103,7 @@ Categories=Utility;
 StartupWMClass=sapphire-launcher
 EOF
 
-# 4) Fresh AppDir, then let linuxdeploy assemble it (binary + deps via ldd, which
+# 6) Fresh AppDir, then let linuxdeploy assemble it (binary + deps via ldd, which
 #    is near-empty for us) and the appimage plugin package it with the modern
 #    fuse-free runtime.
 rm -rf "$APPDIR"
