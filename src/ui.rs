@@ -1,14 +1,17 @@
 // View rendering — split out of main.rs (modular source, single output binary).
 use crate::*;
+#[cfg(not(windows))]
 use crate::platform::sapphire_env_python;
-use iced::widget::{button, column, container, horizontal_space, pick_list, row, scrollable, text, text_editor, text_input, Column};
+use iced::widget::{button, column, container, horizontal_space, pick_list, row, scrollable, text, text_input, Column};
+#[cfg(not(windows))]
+use iced::widget::text_editor;
 use iced::{color, Element, Font, Length, Padding};
 use std::path::PathBuf;
 
 impl App {
     // ── View ───────────────────────────────────────────────────────────────
 
-    pub(crate) fn view(&self) -> Element<Message> {
+    pub(crate) fn view(&self) -> Element<'_, Message> {
         column![
             self.view_header(),
             self.view_tab_bar(),
@@ -23,7 +26,7 @@ impl App {
 
     // ── Header bar ─────────────────────────────────────────────────────────
 
-    fn view_header(&self) -> Element<Message> {
+    fn view_header(&self) -> Element<'_, Message> {
         let placeholder = if cfg!(windows) { "C:\\Users\\You\\Sapphire" } else { "/home/you/sapphire" };
         let path_input = text_input(placeholder, &self.install_path)
             .on_input(Message::PathChanged)
@@ -61,16 +64,16 @@ impl App {
         .align_y(iced::Alignment::Center);
 
         // Update indicator
-        if let Some(n) = self.updates_available {
-            if n > 0 {
-                let badge = button(
-                    text(format!("{} new", n)).size(12).color(color!(0x3d85c6))
-                )
-                .on_press(Message::TabSelected(Tab::Update))
-                .style(button::text)
-                .padding([2, 6]);
-                header = header.push(badge);
-            }
+        if let Some(n) = self.updates_available
+            && n > 0
+        {
+            let badge = button(
+                text(format!("{} new", n)).size(12).color(color!(0x3d85c6))
+            )
+            .on_press(Message::TabSelected(Tab::Update))
+            .style(button::text)
+            .padding([2, 6]);
+            header = header.push(badge);
         }
 
         if self.sapphire_stopping {
@@ -119,7 +122,7 @@ impl App {
 
     // ── Tab bar ────────────────────────────────────────────────────────────
 
-    fn view_tab_bar(&self) -> Element<Message> {
+    fn view_tab_bar(&self) -> Element<'_, Message> {
         let running_label = if self.sapphire_running { "Log *" } else { "Log" };
         let mut tabs = row![
             self.tab_button("Install", Tab::Install),
@@ -177,7 +180,7 @@ impl App {
 
     // ── Tab content ────────────────────────────────────────────────────────
 
-    fn view_tab_content(&self) -> Element<Message> {
+    fn view_tab_content(&self) -> Element<'_, Message> {
         // Running tab gets its own layout with fixed toolbar + scrollable log
         if self.active_tab == Tab::Running {
             return self.view_running_tab();
@@ -205,7 +208,7 @@ impl App {
         .into()
     }
 
-    fn view_install_tab(&self) -> Element<Message> {
+    fn view_install_tab(&self) -> Element<'_, Message> {
         let mut steps_col = Column::new().spacing(6);
 
         for (step, status) in &self.steps {
@@ -229,12 +232,12 @@ impl App {
 
             // Live elapsed timer on the in-progress step — proves it's alive even
             // during a long silent download.
-            if matches!(status, StepStatus::Installing) {
-                if let Some(start) = self.step_started {
-                    let secs = start.elapsed().as_secs();
-                    let t = if secs < 60 { format!("{}s", secs) } else { format!("{}m{:02}s", secs / 60, secs % 60) };
-                    row_items = row_items.push(text(t).size(12).color(color!(0x3d85c6)));
-                }
+            if matches!(status, StepStatus::Installing)
+                && let Some(start) = self.step_started
+            {
+                let secs = start.elapsed().as_secs();
+                let t = if secs < 60 { format!("{}s", secs) } else { format!("{}m{:02}s", secs / 60, secs % 60) };
+                row_items = row_items.push(text(t).size(12).color(color!(0x3d85c6)));
             }
 
             steps_col = steps_col.push(row_items);
@@ -291,7 +294,7 @@ impl App {
         .into()
     }
 
-    fn view_update_tab(&self) -> Element<Message> {
+    fn view_update_tab(&self) -> Element<'_, Message> {
         let mut steps_col = Column::new().spacing(6);
 
         for (label, status) in &self.update_status {
@@ -350,7 +353,7 @@ impl App {
         .into()
     }
 
-    fn view_uninstall_tab(&self) -> Element<Message> {
+    fn view_uninstall_tab(&self) -> Element<'_, Message> {
         let busy = self.uninstalling;
 
         // ═══════════════════════════════════════════════════════════
@@ -456,7 +459,7 @@ impl App {
         .into()
     }
 
-    fn view_troubleshoot_tab(&self) -> Element<Message> {
+    fn view_troubleshoot_tab(&self) -> Element<'_, Message> {
         let mut checks_col = Column::new().spacing(8);
 
         for (check, status) in &self.ts_checks {
@@ -530,7 +533,7 @@ impl App {
     }
 
     #[cfg(not(windows))]
-    fn view_service_tab(&self) -> Element<Message> {
+    fn view_service_tab(&self) -> Element<'_, Message> {
         let bold = Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT };
         let muted = color!(0x7f849c);
         let divider = || container(text("")).width(Length::Fill).height(1).style(|_t| container::Style {
@@ -657,7 +660,7 @@ impl App {
     /// Task), separate from the header's Launch/Stop. Enabled-state = our wrapper .cmd
     /// existing. No process-ownership takeover like the Linux systemd path.
     #[cfg(windows)]
-    fn view_service_tab(&self) -> Element<Message> {
+    fn view_service_tab(&self) -> Element<'_, Message> {
         let bold = Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT };
         let muted = color!(0x7f849c);
         let enabled = crate::platform::autostart_marker_path().exists();
@@ -714,7 +717,7 @@ impl App {
         .into()
     }
 
-    fn view_running_tab(&self) -> Element<Message> {
+    fn view_running_tab(&self) -> Element<'_, Message> {
         let status_text = if self.sapphire_running {
             text("Sapphire is running").size(13).color(color!(0x4caf50))
         } else if self.sapphire_log.is_empty() {
@@ -783,7 +786,7 @@ impl App {
 
     // ── Log panel ──────────────────────────────────────────────────────────
 
-    fn view_log_panel(&self) -> Element<Message> {
+    fn view_log_panel(&self) -> Element<'_, Message> {
         let toggle = button(if self.log_visible { "[-] Log" } else { "[+] Log" })
             .on_press(Message::ToggleLog)
             .style(button::text)

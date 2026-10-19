@@ -63,11 +63,17 @@ To package the Linux AppImage (needs Docker — the binary is compiled in an Ubu
 
 Output: `Sapphire_Launcher-x86_64.AppImage`.
 
+Tests (Linux, needs the sapphire conda env for the two process tests):
+
+```
+cargo test
+```
+
 ## Tech
 
 - **Rust** with **Iced 0.13** for the GUI, software-rendered via tiny-skia (no wgpu / GPU driver dependency)
 - Async command execution via Tokio
-- Source modules: `src/main.rs`, `src/ui.rs`, `src/service.rs`, `src/platform.rs`
+- Source modules: `src/main.rs` (app state + message loop), `src/ui.rs`, `src/install.rs`, `src/troubleshoot.rs`, `src/service.rs`, `src/platform.rs`
 - Config stored alongside Sapphire's own: `%APPDATA%\Sapphire\launcher.json` on Windows, `$XDG_CONFIG_HOME/sapphire/launcher.json` (or `~/.config/sapphire/launcher.json`) on Linux
 </content>
 </invoke>

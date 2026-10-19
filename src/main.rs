@@ -4,16 +4,18 @@ use iced::widget::{scrollable, text_editor};
 use iced::{color, Subscription, Task, Theme};
 use iced::window;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, Mutex, atomic::{AtomicU32, Ordering}};
 use std::time::Instant;
 
 mod ui;
 mod service;
 mod platform;
+mod install;
+mod troubleshoot;
 use crate::platform::*;
 use crate::service::*;
-
+use crate::install::*;
+use crate::troubleshoot::*;
 
 
 // ── Config persistence ─────────────────────────────────────────────────────
@@ -23,25 +25,16 @@ fn config_path() -> PathBuf {
 }
 
 fn load_config() -> (String, Branch) {
-    let default_path = default_install_path();
-
-    let path = config_path();
-    let install_path = match std::fs::read_to_string(&path) {
-        Ok(content) => {
-            content
-                .split("\"install_path\"")
-                .nth(1)
-                .and_then(|s| s.split('"').nth(1))
-                .map(|s| s.replace("\\\\", "\\"))
-                .unwrap_or(default_path)
-        }
-        Err(_) => default_path,
-    };
-
+    let install_path = read_install_path(&config_path()).unwrap_or_else(default_install_path);
     // Detect actual branch from the repo instead of trusting config
     let branch = detect_git_branch(&install_path);
-
     (install_path, branch)
+}
+
+/// `install_path` from a launcher.json, if the file parses and holds a non-empty one.
+fn read_install_path(path: &std::path::Path) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    v.get("install_path")?.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
 fn detect_git_branch(install_path: &str) -> Branch {
@@ -61,20 +54,19 @@ fn detect_git_branch(install_path: &str) -> Branch {
 }
 
 fn save_config(install_path: &str, branch: Branch) {
-    let path = config_path();
+    let _ = write_config(&config_path(), install_path, branch);
+}
+
+fn write_config(path: &std::path::Path, install_path: &str, branch: Branch) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
     let branch_str = match branch {
         Branch::Development => "Development",
         Branch::Stable => "Stable",
     };
-    let escaped_path = install_path.replace('\\', "\\\\");
-    let json = format!(
-        "{{\n  \"install_path\": \"{}\",\n  \"branch\": \"{}\"\n}}\n",
-        escaped_path, branch_str
-    );
-    let _ = std::fs::write(&path, json);
+    let json = serde_json::json!({ "install_path": install_path, "branch": branch_str });
+    std::fs::write(path, format!("{:#}\n", json))
 }
 
 fn main() -> iced::Result {
@@ -110,7 +102,7 @@ fn main() -> iced::Result {
         ..Default::default()
     };
 
-    iced::application("Sapphire Launcher", App::update, App::view)
+    iced::application(concat!("Sapphire Launcher v", env!("CARGO_PKG_VERSION")), App::update, App::view)
         .theme(|_| {
             Theme::custom(
                 "Sapphire Dark".to_string(),
@@ -131,6 +123,7 @@ fn main() -> iced::Result {
             let app = App::default();
             let path = app.install_path.clone();
             let branch = app.selected_branch.unwrap_or(Branch::Stable);
+            let port = app.web_port;
             let task = Task::batch(vec![
                 // Detect a systemd --user service (Linux) → flips into service mode
                 Task::perform(
@@ -145,15 +138,7 @@ fn main() -> iced::Result {
                 // Load any saved service env vars into the editor
                 Task::perform(read_env_file(), Message::EnvLoaded),
                 // Check if sapphire is already running
-                Task::perform(
-                    async {
-                        run_cmd_full_async("curl".into(), vec![
-                            "-sk".into(), "--max-time".into(), "3".into(),
-                            "https://localhost:8073/api/health".into(),
-                        ]).await.map(|b| b.contains("ok")).unwrap_or(false)
-                    },
-                    Message::LaunchPreCheck,
-                ),
+                Task::perform(health_up(port, 3), Message::LaunchPreCheck),
                 // Check for updates
                 Task::perform(
                     check_for_updates(path, branch),
@@ -192,10 +177,10 @@ fn install_desktop_entry() {
 
     let desktop_path = format!("{}/.local/share/applications/sapphire-launcher.desktop", home);
     // Skip if we've already installed for this exact binary location.
-    if let Ok(existing) = std::fs::read_to_string(&desktop_path) {
-        if existing.contains(&format!("Exec={}", exe_str)) {
-            return;
-        }
+    if let Ok(existing) = std::fs::read_to_string(&desktop_path)
+        && existing.contains(&format!("Exec={}", exe_str))
+    {
+        return;
     }
 
     // Icons at common sizes into the hicolor theme.
@@ -233,80 +218,6 @@ fn install_desktop_entry() {
     let _ = hidden_cmd("gtk-update-icon-cache")
         .args(["-f", "-t", &format!("{}/.local/share/icons/hicolor", home)])
         .output();
-}
-
-// ── Step tracking ──────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Step {
-    Git,
-    Conda,
-    CondaInit,
-    PythonEnv,
-    Clone,
-    // Windows-only: Sapphire's native wheels (numpy/torch/…) need the VC++ runtime.
-    // Runs before Deps. A first-class step (like Git/Conda), gated off other OSes.
-    #[cfg(windows)]
-    VcRedist,
-    Deps,
-    Done,
-}
-
-const ALL_STEPS: &[Step] = &[
-    Step::Git,
-    Step::Conda,
-    Step::CondaInit,
-    Step::PythonEnv,
-    Step::Clone,
-    #[cfg(windows)]
-    Step::VcRedist,
-    Step::Deps,
-    Step::Done,
-];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum StepStatus {
-    NotStarted,
-    Checking,
-    Found(String),    // already installed — friendly detail
-    NotFound(String), // not installed — what we'll do
-    Installing,
-    Done(String),
-    Failed(String),
-}
-
-impl StepStatus {
-    fn indicator(&self, tick: usize) -> &str {
-        const SPINNER: &[&str] = &["/", "-", "\\", "|"];
-        match self {
-            StepStatus::NotStarted => "-",
-            StepStatus::Checking | StepStatus::Installing => SPINNER[tick % SPINNER.len()],
-            StepStatus::Found(_) => "+",
-            StepStatus::NotFound(_) => "?",
-            StepStatus::Done(_) => "+",
-            StepStatus::Failed(_) => "x",
-        }
-    }
-
-    fn color(&self) -> iced::Color {
-        match self {
-            StepStatus::NotStarted => color!(0x585b70),
-            StepStatus::Checking | StepStatus::Installing => color!(0x3d85c6),
-            StepStatus::Found(_) | StepStatus::Done(_) => color!(0x4caf50),
-            StepStatus::NotFound(_) => color!(0xf9e154),
-            StepStatus::Failed(_) => color!(0xe74c3c),
-        }
-    }
-
-    fn detail(&self) -> Option<&str> {
-        match self {
-            StepStatus::Found(s)
-            | StepStatus::NotFound(s)
-            | StepStatus::Done(s)
-            | StepStatus::Failed(s) => Some(s.as_str()),
-            _ => None,
-        }
-    }
 }
 
 // ── App state ──────────────────────────────────────────────────────────────
@@ -355,6 +266,8 @@ struct App {
     // stop are ignored, and what to do once she is actually down.
     stop_epoch: usize,
     after_stop: AfterStop,
+    // Sapphire's web port (user/settings.json WEB_UI_PORT); refreshed with the path.
+    web_port: u16,
     // Autostart tab (Linux): whether systemd --user is available; remove confirm.
     systemd_available: bool,
     confirm_remove_service: bool,
@@ -368,13 +281,14 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         let (install_path, branch) = load_config();
+        let port = web_port(&install_path);
 
         Self {
             install_path,
             selected_branch: Some(branch),
             active_tab: Tab::default(),
             log_visible: true,
-            log_lines: vec!["Ready.".to_string()],
+            log_lines: vec![format!("Sapphire Launcher v{} ({}). Ready.", env!("CARGO_PKG_VERSION"), std::env::consts::OS)],
             steps: ALL_STEPS
                 .iter()
                 .map(|s| (*s, StepStatus::NotStarted))
@@ -413,6 +327,7 @@ impl Default for App {
             spawn_epoch: 0,
             stop_epoch: 0,
             after_stop: AfterStop::None,
+            web_port: port,
             systemd_available: false,
             confirm_remove_service: false,
             env_content: text_editor::Content::new(),
@@ -519,8 +434,11 @@ enum Message {
     ServiceDetected(Option<ServiceInfo>),
     ServiceStart,
     ServiceStop,
+    #[cfg(not(windows))]
     ServiceRestart,
+    #[cfg(not(windows))]
     ServiceEnable,
+    #[cfg(not(windows))]
     ServiceDisable,
     ServiceActionResult(String, bool),
     ServiceRefreshed(Option<ServiceInfo>),
@@ -530,1075 +448,56 @@ enum Message {
     ServiceRemoveClick,
     ServiceRemoveResult(String, bool),
     EnvLoaded(String),
+    #[cfg(not(windows))]
     EnvEdit(text_editor::Action),
+    #[cfg(not(windows))]
     EnvSaveRestart,
+    #[cfg(not(windows))]
     EnvSaved(bool),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TsCheck {
-    SapphireRunning,
-    WebUi,
-    DepsHealth,
-    Plugins,
-    PluginDeps,
-    Gpu,
-}
+// ── Sapphire's web endpoint ────────────────────────────────────────────────
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TsStatus {
-    NotChecked,
-    Checking,
-    Ok(String),
-    Problem(String),
-    Fixing,
-    Fixed(String),
-}
+const DEFAULT_WEB_PORT: u16 = 8073;
 
-// ── Async detection logic ──────────────────────────────────────────────────
-
-/// Run a command on a background thread so it doesn't freeze the UI.
-const CREATE_NO_WINDOW: u32 = 0x08000000;
-/// Windows: the spawned runner becomes its own process group (pid = group id) so
-/// Stop can send CTRL_BREAK to it and everything it spawned.
-#[cfg(windows)]
-const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-
-
-async fn run_cmd_async(program: String, args: Vec<String>) -> Result<String, String> {
-    let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new(&program);
-        cmd.args(&args);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        cmd.output()
-            .map(|out| {
-                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                if out.status.success() {
-                    Ok(stdout)
-                } else if stderr.is_empty() {
-                    Err(format!("Exit code {}", out.status.code().unwrap_or(-1)))
-                } else {
-                    Err(stderr)
-                }
-            })
-            .unwrap_or_else(|e| Err(e.to_string()))
-    })
-    .await;
-    result.map_err(|e| e.to_string())?
-}
-
-// These return (Step, StepStatus) after checking the system
-#[cfg(windows)]
-async fn check_git() -> (Step, StepStatus) {
-    match run_cmd_async(find_git(), vec!["--version".into()]).await {
-        Ok(ver) => (Step::Git, StepStatus::Found(ver)),
-        Err(_) => (Step::Git, StepStatus::NotFound("Git not found — we'll install it".to_string())),
-    }
-}
-
-/// Linux: the "Git" step covers all system prerequisites — git (to clone) plus
-/// libportaudio (Sapphire's audio at runtime). Both must be present, even if git
-/// alone already is, so we check both here.
-#[cfg(not(windows))]
-async fn check_git() -> (Step, StepStatus) {
-    let git_ok = run_cmd_async(find_git(), vec!["--version".into()]).await.is_ok();
-    let audio_ok = run_cmd_async(
-        "sh".into(),
-        vec!["-c".into(), "ldconfig -p 2>/dev/null | grep -qi portaudio".into()],
-    ).await.is_ok();
-    // curl is used by the launcher's health/troubleshoot checks (not preinstalled on a fresh box).
-    let curl_ok = run_cmd_async(
-        "sh".into(),
-        vec!["-c".into(), "command -v curl >/dev/null 2>&1".into()],
-    ).await.is_ok();
-
-    if git_ok && audio_ok && curl_ok {
-        return (Step::Git, StepStatus::Found("git, audio libraries, and curl present".to_string()));
-    }
-    let mut missing = Vec::new();
-    if !git_ok { missing.push("git"); }
-    if !audio_ok { missing.push("audio libs (libportaudio)"); }
-    if !curl_ok { missing.push("curl"); }
-    (
-        Step::Git,
-        StepStatus::NotFound(format!(
-            "Missing {} — Go opens your system's own password prompt to install",
-            missing.join(", ")
-        )),
-    )
-}
-
-async fn check_conda() -> (Step, StepStatus) {
-    match run_cmd_async(find_conda(), vec!["--version".into()]).await {
-        Ok(ver) => (Step::Conda, StepStatus::Found(ver)),
-        Err(_) => {
-            #[cfg(windows)]
-            let paths = {
-                let home = std::env::var("USERPROFILE").unwrap_or_default();
-                [
-                    format!("{}\\miniconda3\\Scripts\\conda.exe", home),
-                    format!("{}\\anaconda3\\Scripts\\conda.exe", home),
-                    format!("{}\\Miniconda3\\Scripts\\conda.exe", home),
-                    format!("{}\\Anaconda3\\Scripts\\conda.exe", home),
-                ]
-            };
-            #[cfg(not(windows))]
-            let paths = {
-                let home = std::env::var("HOME").unwrap_or_default();
-                [
-                    format!("{}/miniconda3/bin/conda", home),
-                    format!("{}/anaconda3/bin/conda", home),
-                    "/opt/miniconda3/bin/conda".to_string(),
-                    "/opt/anaconda3/bin/conda".to_string(),
-                ]
-            };
-            for p in &paths {
-                if PathBuf::from(p).exists() {
-                    return (
-                        Step::Conda,
-                        StepStatus::Found(format!("Found at {}", p)),
-                    );
-                }
-            }
-            (
-                Step::Conda,
-                StepStatus::NotFound("Miniconda not found — we'll install it".to_string()),
-            )
-        }
-    }
-}
-
-async fn check_conda_init() -> (Step, StepStatus) {
-    match run_cmd_async(find_conda(), vec!["info".into(), "--json".into()]).await {
-        Ok(_) => (
-            Step::CondaInit,
-            StepStatus::Found("Conda is initialized".to_string()),
-        ),
-        Err(_) => (
-            Step::CondaInit,
-            StepStatus::NotFound("Will run conda init after install".to_string()),
-        ),
-    }
-}
-
-async fn check_python_env() -> (Step, StepStatus) {
-    match run_cmd_async(find_conda(), vec!["env".into(), "list".into()]).await {
-        Ok(output) => {
-            if output.lines().any(|l| l.starts_with("sapphire ") || l.starts_with("sapphire\t")) {
-                (
-                    Step::PythonEnv,
-                    StepStatus::Found("'sapphire' environment exists".to_string()),
-                )
-            } else {
-                (
-                    Step::PythonEnv,
-                    StepStatus::NotFound("Will create 'sapphire' Python 3.11 environment".to_string()),
-                )
-            }
-        }
-        Err(_) => (
-            Step::PythonEnv,
-            StepStatus::NotFound("Need conda first, then we'll create the environment".to_string()),
-        ),
-    }
-}
-
-async fn check_clone(install_path: String) -> (Step, StepStatus) {
-    let repo_path = PathBuf::from(&install_path);
-    let git_dir = repo_path.join(".git");
-
-    if git_dir.exists() {
-        (
-            Step::Clone,
-            StepStatus::Found(format!("Repo already at {}", install_path)),
-        )
-    } else if repo_path.exists() {
-        (
-            Step::Clone,
-            StepStatus::NotFound(format!("Folder exists but no git repo — will clone into {}", install_path)),
-        )
-    } else {
-        (
-            Step::Clone,
-            StepStatus::NotFound(format!("Will clone Sapphire into {}", install_path)),
-        )
-    }
-}
-
-async fn check_deps(install_path: String) -> (Step, StepStatus) {
-    let req_file = PathBuf::from(&install_path).join("requirements.txt");
-    if !req_file.exists() {
-        return (Step::Deps, StepStatus::NotFound("Will install after cloning".to_string()));
-    }
-
-    // requirements.txt existing isn't enough — the env (and its packages) may be
-    // gone (e.g. after removing the conda env). Probe the env's pip for the first
-    // real package to confirm deps are actually installed.
-    let first_pkg = tokio::fs::read_to_string(&req_file).await.ok().and_then(|c| {
-        c.lines()
-            .map(|l| l.trim())
-            .find(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('-'))
-            .map(|l| l.split(&['>', '<', '=', '!', '[', ';', ' '][..]).next().unwrap_or(l).trim().to_string())
-    });
-
-    let Some(pkg) = first_pkg.filter(|p| !p.is_empty()) else {
-        return (Step::Deps, StepStatus::Found("requirements.txt is empty — nothing to install".to_string()));
+/// Sapphire's web UI port: `WEB_UI_PORT` in `<install>/user/settings.json` (number or
+/// numeric string), else core's default 8073. Anything unreadable or odd → default.
+fn web_port(install_path: &str) -> u16 {
+    let path = PathBuf::from(install_path).join("user").join("settings.json");
+    let Ok(txt) = std::fs::read_to_string(path) else { return DEFAULT_WEB_PORT };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&txt) else { return DEFAULT_WEB_PORT };
+    let port = match v.get("WEB_UI_PORT") {
+        Some(serde_json::Value::Number(n)) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
+        Some(serde_json::Value::String(s)) => s.trim().parse().ok(),
+        _ => None,
     };
-
-    let (program, mut args) = find_conda_pip();
-    args.extend(["show".into(), pkg.clone()]);
-    match run_cmd_full_async(program, args).await {
-        Ok(_) => (Step::Deps, StepStatus::Found("Dependencies installed".to_string())),
-        Err(_) => (Step::Deps, StepStatus::NotFound(format!("Dependencies missing (no '{}') — will install", pkg))),
-    }
+    port.filter(|p| *p > 0).unwrap_or(DEFAULT_WEB_PORT)
 }
 
-// ── Async install logic ────────────────────────────────────────────────────
-
-/// Run a command on a background thread, returning combined stdout+stderr for logging
-async fn run_cmd_full_async(program: String, args: Vec<String>) -> Result<String, String> {
-    let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new(&program);
-        cmd.args(&args);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        match cmd.output() {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                let combined = format!("{}{}", stdout, stderr).trim().to_string();
-                if out.status.success() {
-                    Ok(combined)
-                } else {
-                    Err(combined)
-                }
-            }
-            Err(e) => Err(e.to_string()),
-        }
-    })
-    .await;
-    result.map_err(|e| e.to_string())?
+fn web_url(port: u16) -> String {
+    format!("https://localhost:{}", port)
 }
 
-#[cfg(windows)]
-async fn install_git() -> (Step, StepStatus, String) {
-    match run_cmd_full_async("winget".into(), vec!["install".into(), "Git.Git".into(), "--accept-source-agreements".into(), "--accept-package-agreements".into()]).await {
-        Ok(out) => (Step::Git, StepStatus::Done("Git installed! You may need to restart the launcher for PATH to update.".to_string()), out),
-        Err(e) => {
-            if e.contains("already installed") {
-                (Step::Git, StepStatus::Done("Git is already installed".to_string()), e)
-            } else {
-                (Step::Git, StepStatus::Failed(format!("Couldn't install Git — try installing it manually. {}", e)), e)
-            }
-        }
-    }
-}
-
-/// Windows-only: is the VC++ 2015-2022 x64 runtime present? Cheap presence check via
-/// the registry key the redist writes (both the native and WOW6432Node views). We
-/// don't version-match — Go's installer is idempotent — this just lets an already-set-up
-/// box show green instead of re-running winget. A miss here is harmless (Go no-ops).
-#[cfg(windows)]
-async fn check_vcredist() -> (Step, StepStatus) {
-    for key in [
-        "HKLM\\SOFTWARE\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64",
-        "HKLM\\SOFTWARE\\WOW6432Node\\Microsoft\\VisualStudio\\14.0\\VC\\Runtimes\\x64",
-    ] {
-        if let Ok(out) = run_cmd_async("reg".into(), vec![
-            "query".into(), key.into(), "/v".into(), "Installed".into(),
-        ]).await {
-            if out.contains("0x1") {
-                return (Step::VcRedist, StepStatus::Found("Visual C++ runtime is installed".to_string()));
-            }
-        }
-    }
-    (Step::VcRedist, StepStatus::NotFound("We'll install the Visual C++ runtime — Sapphire's components need it".to_string()))
-}
-
-/// Windows-only: install the VC++ redistributable via winget. Idempotent — no-ops if a
-/// same/newer version is already present (same pattern as the git/conda steps).
-#[cfg(windows)]
-async fn install_vcredist() -> (Step, StepStatus, String) {
-    match run_cmd_full_async("winget".into(), vec![
-        "install".into(), "Microsoft.VCRedist.2015+.x64".into(),
-        "--accept-source-agreements".into(), "--accept-package-agreements".into(),
-    ]).await {
-        Ok(out) => (Step::VcRedist, StepStatus::Done("Visual C++ runtime installed".to_string()), out),
-        Err(e) => {
-            if e.contains("already installed") || e.contains("No newer") || e.contains("up to date") {
-                (Step::VcRedist, StepStatus::Done("Visual C++ runtime is already installed".to_string()), e)
-            } else {
-                (Step::VcRedist, StepStatus::Failed(format!("Couldn't install the Visual C++ runtime — you can get it from https://aka.ms/vc14/vc_redist.x64.exe. {}", e)), e)
-            }
-        }
-    }
-}
-
-/// Pick the package-manager install of Sapphire's system prerequisites from
-/// /etc/os-release: git (to clone) + portaudio (audio runtime) + python dev
-/// headers. Returns (pkexec args, human-readable manual command).
-/// Empty args = unknown distro. Package names per the Sapphire docs (libportaudio2).
-#[cfg(not(windows))]
-fn system_packages_plan() -> (Vec<String>, String) {
-    let osr = std::fs::read_to_string("/etc/os-release").unwrap_or_default();
-    let mut id = String::new();
-    let mut id_like = String::new();
-    for line in osr.lines() {
-        if let Some(v) = line.strip_prefix("ID=") { id = v.trim_matches('"').to_lowercase(); }
-        else if let Some(v) = line.strip_prefix("ID_LIKE=") { id_like = v.trim_matches('"').to_lowercase(); }
-    }
-    let hay = format!("{} {}", id, id_like);
-    let v = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-    if hay.contains("debian") || hay.contains("ubuntu") {
-        (v(&["apt-get", "install", "-y", "git", "libportaudio2", "python3-dev", "curl"]),
-         "sudo apt install git libportaudio2 python3-dev curl".into())
-    } else if hay.contains("fedora") || hay.contains("rhel") || hay.contains("centos") {
-        (v(&["dnf", "install", "-y", "git", "portaudio", "python3-devel", "curl"]),
-         "sudo dnf install git portaudio python3-devel curl".into())
-    } else if hay.contains("arch") {
-        (v(&["pacman", "-S", "--noconfirm", "git", "portaudio", "curl"]),
-         "sudo pacman -S git portaudio curl".into())
-    } else if hay.contains("suse") {
-        (v(&["zypper", "install", "-y", "git", "libportaudio2", "python3-devel", "curl"]),
-         "sudo zypper install git libportaudio2 python3-devel curl".into())
-    } else {
-        (vec![], "install git, portaudio, python dev headers, and curl with your package manager".into())
-    }
-}
-
-#[cfg(not(windows))]
-async fn install_git() -> (Step, StepStatus, String) {
-    let (pm_args, manual) = system_packages_plan();
-    if pm_args.is_empty() {
-        return (
-            Step::Git,
-            StepStatus::Failed(format!("Couldn't detect your package manager. Run this yourself, then Re-scan:  {}", manual)),
-            String::new(),
-        );
-    }
-    // pkexec hands off to polkit — the desktop's OWN password dialog, not ours.
-    match run_cmd_full_async("pkexec".into(), pm_args).await {
-        Ok(out) => (Step::Git, StepStatus::Done("System packages installed (git, audio libs).".to_string()), out),
-        Err(e) => (
-            Step::Git,
-            StepStatus::Failed(format!("Couldn't install system packages automatically. Run this in a terminal, then Re-scan:  {}", manual)),
-            e,
-        ),
-    }
-}
-
-#[cfg(windows)]
-async fn install_conda() -> (Step, StepStatus, String) {
-    match run_cmd_full_async("winget".into(), vec!["install".into(), "Anaconda.Miniconda3".into(), "--accept-source-agreements".into(), "--accept-package-agreements".into()]).await {
-        Ok(out) => (Step::Conda, StepStatus::Done("Miniconda installed! You may need to restart the launcher for PATH to update.".to_string()), out),
-        Err(e) => {
-            if e.contains("already installed") {
-                (Step::Conda, StepStatus::Done("Miniconda is already installed".to_string()), e)
-            } else {
-                (Step::Conda, StepStatus::Failed(format!("Couldn't install Miniconda — try installing it manually. {}", e)), e)
-            }
-        }
-    }
-}
-
-/// Linux Miniconda install: download the official installer and run it unattended
-/// into ~/miniconda3 (no root, identical across distros).
-#[cfg(not(windows))]
-async fn install_conda() -> (Step, StepStatus, String) {
-    let arch = run_cmd_async("uname".into(), vec!["-m".into()]).await.unwrap_or_default();
-    let installer_arch = match arch.trim() {
-        "aarch64" | "arm64" => "aarch64",
-        _ => "x86_64",
-    };
-    let url = format!("https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-{}.sh", installer_arch);
-    let tmp = std::env::temp_dir().join("miniconda-installer.sh").to_string_lossy().to_string();
-
-    // Download with curl, fall back to wget.
-    let dl = match run_cmd_full_async("curl".into(), vec!["-fsSL".into(), "-o".into(), tmp.clone(), url.clone()]).await {
-        Ok(o) => Ok(o),
-        Err(_) => run_cmd_full_async("wget".into(), vec!["-qO".into(), tmp.clone(), url.clone()]).await,
-    };
-    if let Err(e) = dl {
-        return (Step::Conda, StepStatus::Failed(format!("Couldn't download the Miniconda installer (need curl or wget): {}", e)), e);
-    }
-
-    let home = std::env::var("HOME").unwrap_or_default();
-    let prefix = format!("{}/miniconda3", home);
-    match run_cmd_full_async("bash".into(), vec![tmp, "-b".into(), "-p".into(), prefix]).await {
-        Ok(out) => (Step::Conda, StepStatus::Done("Miniconda installed into ~/miniconda3".to_string()), out),
-        Err(e) => {
-            if e.contains("already exists") {
-                (Step::Conda, StepStatus::Done("Miniconda already installed".to_string()), e)
-            } else {
-                (Step::Conda, StepStatus::Failed(format!("Miniconda install failed: {}", e)), e)
-            }
-        }
-    }
-}
-
-async fn install_conda_init() -> (Step, StepStatus, String) {
-    let conda = find_conda();
-    // Accept Anaconda ToS for the default channels (required since 2025-07-15).
-    for ch in [
-        "https://repo.anaconda.com/pkgs/main",
-        "https://repo.anaconda.com/pkgs/r",
-        "https://repo.anaconda.com/pkgs/msys2",
-    ] {
-        let _ = run_cmd_full_async(conda.clone(), vec![
-            "tos".into(), "accept".into(), "--override-channels".into(),
-            "--channel".into(), ch.to_string(),
-        ]).await;
-    }
-
-    match run_cmd_full_async(conda, vec!["init".into()]).await {
-        Ok(out) => (Step::CondaInit, StepStatus::Done("Conda initialized".to_string()), out),
-        Err(e) => (Step::CondaInit, StepStatus::Failed(format!("Conda init had a problem: {}", e)), e),
-    }
-}
-
-async fn install_python_env() -> (Step, StepStatus, String) {
-    match run_cmd_full_async(find_conda(), vec!["create".into(), "-n".into(), "sapphire".into(), "python=3.11".into(), "-y".into()]).await {
-        Ok(out) => (Step::PythonEnv, StepStatus::Done("Python 3.11 environment 'sapphire' created".to_string()), out),
-        Err(e) => {
-            if e.contains("already exists") {
-                (Step::PythonEnv, StepStatus::Done("Environment 'sapphire' already exists".to_string()), e)
-            } else {
-                (Step::PythonEnv, StepStatus::Failed(format!("Couldn't create Python environment: {}", e)), e)
-            }
-        }
-    }
-}
-
-async fn install_clone(install_path: String, branch: String) -> (Step, StepStatus, String) {
-    let git_branch = match branch.as_str() {
-        "Development" => "dev",
-        _ => "main",
-    };
-
-    let repo_path = PathBuf::from(&install_path);
-
-    // If folder exists but isn't a repo, check if it's empty
-    if repo_path.exists() && !repo_path.join(".git").exists() {
-        let is_empty = std::fs::read_dir(&repo_path)
-            .map(|mut d| d.next().is_none())
-            .unwrap_or(false);
-        if !is_empty {
-            return (
-                Step::Clone,
-                StepStatus::Failed(format!(
-                    "Folder {} already exists and has files in it. Move or rename it first.",
-                    install_path
-                )),
-                String::new(),
-            );
-        }
-        // Empty folder — git clone works fine into empty dirs
-    }
-
-    // If already a repo, just make sure we're on the right branch
-    if repo_path.join(".git").exists() {
-        let _ = run_cmd_full_async(find_git(), vec!["-C".into(), install_path.clone(), "checkout".into(), git_branch.to_string()]).await;
-        return (
-            Step::Clone,
-            StepStatus::Done(format!("Repo exists, switched to {} branch", git_branch)),
-            String::new(),
-        );
-    }
-
-    match run_cmd_full_async(
-        find_git(),
-        vec![
-            "clone".into(),
-            "--branch".into(),
-            git_branch.to_string(),
-            "https://github.com/ddxfish/sapphire.git".into(),
-            install_path.clone(),
-        ],
-    ).await {
-        Ok(out) => (
-            Step::Clone,
-            StepStatus::Done(format!("Cloned Sapphire ({}) into {}", git_branch, install_path)),
-            out,
-        ),
-        Err(e) => (
-            Step::Clone,
-            StepStatus::Failed(format!("Clone failed: {}", e)),
-            e,
-        ),
-    }
-}
-
-async fn install_deps(install_path: String, sink: Arc<std::sync::Mutex<Vec<String>>>) -> (Step, StepStatus, String) {
-    let req_file = PathBuf::from(&install_path).join("requirements.txt");
-
-    if !req_file.exists() {
-        return (
-            Step::Deps,
-            StepStatus::Failed("requirements.txt not found — clone may have failed".to_string()),
-            String::new(),
-        );
-    }
-
-    // Run pip inside the conda env. Stream output live so a multi-GB download
-    // (torch &c.) shows progress instead of looking frozen.
-    let (program, mut base_args) = find_conda_pip();
-    base_args.extend(["install".into(), "-r".into(), req_file.to_string_lossy().to_string()]);
-    match run_cmd_streamed(program, base_args, None, sink).await {
-        // lines were already streamed live → empty log_output to avoid double-printing
-        Ok(_) => (Step::Deps, StepStatus::Done("Dependencies installed".to_string()), String::new()),
-        Err(e) => (Step::Deps, StepStatus::Failed(format!("pip install failed: {}", e)), String::new()),
-    }
-}
-
-// ── Async uninstall logic ───────────────────────────────────────────────────
-
-async fn uninstall_conda_env() -> (String, bool) {
-    match run_cmd_full_async(find_conda(), vec!["remove".into(), "-n".into(), "sapphire".into(), "--all".into(), "-y".into()]).await {
-        Ok(out) => (format!("Removed conda environment 'sapphire'.\n{}", out), true),
-        Err(e) => {
-            if e.contains("does not exist") || e.contains("not found") {
-                ("Conda environment 'sapphire' doesn't exist — nothing to remove.".to_string(), true)
-            } else {
-                (format!("Failed to remove conda environment: {}", e), false)
-            }
-        }
-    }
-}
-
-async fn uninstall_delete_folder(install_path: String) -> (String, bool) {
-    let path = install_path.clone();
-    tokio::task::spawn_blocking(move || {
-        let p = PathBuf::from(&path);
-        if !p.exists() {
-            return (format!("Folder {} doesn't exist — nothing to delete.", path), true);
-        }
-        match std::fs::remove_dir_all(&p) {
-            Ok(()) => (format!("Deleted {}", path), true),
-            Err(e) => (format!("Couldn't delete {}: {}", path, e), false),
-        }
-    })
-    .await
-    .unwrap_or_else(|e| (format!("Task failed: {}", e), false))
-}
-
-async fn uninstall_delete_userdata(install_path: String) -> (String, bool) {
-    let path = install_path.clone();
-    tokio::task::spawn_blocking(move || {
-        let user_dir = PathBuf::from(&path).join("user");
-        if !user_dir.exists() {
-            return (format!("No user folder found at {}\\user — nothing to delete.", path), true);
-        }
-        match std::fs::remove_dir_all(&user_dir) {
-            Ok(()) => (format!("Deleted {}\\user — your settings and data are gone.", path), true),
-            Err(e) => (format!("Couldn't delete {}\\user: {}", path, e), false),
-        }
-    })
-    .await
-    .unwrap_or_else(|e| (format!("Task failed: {}", e), false))
-}
-
-// ── Update check ───────────────────────────────────────────────────────────
-
-async fn check_for_updates(install_path: String, branch: Branch) -> Option<u32> {
-    let git_dir = PathBuf::from(&install_path).join(".git");
-    if !git_dir.exists() { return None; }
-
-    let git_branch = match branch {
-        Branch::Development => "dev",
-        Branch::Stable => "main",
-    };
-
-    // Fetch latest from remote
-    let _ = run_cmd_full_async(find_git(), vec![
-        "-C".into(), install_path.clone(), "fetch".into(), "origin".into(),
-    ]).await;
-
-    // Count commits behind
-    match run_cmd_full_async(find_git(), vec![
-        "-C".into(), install_path,
-        "rev-list".into(), "--count".into(),
-        format!("HEAD..origin/{}", git_branch),
-    ]).await {
-        Ok(count) => count.trim().parse::<u32>().ok(),
-        Err(_) => None,
-    }
-}
-
-// ── Update helpers ─────────────────────────────────────────────────────────
-
-async fn git_stash_and_pull(install_path: String) -> (String, bool) {
-    // Check for local changes
-    let dirty = match run_cmd_full_async(find_git(), vec![
-        "-C".into(), install_path.clone(), "status".into(), "--porcelain".into(),
-    ]).await {
-        Ok(out) => !out.trim().is_empty(),
-        Err(_) => false,
-    };
-
-    if dirty {
-        // Stash local changes
-        match run_cmd_full_async(find_git(), vec![
-            "-C".into(), install_path.clone(), "stash".into(), "push".into(),
-            "-m".into(), "sapphire-launcher auto-stash before update".into(),
-        ]).await {
-            Ok(_) => {}
-            Err(e) => return (format!("Couldn't stash local changes: {}", e), false),
-        }
-    }
-
-    // Pull
-    let result = match run_cmd_full_async(find_git(), vec![
-        "-C".into(), install_path.clone(), "pull".into(),
-    ]).await {
-        Ok(out) => {
-            let summary = out.lines().next().unwrap_or(&out).to_string();
-            if dirty {
-                (format!("pull: {} (your local changes were stashed — run 'git stash pop' to restore)", summary), true)
-            } else {
-                (format!("pull: {}", summary), true)
-            }
-        }
-        Err(e) => (format!("pull failed: {}", e), false),
-    };
-
-    result
+/// One health probe: is Sapphire answering on `port`? Silent during boot, so it tells
+/// "up" from "not up" but never "booting" from "not running".
+async fn health_up(port: u16, timeout_s: u32) -> bool {
+    run_cmd_full_async("curl".into(), vec![
+        "-sk".into(), "--max-time".into(), timeout_s.to_string(),
+        format!("{}/api/health", web_url(port)),
+    ]).await.map(|b| b.contains("ok")).unwrap_or(false)
 }
 
 /// Poll the health endpoint every 500 ms until it stops answering (true) or `tries`
 /// run out (false). Confirms a stop when no exit notice can come (service mode, or
 /// an instance we didn't spawn).
-async fn wait_health_down(tries: usize) -> bool {
+async fn wait_health_down(port: u16, tries: usize) -> bool {
     for _ in 0..tries {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let up = run_cmd_full_async("curl".into(), vec![
-            "-sk".into(), "--max-time".into(), "2".into(),
-            "https://localhost:8073/api/health".into(),
-        ]).await.map(|b| b.contains("ok")).unwrap_or(false);
-        if !up {
+        if !health_up(port, 2).await {
             return true;
         }
     }
     false
-}
-
-// ── Troubleshoot checks ────────────────────────────────────────────────────
-
-async fn ts_check_running() -> (TsCheck, TsStatus) {
-    match run_cmd_full_async("curl".into(), vec![
-        "-sk".into(), "--max-time".into(), "5".into(),
-        "https://localhost:8073/api/health".into(),
-    ]).await {
-        Ok(body) if body.contains("ok") => (TsCheck::SapphireRunning, TsStatus::Ok("Sapphire is responding".into())),
-        Ok(_) => (TsCheck::SapphireRunning, TsStatus::Problem("Sapphire responded but health check failed".into())),
-        Err(_) => (TsCheck::SapphireRunning, TsStatus::Problem("Can't reach Sapphire — is it running?".into())),
-    }
-}
-
-async fn ts_check_webui() -> (TsCheck, TsStatus) {
-    match run_cmd_full_async("curl".into(), vec![
-        "-sk".into(), "--max-time".into(), "5".into(),
-        "-o".into(), null_device().into(),
-        "-w".into(), "%{http_code}".into(),
-        "-L".into(), "https://localhost:8073/".into(),
-    ]).await {
-        Ok(code) => {
-            let code = code.trim().to_string();
-            // curl output may have extra text before the code — grab last 3 chars
-            let status = code.chars().rev().take(3).collect::<String>().chars().rev().collect::<String>();
-            if status == "200" {
-                (TsCheck::WebUi, TsStatus::Ok("Web UI is loading fine".into()))
-            } else if status == "500" {
-                (TsCheck::WebUi, TsStatus::Problem("Web UI returns error 500 — likely a package version issue".into()))
-            } else {
-                (TsCheck::WebUi, TsStatus::Problem(format!("Web UI returned HTTP {}", status)))
-            }
-        }
-        Err(_) => (TsCheck::WebUi, TsStatus::Problem("Can't reach web UI — is Sapphire running?".into())),
-    }
-}
-
-async fn ts_check_deps() -> (TsCheck, TsStatus) {
-    let (program, mut args) = find_conda_pip();
-    args.push("check".into());
-    match run_cmd_full_async(program, args).await {
-        Ok(output) if output.contains("No broken requirements") => {
-            (TsCheck::DepsHealth, TsStatus::Ok("All dependencies look good".into()))
-        }
-        Ok(output) => {
-            let problems: Vec<&str> = output.lines().take(5).collect();
-            (TsCheck::DepsHealth, TsStatus::Problem(format!("Broken packages:\n{}", problems.join("\n"))))
-        }
-        Err(e) => {
-            // pip check returns non-zero when deps are broken — that's the actual output
-            if e.contains("has requirement") || e.contains("not installed") {
-                let problems: Vec<&str> = e.lines().take(5).collect();
-                (TsCheck::DepsHealth, TsStatus::Problem(format!("Broken packages:\n{}", problems.join("\n"))))
-            } else {
-                (TsCheck::DepsHealth, TsStatus::Problem(format!("Couldn't check: {}", e)))
-            }
-        }
-    }
-}
-
-/// Find git executable on disk (Linux: rely on PATH).
-#[cfg(not(windows))]
-fn find_git() -> String {
-    if let Ok(out) = std::process::Command::new("which").arg("git").output() {
-        if out.status.success() {
-            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !p.is_empty() && PathBuf::from(&p).exists() {
-                return p;
-            }
-        }
-    }
-    "git".into()
-}
-
-/// Find git executable on disk
-#[cfg(windows)]
-fn find_git() -> String {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    let common_paths = [
-        "C:\\Program Files\\Git\\cmd\\git.exe".to_string(),
-        "C:\\Program Files (x86)\\Git\\cmd\\git.exe".to_string(),
-        "C:\\Program Files\\Git\\bin\\git.exe".to_string(),
-        format!("{}\\AppData\\Local\\Programs\\Git\\cmd\\git.exe", home),
-        format!("{}\\scoop\\shims\\git.exe", home),
-        format!("{}\\AppData\\Local\\GitHubDesktop\\app\\resources\\app\\git\\cmd\\git.exe", home),
-    ];
-    for p in &common_paths {
-        if PathBuf::from(p).exists() {
-            return p.clone();
-        }
-    }
-    // Try refreshing PATH from registry and searching there
-    if let Ok(output) = hidden_cmd("cmd")
-        .args(["/c", "where", "git"])
-        .output()
-    {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout);
-            if let Some(first_line) = path.lines().next() {
-                let p = first_line.trim();
-                if !p.is_empty() && PathBuf::from(p).exists() {
-                    return p.to_string();
-                }
-            }
-        }
-    }
-    "git".into() // final fallback
-}
-
-/// Find conda executable on disk
-#[cfg(windows)]
-fn find_conda() -> String {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    let conda_paths = [
-        format!("{}\\miniconda3\\Scripts\\conda.exe", home),
-        format!("{}\\Miniconda3\\Scripts\\conda.exe", home),
-        format!("{}\\anaconda3\\Scripts\\conda.exe", home),
-        format!("{}\\Anaconda3\\Scripts\\conda.exe", home),
-    ];
-    for p in &conda_paths {
-        if PathBuf::from(p).exists() {
-            return p.clone();
-        }
-    }
-    "conda".into() // fallback to PATH
-}
-
-/// Find conda executable on disk (Linux locations, then PATH).
-#[cfg(not(windows))]
-fn find_conda() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let conda_paths = [
-        format!("{}/miniconda3/bin/conda", home),
-        format!("{}/anaconda3/bin/conda", home),
-        "/opt/miniconda3/bin/conda".to_string(),
-        "/opt/anaconda3/bin/conda".to_string(),
-    ];
-    for p in &conda_paths {
-        if PathBuf::from(p).exists() {
-            return p.clone();
-        }
-    }
-    if let Ok(out) = std::process::Command::new("which").arg("conda").output() {
-        if out.status.success() {
-            let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if !p.is_empty() && PathBuf::from(&p).exists() {
-                return p;
-            }
-        }
-    }
-    "conda".into() // fallback to PATH
-}
-
-#[cfg(windows)]
-fn find_conda_pip() -> (String, Vec<String>) {
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    let pip_paths = [
-        format!("{}\\miniconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
-        format!("{}\\Miniconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
-        format!("{}\\anaconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
-    ];
-    for p in &pip_paths {
-        if PathBuf::from(p).exists() {
-            return (p.clone(), vec![]);
-        }
-    }
-    // Fallback to conda run
-    (find_conda(), vec!["run".into(), "-n".into(), "sapphire".into(), "pip".into()])
-}
-
-/// Find pip in the conda sapphire env directly (Linux), else `conda run`.
-#[cfg(not(windows))]
-fn find_conda_pip() -> (String, Vec<String>) {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let pip_paths = [
-        format!("{}/miniconda3/envs/sapphire/bin/pip", home),
-        format!("{}/anaconda3/envs/sapphire/bin/pip", home),
-    ];
-    for p in &pip_paths {
-        if PathBuf::from(p).exists() {
-            return (p.clone(), vec![]);
-        }
-    }
-    // Fallback to conda run
-    (find_conda(), vec!["run".into(), "-n".into(), "sapphire".into(), "pip".into()])
-}
-
-async fn ts_fix_deps(install_path: String) -> (TsCheck, String, bool) {
-    let req = PathBuf::from(&install_path).join("requirements.txt");
-    let (program, mut base_args) = find_conda_pip();
-    base_args.extend(["install".into(), "-r".into(), req.to_string_lossy().to_string()]);
-    match run_cmd_full_async(program, base_args).await {
-        Ok(out) => (TsCheck::DepsHealth, format!("Repaired! Restart Sapphire to apply."), true),
-        Err(e) => (TsCheck::DepsHealth, format!("Repair failed: {}", e), false),
-    }
-}
-
-async fn ts_check_gpu() -> (TsCheck, TsStatus) {
-    match run_cmd_async("nvidia-smi".into(), vec![
-        "--query-gpu=name,memory.total".into(), "--format=csv,noheader,nounits".into(),
-    ]).await {
-        Ok(output) => {
-            let info = output.trim().to_string();
-            if let Some((name, mem)) = info.split_once(',') {
-                let mem_gb = mem.trim().parse::<f64>().unwrap_or(0.0) / 1024.0;
-                (TsCheck::Gpu, TsStatus::Ok(format!("{} ({:.0} GB) — voice features will use GPU", name.trim(), mem_gb)))
-            } else {
-                (TsCheck::Gpu, TsStatus::Ok(format!("NVIDIA GPU found: {}", info)))
-            }
-        }
-        Err(_) => (TsCheck::Gpu, TsStatus::Ok("No NVIDIA GPU found — voice features will use CPU (still works, just slower)".into())),
-    }
-}
-
-async fn ts_check_plugins(install_path: String) -> (TsCheck, TsStatus) {
-    let install_dir = PathBuf::from(&install_path).join("install");
-    if !install_dir.exists() {
-        return (TsCheck::Plugins, TsStatus::Ok("No optional features found".into()));
-    }
-
-    let (pip_program, pip_base) = find_conda_pip();
-
-    // Find all requirements-*.txt files
-    let mut results: Vec<String> = Vec::new();
-    let mut any_missing = false;
-
-    let features = [
-        ("requirements-stt.txt", "Speech-to-Text"),
-        ("requirements-tts.txt", "Text-to-Speech"),
-        ("requirements-wakeword.txt", "Wake Word"),
-    ];
-
-    for (file, label) in &features {
-        let req_path = install_dir.join(file);
-        if !req_path.exists() { continue; }
-
-        // Read the requirements file and check each package
-        let contents = match tokio::fs::read_to_string(&req_path).await {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let mut all_installed = true;
-        let mut missing = Vec::new();
-
-        for line in contents.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
-            // Extract package name (before any >= or == specifier)
-            let pkg_name = line.split(&['>', '<', '=', '!', '['][..]).next().unwrap_or(line).trim();
-
-            let mut args = pip_base.clone();
-            args.extend(["show".into(), pkg_name.into()]);
-            match run_cmd_full_async(pip_program.clone(), args).await {
-                Ok(_) => {} // installed
-                Err(_) => {
-                    all_installed = false;
-                    missing.push(pkg_name.to_string());
-                }
-            }
-        }
-
-        if all_installed {
-            results.push(format!("{}: installed", label));
-        } else {
-            any_missing = true;
-            results.push(format!("{}: missing {}", label, missing.join(", ")));
-        }
-    }
-
-    let summary = results.join(" | ");
-    if any_missing {
-        (TsCheck::Plugins, TsStatus::Problem(summary))
-    } else if results.is_empty() {
-        (TsCheck::Plugins, TsStatus::Ok("No optional features found".into()))
-    } else {
-        (TsCheck::Plugins, TsStatus::Ok(summary))
-    }
-}
-
-async fn ts_fix_plugins(install_path: String) -> (TsCheck, String, bool) {
-    let install_dir = PathBuf::from(&install_path).join("install");
-    let (pip_program, pip_base) = find_conda_pip();
-
-    let features = ["requirements-stt.txt", "requirements-tts.txt", "requirements-wakeword.txt"];
-    let mut any_fail = false;
-
-    for file in &features {
-        let req_path = install_dir.join(file);
-        if !req_path.exists() { continue; }
-
-        let mut args = pip_base.clone();
-        args.extend(["install".into(), "-r".into(), req_path.to_string_lossy().to_string()]);
-        if let Err(e) = run_cmd_full_async(pip_program.clone(), args).await {
-            any_fail = true;
-            return (TsCheck::Plugins, format!("Failed on {}: {}", file, e), false);
-        }
-    }
-
-    if any_fail {
-        (TsCheck::Plugins, "Some features failed to install.".into(), false)
-    } else {
-        (TsCheck::Plugins, "All optional features installed. Restart Sapphire to apply.".into(), true)
-    }
-}
-
-/// Read enabled Sapphire plugins and their declared pip specifiers. A plugin is enabled
-/// if it's listed in `user/webui/plugins.json` `enabled`, OR its manifest sets
-/// `default_enabled` and it's not in `disabled` (so we must read every manifest, not just
-/// the enabled list — that's how default-on system plugins like memory/email count).
-/// Returns (plugin name, [pip specifiers]) for enabled plugins that declare any. Fully
-/// graceful: a missing state file, non-plugin folder, or garbled manifest is just skipped.
-async fn enabled_plugin_deps(install_path: &str) -> Vec<(String, Vec<String>)> {
-    let root = PathBuf::from(install_path);
-
-    let str_list = |v: &serde_json::Value, key: &str| -> Vec<String> {
-        v.get(key).and_then(|x| x.as_array())
-            .map(|arr| arr.iter().filter_map(|e| e.as_str().map(str::to_string)).collect())
-            .unwrap_or_default()
-    };
-    // Enabled/disabled state: prefer the user's web-UI config; fall back to the static
-    // default shipped in the repo (the only file present on a fresh clone). Mirrors
-    // Sapphire's plugin_loader.py read order, so we don't see empty lists on a clone.
-    let state_paths = [
-        root.join("user").join("webui").join("plugins.json"),
-        root.join("interfaces").join("web").join("static").join("core-ui").join("plugins.json"),
-    ];
-    let (mut enabled_list, mut disabled_list) = (Vec::new(), Vec::new());
-    for sp in &state_paths {
-        if let Ok(txt) = tokio::fs::read_to_string(sp).await {
-            let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or(serde_json::Value::Null);
-            enabled_list = str_list(&v, "enabled");
-            disabled_list = str_list(&v, "disabled");
-            break;
-        }
-    }
-
-    // Scan BOTH plugin roots Sapphire loads from: system (plugins/) and user
-    // (user/plugins/). A user-installed plugin with pip deps lives only in the latter.
-    let plugin_dirs = [root.join("plugins"), root.join("user").join("plugins")];
-    let mut out: Vec<(String, Vec<String>)> = Vec::new();
-    for dir in &plugin_dirs {
-        let Ok(mut entries) = tokio::fs::read_dir(dir).await else { continue; };
-        while let Ok(Some(entry)) = entries.next_entry().await {
-            let Ok(txt) = tokio::fs::read_to_string(entry.path().join("plugin.json")).await else { continue };
-            let Ok(manifest) = serde_json::from_str::<serde_json::Value>(&txt) else { continue };
-            let name = manifest.get("name").and_then(|n| n.as_str()).map(str::to_string)
-                .unwrap_or_else(|| entry.file_name().to_string_lossy().into_owned());
-            let default_enabled = manifest.get("default_enabled").and_then(|b| b.as_bool()).unwrap_or(false);
-            let is_enabled = enabled_list.iter().any(|e| e == &name)
-                || (default_enabled && !disabled_list.iter().any(|d| d == &name));
-            if !is_enabled { continue; }
-            let specs: Vec<String> = manifest.get("pip_dependencies").and_then(|d| d.as_array())
-                .map(|arr| arr.iter().filter_map(|s| s.as_str().map(str::to_string)).collect())
-                .unwrap_or_default();
-            if !specs.is_empty() {
-                out.push((name, specs));
-            }
-        }
-    }
-    out
-}
-
-/// Troubleshoot check: for each ENABLED plugin, verify its `pip_dependencies` are
-/// installed (via `pip show`). Disabled plugins and dep-free plugins are ignored.
-async fn ts_check_plugin_deps(install_path: String) -> (TsCheck, TsStatus) {
-    let plugins = enabled_plugin_deps(&install_path).await;
-    if plugins.is_empty() {
-        return (TsCheck::PluginDeps, TsStatus::Ok("No enabled plugins need extra packages".into()));
-    }
-    let (pip_program, pip_base) = find_conda_pip();
-    let mut report: Vec<String> = Vec::new();
-    for (name, specs) in &plugins {
-        let mut missing: Vec<String> = Vec::new();
-        for spec in specs {
-            // Strip the version/extras specifier to the bare package name (mirrors
-            // Sapphire's own re.split(r'[><=!~\[]', spec) in plugin_loader.py).
-            let pkg = spec.split(&['>', '<', '=', '!', '~', '[', ' '][..]).next().unwrap_or(spec).trim();
-            if pkg.is_empty() { continue; }
-            let mut args = pip_base.clone();
-            args.extend(["show".into(), pkg.into()]);
-            if run_cmd_full_async(pip_program.clone(), args).await.is_err() {
-                missing.push(spec.clone());
-            }
-        }
-        if !missing.is_empty() {
-            report.push(format!("{}: missing {}", name, missing.join(", ")));
-        }
-    }
-    if report.is_empty() {
-        (TsCheck::PluginDeps, TsStatus::Ok("All enabled plugins have their dependencies".into()))
-    } else {
-        (TsCheck::PluginDeps, TsStatus::Problem(report.join(" | ")))
-    }
-}
-
-/// The "Install" button for plugin deps: pip-install every enabled plugin's specifiers
-/// in one call (pip skips already-satisfied ones, so we don't need to pre-filter).
-async fn ts_fix_plugin_deps(install_path: String) -> (TsCheck, String, bool) {
-    let specs: Vec<String> = enabled_plugin_deps(&install_path).await
-        .into_iter().flat_map(|(_, s)| s).collect();
-    if specs.is_empty() {
-        return (TsCheck::PluginDeps, "No plugin dependencies to install.".into(), true);
-    }
-    let (program, mut args) = find_conda_pip();
-    args.push("install".into());
-    args.extend(specs);
-    match run_cmd_full_async(program, args).await {
-        Ok(_) => (TsCheck::PluginDeps, "Plugin dependencies installed. Restart Sapphire to apply.".into(), true),
-        Err(e) => (TsCheck::PluginDeps, format!("Install failed: {}", e), false),
-    }
 }
 
 // ── Update ─────────────────────────────────────────────────────────────────
@@ -1622,6 +521,7 @@ impl App {
             Message::PathChanged(path) => {
                 if !path.is_empty() {
                     self.install_path = path;
+                    self.web_port = web_port(&self.install_path);
                     save_config(&self.install_path, self.selected_branch.unwrap_or(Branch::Stable));
                 }
                 Task::none()
@@ -1713,7 +613,7 @@ impl App {
                 self.begin_stop(AfterStop::None)
             }
             Message::OpenBrowser => {
-                open_url("https://localhost:8073");
+                open_url(&web_url(self.web_port));
                 Task::none()
             }
             Message::SwitchBranch => {
@@ -1826,11 +726,9 @@ impl App {
                         // Step 2: pip install -r requirements.txt
                         self.update_status[1].1 = StepStatus::Installing;
                         self.log_lines.push("[update] Updating dependencies...".to_string());
-                        let (program, mut args) = find_conda_pip();
                         let req = PathBuf::from(&self.install_path).join("requirements.txt");
-                        args.extend(["install".into(), "-r".into(), req.to_string_lossy().to_string()]);
                         return Task::perform(async move {
-                            match run_cmd_full_async(program, args).await {
+                            match pip_install(vec!["-r".into(), req.to_string_lossy().to_string()]).await {
                                 Ok(_) => ("Dependencies updated.".to_string(), true),
                                 Err(e) => (format!("pip install failed: {}", e), false),
                             }
@@ -1854,22 +752,7 @@ impl App {
                 if !self.streaming_spawn {
                     return Task::none();
                 }
-                let msg = if self.sapphire_stopping {
-                    // We asked her to stop — whatever the code (a forced stop reports 1).
-                    "Sapphire stopped.".to_string()
-                } else {
-                    // Core's exit contract: 0 clean, 43 twin, 44 config, 1 ended from
-                    // outside (or a crash loop that gave up — hence the hedge).
-                    match result {
-                        Ok(Some(0)) => "Sapphire shut down.".to_string(),
-                        Ok(Some(43)) => "Another Sapphire is already running (see the line above). Stop it first.".to_string(),
-                        Ok(Some(44)) => "Sapphire could not start: configuration error (web host, port or certificate). See the lines above.".to_string(),
-                        Ok(Some(1)) => "Sapphire ended with code 1. If there is no error above, something outside this app ended it (Task Manager, taskkill).".to_string(),
-                        Ok(Some(code)) => format!("Sapphire exited (code {}).", code),
-                        Ok(None) => "Sapphire was ended by a signal.".to_string(),
-                        Err(e) => e,
-                    }
-                };
+                let msg = exit_message(result, self.sapphire_stopping);
                 self.sapphire_log.push(format!("--- {} ---", msg));
                 self.log_lines.push(msg);
                 if self.sapphire_stopping {
@@ -1955,15 +838,7 @@ impl App {
                 if self.streaming_spawn || self.sapphire_stopping || self.service.is_some() {
                     return Task::none();
                 }
-                Task::perform(
-                    async {
-                        run_cmd_full_async("curl".into(), vec![
-                            "-sk".into(), "--max-time".into(), "3".into(),
-                            "https://localhost:8073/api/health".into(),
-                        ]).await.map(|b| b.contains("ok")).unwrap_or(false)
-                    },
-                    Message::HealthResult,
-                )
+                Task::perform(health_up(self.web_port, 3), Message::HealthResult)
             }
             Message::HealthResult(running) => {
                 if !self.streaming_spawn && !self.sapphire_stopping && self.service.is_none() {
@@ -1992,6 +867,7 @@ impl App {
             // ── Install flow ───────────────────────────────────────────
             Message::ScanClicked => {
                 self.scanning = true;
+                self.web_port = web_port(&self.install_path); // settings.json may be new
                 self.log_lines.push("Scanning system...".to_string());
 
                 // Set all steps to Checking
@@ -2006,6 +882,7 @@ impl App {
                 let path = self.install_path.clone();
 
                 // Fire off all checks in parallel
+                #[allow(unused_mut)] // Windows pushes the VC++ check below
                 let mut checks = vec![
                     Task::perform(check_git(), |(step, status)| {
                         Message::StepResult(step, status)
@@ -2248,10 +1125,11 @@ impl App {
                 }
                 self.log_lines.push("[troubleshoot] Running checks...".to_string());
                 let path = self.install_path.clone();
+                let port = self.web_port;
 
                 Task::batch(vec![
-                    Task::perform(ts_check_running(), |(c, s)| Message::TroubleshootResult(c, s)),
-                    Task::perform(ts_check_webui(), |(c, s)| Message::TroubleshootResult(c, s)),
+                    Task::perform(ts_check_running(port), |(c, s)| Message::TroubleshootResult(c, s)),
+                    Task::perform(ts_check_webui(port), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_deps(), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_plugins(path.clone()), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_plugin_deps(path), |(c, s)| Message::TroubleshootResult(c, s)),
@@ -2312,6 +1190,7 @@ impl App {
                         let have_valid = PathBuf::from(&self.install_path).join("main.py").exists();
                         if !have_valid && PathBuf::from(wd).join("main.py").exists() {
                             self.install_path = wd.clone();
+                            self.web_port = web_port(&self.install_path);
                             self.selected_branch = Some(detect_git_branch(wd));
                             save_config(&self.install_path, self.selected_branch.unwrap_or(Branch::Stable));
                             self.log_lines.push(format!("Using service path: {}", wd));
@@ -2359,6 +1238,7 @@ impl App {
                     |(m, ok)| Message::ServiceActionResult(m, ok),
                 )
             }
+            #[cfg(not(windows))]
             Message::ServiceRestart => {
                 self.sapphire_running = true;
                 self.sapphire_stopping = false;
@@ -2375,6 +1255,7 @@ impl App {
                     |(m, ok)| Message::ServiceActionResult(m, ok),
                 )
             }
+            #[cfg(not(windows))]
             Message::ServiceEnable => {
                 self.log_lines.push("Enabling sapphire.service (autostart at login)...".to_string());
                 Task::perform(
@@ -2386,6 +1267,7 @@ impl App {
                     |(m, ok)| Message::ServiceActionResult(m, ok),
                 )
             }
+            #[cfg(not(windows))]
             Message::ServiceDisable => {
                 self.log_lines.push("Disabling sapphire.service autostart...".to_string());
                 Task::perform(
@@ -2476,14 +1358,17 @@ impl App {
                 self.env_content = text_editor::Content::with_text(&s);
                 Task::none()
             }
+            #[cfg(not(windows))]
             Message::EnvEdit(action) => {
                 self.env_content.perform(action);
                 Task::none()
             }
+            #[cfg(not(windows))]
             Message::EnvSaveRestart => {
                 self.log_lines.push("[service] Saving environment, then restarting...".to_string());
                 Task::perform(write_env_file(self.env_content.text()), Message::EnvSaved)
             }
+            #[cfg(not(windows))]
             Message::EnvSaved(ok) => {
                 if ok {
                     self.log_lines.push("[service] Environment saved.".to_string());
@@ -2528,15 +1413,16 @@ impl App {
         self.after_stop = after;
         self.stop_epoch += 1;
         let epoch = self.stop_epoch;
+        let port = self.web_port;
         self.log_lines.push("Stopping Sapphire...".to_string());
 
         // Service mode: stop the unit, confirm through the health probe.
         if self.service.is_some() {
             self.streaming_journal = false;
             return Task::perform(
-                async {
+                async move {
                     let _ = run_cmd_full_async("systemctl".into(), vec!["--user".into(), "stop".into(), "sapphire".into()]).await;
-                    wait_health_down(20).await
+                    wait_health_down(port, 20).await
                 },
                 Message::SapphireStopConfirmed,
             );
@@ -2547,9 +1433,9 @@ impl App {
             // Not ours (started outside this app): no runner to signal and no exit
             // notice coming. Sweep, then confirm through the health probe.
             return Task::perform(
-                async {
+                async move {
                     let _ = tokio::task::spawn_blocking(|| kill_process_tree(0)).await;
-                    wait_health_down(20).await
+                    wait_health_down(port, 20).await
                 },
                 Message::SapphireStopConfirmed,
             );
@@ -2689,35 +1575,26 @@ impl App {
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
-fn step_label(step: Step) -> &'static str {
-    match step {
-        #[cfg(windows)]
-        Step::Git => "Check for Git",
-        #[cfg(not(windows))]
-        Step::Git => "Check system packages (git, audio, curl)",
-        Step::Conda => "Check for Miniconda",
-        Step::CondaInit => "Initialize conda",
-        Step::PythonEnv => "Create Python environment",
-        Step::Clone => "Clone Sapphire",
-        #[cfg(windows)]
-        Step::VcRedist => "Check Visual C++ runtime",
-        Step::Deps => "Install dependencies",
-        Step::Done => "Done!",
+/// The pane/log line for a runner exit. `stopping` = we asked her to stop, so the
+/// code is ours (a forced stop reports 1) and the answer is simply "stopped".
+/// Otherwise core's exit contract: 0 clean, 43 twin, 44 config, 1 ended from outside
+/// (or a crash loop that gave up — hence the hedge), None = killed by a signal.
+fn exit_message(result: Result<Option<i32>, String>, stopping: bool) -> String {
+    if stopping {
+        return "Sapphire stopped.".to_string();
+    }
+    match result {
+        Ok(Some(0)) => "Sapphire shut down.".to_string(),
+        Ok(Some(43)) => "Another Sapphire is already running (see the line above). Stop it first.".to_string(),
+        Ok(Some(44)) => "Sapphire could not start: configuration error (web host, port or certificate). See the lines above.".to_string(),
+        Ok(Some(1)) => "Sapphire ended with code 1. If there is no error above, something outside this app ended it (Task Manager, taskkill).".to_string(),
+        Ok(Some(code)) => format!("Sapphire exited (code {}).", code),
+        Ok(None) => "Sapphire was ended by a signal.".to_string(),
+        Err(e) => e,
     }
 }
 
 /// Strip ANSI escape sequences from a string
-fn ts_label(check: TsCheck) -> &'static str {
-    match check {
-        TsCheck::SapphireRunning => "Sapphire responding",
-        TsCheck::WebUi => "Web UI loading",
-        TsCheck::DepsHealth => "Package health",
-        TsCheck::Plugins => "Optional features",
-        TsCheck::PluginDeps => "Plugin dependencies",
-        TsCheck::Gpu => "GPU",
-    }
-}
-
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
@@ -2734,4 +1611,236 @@ fn strip_ansi(s: &str) -> String {
         }
     }
     out
+}
+
+// ── Tests: pure helpers + the Stop state machine. No process is ever spawned here:
+// the Tasks update() returns are inert until iced polls them, and we drop them. ──
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sapphire-launcher-test-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn config_round_trips_awkward_paths() {
+        let cfg = scratch("config").join("sub").join("launcher.json");
+        let awkward = r#"C:\Users\Krem's "lab"\sapphire"#;
+        write_config(&cfg, awkward, Branch::Development).unwrap();
+        assert_eq!(read_install_path(&cfg).as_deref(), Some(awkward));
+        let text = std::fs::read_to_string(&cfg).unwrap();
+        assert!(text.contains("\"branch\": \"Development\""), "{}", text);
+    }
+
+    #[test]
+    fn config_read_is_forgiving() {
+        let d = scratch("config-bad");
+        assert_eq!(read_install_path(&d.join("missing.json")), None);
+        let p = d.join("garbage.json");
+        std::fs::write(&p, "{not json").unwrap();
+        assert_eq!(read_install_path(&p), None);
+        std::fs::write(&p, r#"{"install_path": "   "}"#).unwrap();
+        assert_eq!(read_install_path(&p), None);
+    }
+
+    #[test]
+    fn web_port_reads_settings_or_defaults() {
+        let d = scratch("port");
+        let install = d.to_string_lossy().into_owned();
+        assert_eq!(web_port(&install), DEFAULT_WEB_PORT, "no settings file");
+        let settings = d.join("user").join("settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        for (body, want) in [
+            (r#"{"WEB_UI_PORT": 9000}"#, 9000),
+            (r#"{"WEB_UI_PORT": "9001"}"#, 9001),
+            (r#"{"WEB_UI_PORT": 0}"#, DEFAULT_WEB_PORT),
+            (r#"{"WEB_UI_PORT": 70000}"#, DEFAULT_WEB_PORT),
+            (r#"{"WEB_UI_PORT": "lots"}"#, DEFAULT_WEB_PORT),
+            (r#"{"OTHER": 1}"#, DEFAULT_WEB_PORT),
+            ("{broken", DEFAULT_WEB_PORT),
+        ] {
+            std::fs::write(&settings, body).unwrap();
+            assert_eq!(web_port(&install), want, "settings body: {}", body);
+        }
+        assert_eq!(web_url(8073), "https://localhost:8073");
+    }
+
+    #[test]
+    fn exit_wording_follows_the_core_contract() {
+        assert_eq!(exit_message(Ok(Some(1)), true), "Sapphire stopped.");
+        assert_eq!(exit_message(Ok(None), true), "Sapphire stopped.");
+        assert_eq!(exit_message(Ok(Some(0)), false), "Sapphire shut down.");
+        assert!(exit_message(Ok(Some(43)), false).contains("Another Sapphire is already running"));
+        assert!(exit_message(Ok(Some(44)), false).contains("configuration error"));
+        assert!(exit_message(Ok(Some(1)), false).contains("code 1"));
+        assert_eq!(exit_message(Ok(Some(7)), false), "Sapphire exited (code 7).");
+        assert!(exit_message(Ok(None), false).contains("signal"));
+        assert_eq!(exit_message(Err("Failed to start: nope".into()), false), "Failed to start: nope");
+    }
+
+    #[test]
+    fn strip_ansi_removes_colour_codes() {
+        assert_eq!(strip_ansi("\x1b[31mred\x1b[0m plain"), "red plain");
+    }
+
+    #[test]
+    fn git_branch_detection() {
+        let d = scratch("branch");
+        assert_eq!(detect_git_branch(&d.to_string_lossy()), Branch::Stable, "no repo → Stable");
+        for (branch, want) in [("dev", Branch::Development), ("main", Branch::Stable)] {
+            let r = scratch(&format!("branch-{}", branch));
+            // A real install is a clone with history; an unborn branch has no HEAD to
+            // resolve, so give the test repo one commit.
+            let git = |args: &[&str]| std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args)
+                .current_dir(&r).status().map(|s| s.success()).unwrap_or(false);
+            let ok = git(&["init", "-q", "-b", branch]) && git(&["commit", "-q", "--allow-empty", "-m", "init"]);
+            if !ok {
+                eprintln!("skipped: git init failed");
+                return;
+            }
+            assert_eq!(detect_git_branch(&r.to_string_lossy()), want, "branch {}", branch);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn own_process_group_is_readable() {
+        assert!(process_group_of(std::process::id()).is_some());
+    }
+
+    // ── Stop state machine ────────────────────────────────────────────────
+    fn app() -> App {
+        let mut a = App::default();
+        a.log_lines.clear();
+        a.service = None;
+        a
+    }
+    /// She is OURS: spawned by this launcher, follower attached, pid known.
+    fn ours(a: &mut App) {
+        a.sapphire_pid.store(4242, Ordering::Relaxed);
+        a.streaming_spawn = true;
+        a.sapphire_running = true;
+    }
+    fn logged(a: &App, needle: &str) -> bool {
+        a.log_lines.iter().any(|l| l.contains(needle))
+    }
+
+    #[test]
+    fn exit_43_when_not_stopping_marks_not_running() {
+        let mut a = app();
+        ours(&mut a);
+        let _ = a.update(Message::SapphireExited(Ok(Some(43))));
+        assert!(!a.sapphire_running && !a.streaming_spawn);
+        assert!(logged(&a, "Another Sapphire is already running"));
+    }
+
+    #[test]
+    fn exit_while_stopping_finishes_the_stop() {
+        let mut a = app();
+        ours(&mut a);
+        a.sapphire_stopping = true;
+        let _ = a.update(Message::SapphireExited(Ok(Some(1))));
+        assert!(logged(&a, "Sapphire stopped."));
+        assert!(!a.sapphire_stopping && !a.sapphire_running && !a.streaming_spawn);
+        assert_eq!(a.sapphire_pid.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn late_exit_after_a_forced_stop_is_ignored() {
+        let mut a = app();
+        a.streaming_spawn = false;
+        let _ = a.update(Message::SapphireExited(Ok(Some(1))));
+        assert!(a.log_lines.is_empty());
+    }
+
+    #[test]
+    fn stale_stop_timers_are_ignored() {
+        let mut a = app();
+        ours(&mut a);
+        a.sapphire_stopping = true;
+        a.stop_epoch = 5;
+        let _ = a.update(Message::StopTimeout(4));
+        let _ = a.update(Message::StopStillWaiting(4));
+        let _ = a.update(Message::StopSwept(4));
+        let _ = a.update(Message::StopSignalSent(false, 4));
+        assert!(a.log_lines.is_empty() && a.sapphire_stopping);
+    }
+
+    #[test]
+    fn begin_stop_runs_once_and_keeps_the_latest_continuation() {
+        let mut a = app();
+        ours(&mut a);
+        let _ = a.begin_stop(AfterStop::None);
+        assert!(a.sapphire_stopping && a.stop_epoch == 1 && a.streaming_spawn, "follower stays attached");
+        let _ = a.begin_stop(AfterStop::Update);
+        assert!(a.stop_epoch == 1 && matches!(a.after_stop, AfterStop::Update));
+        let _ = a.begin_stop(AfterStop::None);
+        assert!(matches!(a.after_stop, AfterStop::Update), "None never overrides a pending continuation");
+        assert_eq!(a.log_lines.iter().filter(|l| l.contains("Stopping Sapphire...")).count(), 1);
+    }
+
+    #[test]
+    fn forced_stop_finishes_and_runs_the_continuation() {
+        let mut a = app();
+        ours(&mut a);
+        a.sapphire_stopping = true;
+        a.stop_epoch = 1;
+        a.after_stop = AfterStop::Update;
+        let _ = a.update(Message::StopSwept(1));
+        assert!(logged(&a, "Sapphire stopped (forced)."));
+        assert!(logged(&a, "Starting update"));
+        assert!(!a.sapphire_stopping && !a.sapphire_running && matches!(a.after_stop, AfterStop::None));
+    }
+
+    #[test]
+    fn signal_failure_falls_back_to_force() {
+        let mut a = app();
+        ours(&mut a);
+        a.sapphire_stopping = true;
+        a.stop_epoch = 1;
+        let _ = a.update(Message::StopSignalSent(false, 1));
+        assert!(logged(&a, "forcing"));
+    }
+
+    #[test]
+    fn close_leaves_a_foreign_sapphire_alone() {
+        let mut a = app();
+        a.sapphire_running = true; // health-detected, not spawned by us
+        let _ = a.update(Message::CloseRequested(window::Id::unique()));
+        assert!(!a.sapphire_stopping && !logged(&a, "Closing"));
+    }
+
+    #[test]
+    fn close_stops_our_sapphire_first() {
+        let mut a = app();
+        ours(&mut a);
+        let _ = a.update(Message::CloseRequested(window::Id::unique()));
+        assert!(a.sapphire_stopping && matches!(a.after_stop, AfterStop::Close(_)));
+        assert!(logged(&a, "Closing: stopping Sapphire first"));
+    }
+
+    #[test]
+    fn stop_confirmed_false_keeps_her_shown_as_running() {
+        let mut a = app();
+        a.sapphire_running = true;
+        a.sapphire_stopping = true;
+        let _ = a.update(Message::SapphireStopConfirmed(false));
+        assert!(a.sapphire_running && !a.sapphire_stopping && logged(&a, "didn't stop"));
+    }
+
+    #[test]
+    fn startup_probe_marks_an_external_instance() {
+        let mut a = app();
+        let _ = a.update(Message::LaunchPreCheck(true));
+        assert!(a.sapphire_running);
+        assert!(a.sapphire_log.iter().any(|l| l.contains("started outside this app")));
+        let mut b = app();
+        let _ = b.update(Message::LaunchPreCheck(false));
+        assert!(!b.sapphire_running);
+    }
 }

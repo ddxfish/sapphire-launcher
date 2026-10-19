@@ -3181,7 +3181,7 @@ dependencies = [
 
 [[package]]
 name = "sapphire-launcher"
-version = "0.1.0"
+version = "0.9.6"
 dependencies = [
  "futures",
  "iced",

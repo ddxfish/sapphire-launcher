@@ -1,12 +1,12 @@
 // Platform seam: all OS divergence (paths, exec, browser/file open, process kill).
-#[cfg(windows)] use crate::CREATE_NO_WINDOW;
 use std::path::PathBuf;
 use std::process::Command;
 
 // ── Platform seam ───────────────────────────────────────────────────────────
 // All OS divergence lives here. Callers stay OS-agnostic. Windows branches
 // preserve existing behavior byte-for-byte; the Linux branches are the new path.
-// (find_git / find_conda / find_conda_pip live further down, also #[cfg]-split.)
+// (run_cmd_* exec helpers and find_git / find_conda / find_conda_pip live at the
+// bottom, also #[cfg]-split.)
 
 /// Absolute path to the sapphire env's python (for a systemd ExecStart). None if
 /// the env isn't there. Linux only (the service tab is Linux for now).
@@ -20,8 +20,6 @@ pub(crate) fn sapphire_env_python() -> Option<String> {
     .into_iter()
     .find(|p| PathBuf::from(p).exists())
 }
-#[cfg(windows)]
-pub(crate) fn sapphire_env_python() -> Option<String> { None }
 
 /// Windows: the env's windowless interpreter (pythonw.exe) for the autostart wrapper —
 /// no console flashes at logon. None if the env isn't there.
@@ -69,20 +67,20 @@ pub(crate) fn autostart_log_path() -> PathBuf {
 pub(crate) fn app_config_dir() -> PathBuf {
     #[cfg(windows)]
     {
-        if let Ok(appdata) = std::env::var("APPDATA") {
-            if !appdata.is_empty() {
-                return PathBuf::from(appdata).join("Sapphire");
-            }
+        if let Ok(appdata) = std::env::var("APPDATA")
+            && !appdata.is_empty()
+        {
+            return PathBuf::from(appdata).join("Sapphire");
         }
         PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()))
             .join("AppData").join("Roaming").join("Sapphire")
     }
     #[cfg(not(windows))]
     {
-        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-            if !xdg.is_empty() {
-                return PathBuf::from(xdg).join("sapphire");
-            }
+        if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME")
+            && !xdg.is_empty()
+        {
+            return PathBuf::from(xdg).join("sapphire");
         }
         PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
             .join(".config").join("sapphire")
@@ -257,6 +255,7 @@ pub(crate) fn kill_process_tree(pid: u32) {
 
 /// Create a Command that won't flash a console window on Windows
 pub(crate) fn hidden_cmd(program: &str) -> Command {
+    #[allow(unused_mut)] // mutated on Windows only
     let mut cmd = Command::new(program);
     #[cfg(target_os = "windows")]
     {
@@ -264,4 +263,199 @@ pub(crate) fn hidden_cmd(program: &str) -> Command {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
+}
+
+// ── Exec helpers (moved from main.rs) ─────────────────────────────────────
+
+#[cfg(windows)]
+pub(crate) const CREATE_NO_WINDOW: u32 = 0x08000000;
+/// Windows: the spawned runner becomes its own process group (pid = group id) so
+/// Stop can send CTRL_BREAK to it and everything it spawned.
+#[cfg(windows)]
+pub(crate) const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+
+
+/// Run a command on a background thread so it doesn't freeze the UI.
+pub(crate) async fn run_cmd_async(program: String, args: Vec<String>) -> Result<String, String> {
+    let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
+        let mut cmd = Command::new(&program);
+        cmd.args(&args);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        cmd.output()
+            .map(|out| {
+                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                if out.status.success() {
+                    Ok(stdout)
+                } else if stderr.is_empty() {
+                    Err(format!("Exit code {}", out.status.code().unwrap_or(-1)))
+                } else {
+                    Err(stderr)
+                }
+            })
+            .unwrap_or_else(|e| Err(e.to_string()))
+    })
+    .await;
+    result.map_err(|e| e.to_string())?
+}
+
+
+
+
+/// Run a command on a background thread, returning combined stdout+stderr for logging
+pub(crate) async fn run_cmd_full_async(program: String, args: Vec<String>) -> Result<String, String> {
+    let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
+        let mut cmd = Command::new(&program);
+        cmd.args(&args);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        match cmd.output() {
+            Ok(out) => {
+                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+                let combined = format!("{}{}", stdout, stderr).trim().to_string();
+                if out.status.success() {
+                    Ok(combined)
+                } else {
+                    Err(combined)
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await;
+    result.map_err(|e| e.to_string())?
+}
+
+
+/// Find git executable on disk (Linux: rely on PATH).
+#[cfg(not(windows))]
+pub(crate) fn find_git() -> String {
+    if let Ok(out) = std::process::Command::new("which").arg("git").output()
+        && out.status.success()
+    {
+        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !p.is_empty() && PathBuf::from(&p).exists() {
+            return p;
+        }
+    }
+    "git".into()
+}
+
+/// Find git executable on disk
+#[cfg(windows)]
+pub(crate) fn find_git() -> String {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let common_paths = [
+        "C:\\Program Files\\Git\\cmd\\git.exe".to_string(),
+        "C:\\Program Files (x86)\\Git\\cmd\\git.exe".to_string(),
+        "C:\\Program Files\\Git\\bin\\git.exe".to_string(),
+        format!("{}\\AppData\\Local\\Programs\\Git\\cmd\\git.exe", home),
+        format!("{}\\scoop\\shims\\git.exe", home),
+        format!("{}\\AppData\\Local\\GitHubDesktop\\app\\resources\\app\\git\\cmd\\git.exe", home),
+    ];
+    for p in &common_paths {
+        if PathBuf::from(p).exists() {
+            return p.clone();
+        }
+    }
+    // Try refreshing PATH from registry and searching there
+    if let Ok(output) = hidden_cmd("cmd")
+        .args(["/c", "where", "git"])
+        .output()
+        && output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout);
+            if let Some(first_line) = path.lines().next() {
+                let p = first_line.trim();
+                if !p.is_empty() && PathBuf::from(p).exists() {
+                    return p.to_string();
+                }
+            }
+        }
+    "git".into() // final fallback
+}
+
+/// Find conda executable on disk
+#[cfg(windows)]
+pub(crate) fn find_conda() -> String {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let conda_paths = [
+        format!("{}\\miniconda3\\Scripts\\conda.exe", home),
+        format!("{}\\Miniconda3\\Scripts\\conda.exe", home),
+        format!("{}\\anaconda3\\Scripts\\conda.exe", home),
+        format!("{}\\Anaconda3\\Scripts\\conda.exe", home),
+    ];
+    for p in &conda_paths {
+        if PathBuf::from(p).exists() {
+            return p.clone();
+        }
+    }
+    "conda".into() // fallback to PATH
+}
+
+/// Find conda executable on disk (Linux locations, then PATH).
+#[cfg(not(windows))]
+pub(crate) fn find_conda() -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let conda_paths = [
+        format!("{}/miniconda3/bin/conda", home),
+        format!("{}/anaconda3/bin/conda", home),
+        "/opt/miniconda3/bin/conda".to_string(),
+        "/opt/anaconda3/bin/conda".to_string(),
+    ];
+    for p in &conda_paths {
+        if PathBuf::from(p).exists() {
+            return p.clone();
+        }
+    }
+    if let Ok(out) = std::process::Command::new("which").arg("conda").output()
+        && out.status.success()
+    {
+        let p = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !p.is_empty() && PathBuf::from(&p).exists() {
+            return p;
+        }
+    }
+    "conda".into() // fallback to PATH
+}
+
+#[cfg(windows)]
+pub(crate) fn find_conda_pip() -> (String, Vec<String>) {
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    let pip_paths = [
+        format!("{}\\miniconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
+        format!("{}\\Miniconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
+        format!("{}\\anaconda3\\envs\\sapphire\\Scripts\\pip.exe", home),
+    ];
+    for p in &pip_paths {
+        if PathBuf::from(p).exists() {
+            return (p.clone(), vec![]);
+        }
+    }
+    // Fallback to conda run
+    (find_conda(), vec!["run".into(), "-n".into(), "sapphire".into(), "pip".into()])
+}
+
+/// Find pip in the conda sapphire env directly (Linux), else `conda run`.
+#[cfg(not(windows))]
+pub(crate) fn find_conda_pip() -> (String, Vec<String>) {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let pip_paths = [
+        format!("{}/miniconda3/envs/sapphire/bin/pip", home),
+        format!("{}/anaconda3/envs/sapphire/bin/pip", home),
+    ];
+    for p in &pip_paths {
+        if PathBuf::from(p).exists() {
+            return (p.clone(), vec![]);
+        }
+    }
+    // Fallback to conda run
+    (find_conda(), vec!["run".into(), "-n".into(), "sapphire".into(), "pip".into()])
 }

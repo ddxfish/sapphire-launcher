@@ -4,6 +4,9 @@ use crate::platform::*;
 use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
 use tokio::io::BufReader;
 
+// Service mode is Linux-only today (Windows detect returns None), so on Windows the
+// fields the Autostart view reads are never read.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct ServiceInfo {
     pub(crate) active: bool,            // ActiveState == "active" (running now)
@@ -143,11 +146,10 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
     // See platform::autostart_shim_path for the full why.
     let shim = autostart_shim_path();
     let log = autostart_log_path();
-    if let Some(parent) = shim.parent() {
-        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+    if let Some(parent) = shim.parent()
+        && let Err(e) = tokio::fs::create_dir_all(parent).await {
             return (format!("Couldn't create the autostart folder: {}", e), false);
         }
-    }
     // Poor-man's log rotation: truncate the logfile on each Enable so it can't grow
     // unboundedly across re-enables. The shim still opens it in append mode, so logs
     // accumulate within a single logon session (across main.py's crash-restarts).
@@ -262,8 +264,6 @@ pub(crate) async fn write_env_file(content: String) -> bool {
     let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     true
 }
-#[cfg(windows)]
-pub(crate) async fn write_env_file(_content: String) -> bool { false }
 
 /// Run a command, streaming each output line into `sink` (drained to the launcher
 /// log by the Tick handler). Spin-safe: a normal awaited future, not a Task::stream.
