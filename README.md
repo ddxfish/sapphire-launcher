@@ -11,9 +11,9 @@ Sapphire Launcher handles everything so you don't have to touch a terminal. One 
 
 - **Install** — Sets up everything Sapphire needs: Git, Miniconda, a dedicated Python environment, clones the repo, and installs all dependencies. Just click Go.
 - **Update** — Pull the latest changes and update dependencies with one button. Handles dirty repos by auto-stashing your changes.
-- **Launch** — Start Sapphire and see its live output in the Log tab. Open Browser button takes you straight to the web UI.
+- **Launch** — Start Sapphire and see its live output in the Log tab. She keeps running when you close the launcher; open it again and it picks her back up (live log, Stop). Open Browser takes you straight to the web UI.
 - **Branch Switching** — Switch between Stable (main) and Development (dev) branches from the dropdown. Auto-stops and restarts Sapphire if needed.
-- **Autostart** — Optionally launch Sapphire when you log in. On Linux it can install Sapphire as a systemd user service with custom environment variables.
+- **Autostart** — Optionally launch Sapphire when you log in. On Windows a logon task starts her exactly the way Launch does, so the launcher can follow and stop her. On Linux it can install Sapphire as a systemd user service with custom environment variables.
 - **Troubleshoot** — Checks if Sapphire is responding and the web UI loads, runs `pip check` on her packages, scans optional voice features (STT/TTS/Wake Word), checks that every enabled plugin has its packages, and detects your GPU(s). Install/Fix buttons stream their output into the log; they wait for Sapphire to be stopped.
 - **Uninstall** — Quick resets for password and API keys. Danger zone for removing the conda environment, user data, or the entire install.
 
@@ -21,7 +21,7 @@ Sapphire Launcher handles everything so you don't have to touch a terminal. One 
 
 - Single file, no installer needed
 - Finds Git, Conda, and pip on disk automatically (no PATH dependency)
-- Detects if Sapphire is already running on startup
+- Finds a Sapphire that is already running (autostart, a terminal, an earlier launcher), follows her log and can stop her
 - Update checker with badge indicator
 - Persists your install path and branch between sessions
 - Collapsible launcher log panel
@@ -85,6 +85,6 @@ cargo test
 - **Rust** with **Iced 0.13** for the GUI, software-rendered via tiny-skia (no wgpu / GPU driver dependency)
 - Async command execution via Tokio
 - Source modules: `src/main.rs` (app state + message loop), `src/ui.rs`, `src/install.rs`, `src/troubleshoot.rs`, `src/service.rs`, `src/platform.rs`
-- Config stored alongside Sapphire's own: `%APPDATA%\Sapphire\launcher.json` on Windows, `$XDG_CONFIG_HOME/sapphire/launcher.json` (or `~/.config/sapphire/launcher.json`) on Linux
+- Config stored alongside Sapphire's own: `%APPDATA%\Sapphire\launcher.json` on Windows, `$XDG_CONFIG_HOME/sapphire/launcher.json` (or `~/.config/sapphire/launcher.json`) on Linux. Her console output from Launch/autostart goes to `sapphire-launcher.log` in the same folder (core's own `user/logs/sapphire.log` is unaffected); `sapphire-run.json` there is how a reopened launcher finds her
 </content>
 </invoke>

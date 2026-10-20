@@ -6,7 +6,7 @@ use iced::widget::text_editor;
 use iced::{color, Subscription, Task, Theme};
 use iced::window;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, atomic::{AtomicU32, Ordering}};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 mod ui;
@@ -119,18 +119,18 @@ fn main() -> iced::Result {
         })
         .subscription(App::subscription)
         .window(win_settings)
-        // We handle close ourselves: stop the Sapphire we launched, then exit.
-        .exit_on_close_request(false)
+        // Closing the window just closes it: Sapphire is started detached and keeps
+        // running (the launcher is an assistant, not a parent).
         .run_with(|| {
             let app = App::default();
             let path = app.install_path.clone();
             let branch = app.selected_branch.unwrap_or(Branch::Stable);
-            let port = app.web_port;
             #[cfg(windows)]
             let shim_path = path.clone();
             #[allow(unused_mut)] // Windows pushes the autostart check below
             let mut tasks = vec![
-                // Detect a systemd --user service (Linux) → flips into service mode
+                // Detect a systemd --user service (Linux) → flips into service mode.
+                // Without one, ServiceDetected asks whether she is running anyway.
                 Task::perform(
                     async { tokio::task::spawn_blocking(detect_sapphire_service).await.unwrap_or(None) },
                     Message::ServiceDetected,
@@ -140,8 +140,6 @@ fn main() -> iced::Result {
                     async { tokio::task::spawn_blocking(systemd_user_available).await.unwrap_or(false) },
                     Message::SystemdChecked,
                 ),
-                // Check if sapphire is already running
-                Task::perform(health_up(port, 3), Message::LaunchPreCheck),
                 // Check for updates (Sapphire's repo, and the launcher's own releases)
                 Task::perform(
                     check_for_updates(path, branch),
@@ -282,7 +280,9 @@ struct App {
     sapphire_running: bool,
     sapphire_stopping: bool,
     sapphire_log: Vec<String>,
-    sapphire_pid: Arc<AtomicU32>,
+    // Who she is — pid, who started her, where her output goes. Some while she runs
+    // (or is stopping), None otherwise. Her pid is 0 for a moment after Launch.
+    attached: Option<Instance>,
     // When Launch was last clicked: a double-click's second click lands on Stop.
     launched_at: Option<Instant>,
     // Linux systemd --user service (None on Windows / when no unit is detected)
@@ -291,11 +291,13 @@ struct App {
     streaming_journal: bool,
     // Bumped on each (re)start so iced treats the follower as a fresh subscription.
     journal_epoch: usize,
-    // Spawn-mode log follower (when WE launched Sapphire, not a systemd unit). Same
-    // shape as the journal one: a Subscription (so iced parks it when idle), with an
-    // epoch bumped on each launch to force a fresh follower.
-    streaming_spawn: bool,
-    spawn_epoch: usize,
+    // We hold the Child of a Sapphire this launcher started, so her exit notice comes
+    // to us. A Subscription keyed on child_epoch starts her (detached) and waits.
+    holding_child: bool,
+    child_epoch: usize,
+    // The file tail feeding the Log tab (her launch log, or core's own log for an
+    // instance started elsewhere); bumped whenever the source changes.
+    tail_epoch: usize,
     // Stop flow (spawn mode): bumped per Stop so late timers/sweeps from an older
     // stop are ignored, and what to do once she is actually down.
     stop_epoch: usize,
@@ -361,13 +363,14 @@ impl Default for App {
             sapphire_running: false,
             sapphire_stopping: false,
             sapphire_log: Vec::new(),
-            sapphire_pid: Arc::new(AtomicU32::new(0)),
+            attached: None,
             launched_at: None,
             service: None,
             streaming_journal: false,
             journal_epoch: 0,
-            streaming_spawn: false,
-            spawn_epoch: 0,
+            holding_child: false,
+            child_epoch: 0,
+            tail_epoch: 0,
             stop_epoch: 0,
             after_stop: AfterStop::None,
             web_port: port,
@@ -414,14 +417,14 @@ const BRANCHES: &[Branch] = &[Branch::Stable, Branch::Development];
 
 // ── Messages ───────────────────────────────────────────────────────────────
 
-/// What a Stop was for — runs once Sapphire is actually down.
+/// What a Stop was for — runs once Sapphire is actually down. (Closing the window
+/// is not one: she keeps running.)
 #[derive(Debug, Clone, Copy, Default)]
 enum AfterStop {
     #[default]
     None,
     Update,
     SwitchBranch,
-    Close(window::Id),
 }
 
 #[derive(Debug, Clone)]
@@ -448,17 +451,16 @@ enum Message {
     OpenRunLog,
     ScrollRunLog,
     // Launch
-    LaunchPreCheck(bool),   // startup probe: is a Sapphire already up (started outside this app)?
-    HealthPoll,             // periodic: is an out-of-band Sapphire up? (e.g. autostart)
-    HealthResult(bool),     // result of the periodic health poll
+    InstancePoll,                    // startup + every 5 s: is a Sapphire running on this install?
+    InstanceFound(Option<Instance>), // the answer (None = nobody we can vouch for)
+    SapphireStarted(u32),            // our detached runner is up: its pid
     SapphireLines(Vec<String>), // a coalesced batch of log lines (burst-safe)
     SapphireExited(Result<Option<i32>, String>), // runner ended: Ok(exit code) / Err(never started)
-    SapphireStopConfirmed(bool),  // health probe after a sweep/service stop: false = still up
+    SapphireStopConfirmed(bool),  // pid watch / health probe after a stop: false = still up
     StopSignalSent(bool, usize),  // (sent_ok, stop_epoch): the graceful signal went out (or not)
     StopStillWaiting(usize),      // 15 s into a stop: reassure the user
     StopTimeout(usize),           // 100 s into a stop: force it
-    StopSwept(usize),             // the hard kill finished
-    CloseRequested(window::Id),   // user closed the window
+    StopSwept(usize, bool),       // the hard kill finished; true = she is still there
     // Uninstall flow (two-click confirmation)
     ResetPassword,
     ResetCredentials,
@@ -550,12 +552,59 @@ async fn health_up(port: u16, timeout_s: u32) -> bool {
 }
 
 /// Poll the health endpoint every 500 ms until it stops answering (true) or `tries`
-/// run out (false). Confirms a stop when no exit notice can come (service mode, or
-/// an instance we didn't spawn).
+/// run out (false). Confirms a stop when there is no pid to watch (service mode, or
+/// an old core found on the web port only).
 async fn wait_health_down(port: u16, tries: usize) -> bool {
     for _ in 0..tries {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if !health_up(port, 2).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is a Sapphire running on this install? `find_instance` (core's lock + our
+/// handshake, pid identity-checked) first — it sees her during boot, when the port
+/// is blind. When the install has no lock file at all (a core from before
+/// 2026-10-16, which Stable still is) the web port is asked as before, and a yes is
+/// an instance with pid 0: shown as running, followed through core's log, stopped
+/// by the sweep. Off the UI thread.
+async fn instance_lookup(install: String, port: u16) -> Option<Instance> {
+    let i = install.clone();
+    let (found, has_lock) = tokio::task::spawn_blocking(move || (find_instance(&i), lock_path(&i).exists()))
+        .await
+        .unwrap_or((None, true));
+    match (found, has_lock) {
+        (Some(inst), _) => Some(inst),
+        (None, true) => None,
+        (None, false) => health_up(port, 3).await.then(|| Instance {
+            pid: 0,
+            since: String::new(),
+            origin: Origin::Elsewhere,
+            log: core_log_path(&install),
+        }),
+    }
+}
+
+/// `msg`, `secs` seconds from when iced starts the Task. The sleep is built inside
+/// the future: `tokio::time::sleep` wants a runtime the moment it is called, and
+/// `update()` has one only because iced enters it (the tests don't).
+fn after(secs: u64, msg: Message) -> Task<Message> {
+    Task::perform(
+        async move { tokio::time::sleep(std::time::Duration::from_secs(secs)).await },
+        move |_| msg.clone(),
+    )
+}
+
+/// Watch a pid we signalled until it is gone (true) or `tries` × 500 ms run out
+/// (false). Gone = no longer alive-and-hers, so a recycled number reads as gone.
+/// Waits a moment after, so the log tail has shown her last lines.
+async fn wait_pid_gone(pid: u32, tries: usize) -> bool {
+    for _ in 0..tries {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        if !tokio::task::spawn_blocking(move || pid_is_hers(pid)).await.unwrap_or(true) {
+            tokio::time::sleep(std::time::Duration::from_millis(700)).await;
             return true;
         }
     }
@@ -583,6 +632,7 @@ impl App {
                     // An armed "YES, delete" must never carry over to a new folder,
                     // and the scan on screen was for the old one.
                     self.disarm_confirms();
+                    self.let_go_of_found();
                     if !self.installing && !self.scanning {
                         for (_, status) in &mut self.steps { *status = StepStatus::NotStarted; }
                     }
@@ -657,32 +707,26 @@ impl App {
 
                 // Just start her. If another Sapphire already holds this user/, core
                 // says so and exits 43 within a second — SapphireExited shows the line.
-                // (The health probe is blind for the whole boot, so it can't be the gate.)
-                // The follower is a Subscription keyed on spawn_epoch; flipping
-                // streaming_spawn on (and bumping the epoch) starts a fresh process + log stream.
+                // The child follower is a Subscription keyed on child_epoch: flipping
+                // holding_child on (and bumping the epoch) starts her, detached.
+                // SapphireStarted brings her pid and starts the log tail.
                 self.sapphire_running = true;
                 self.sapphire_log.clear();
                 self.active_tab = Tab::Running;
                 self.log_lines.push("Launching Sapphire...".to_string());
-                self.streaming_spawn = true;
-                self.spawn_epoch += 1;
+                self.attached = Some(Instance { pid: 0, since: String::new(), origin: Origin::Launcher, log: launch_log_path() });
+                self.holding_child = true;
+                self.child_epoch += 1;
                 self.launched_at = Some(Instant::now());
                 Task::none()
             }
-            Message::LaunchPreCheck(already_running) => {
-                // Startup probe only. Service mode: ServiceDetected owns the running
-                // state (the probe is blind while she boots, so it must not flip it).
-                if self.service.is_some() {
-                    return Task::none();
-                }
-                if already_running {
-                    self.sapphire_running = true;
-                    self.sapphire_log.clear();
-                    self.sapphire_log.push("Sapphire is already running (started outside this app).".into());
-                    self.sapphire_log.push("".into());
-                    self.sapphire_log.push("No live logs available for this session.".into());
-                    self.sapphire_log.push("To see logs: click Stop, then Launch again.".into());
-                    self.log_lines.push("Sapphire already running.".to_string());
+            Message::SapphireStarted(pid) => {
+                // Our detached runner is up and her log file is fresh: follow it.
+                if self.holding_child
+                    && let Some(i) = self.attached.as_mut()
+                {
+                    i.pid = pid;
+                    self.tail_epoch += 1;
                 }
                 Task::none()
             }
@@ -848,8 +892,8 @@ impl App {
                 Task::none()
             }
             Message::SapphireExited(result) => {
-                // A late notice from a follower we already closed (forced stop): ignore.
-                if !self.streaming_spawn {
+                // Only the Child we hold reports exits; anything else is stale.
+                if !self.holding_child {
                     return Task::none();
                 }
                 let msg = exit_message(result, self.sapphire_stopping);
@@ -859,8 +903,8 @@ impl App {
                     self.finish_stop()
                 } else {
                     self.sapphire_running = false;
-                    self.streaming_spawn = false;
-                    self.sapphire_pid.store(0, Ordering::Relaxed);
+                    self.holding_child = false;
+                    self.attached = None;
                     Task::none()
                 }
             }
@@ -872,16 +916,13 @@ impl App {
                     self.log_lines.push("Sapphire stopped.".to_string());
                     return self.finish_stop();
                 }
-                // Still answering after the grace window (e.g. an elevated instance we
-                // can't touch). Keep her shown as running so the button stays Stop; a
-                // pending window close still closes.
+                // Still there after the grace window (e.g. an elevated instance we
+                // can't touch). Keep her shown as running so the button stays Stop.
                 self.sapphire_stopping = false;
                 self.sapphire_running = true;
+                self.after_stop = AfterStop::None;
                 self.log_lines.push("Sapphire didn't stop — it may be running with admin rights. Try Stop again.".to_string());
-                match std::mem::take(&mut self.after_stop) {
-                    AfterStop::Close(id) => window::close(id),
-                    _ => Task::none(),
-                }
+                Task::none()
             }
             Message::StopSignalSent(sent, epoch) => {
                 if !self.sapphire_stopping || epoch != self.stop_epoch {
@@ -891,12 +932,21 @@ impl App {
                     self.log_lines.push("Couldn't signal Sapphire to stop — forcing it.".to_string());
                     return self.force_stop(epoch);
                 }
-                // She got the signal; SapphireExited arrives when the runner is gone
-                // (normally ~8 s). Reassure at 15 s, force at 100 s (core's worst case).
-                Task::batch(vec![
-                    Task::perform(tokio::time::sleep(std::time::Duration::from_secs(15)), move |_| Message::StopStillWaiting(epoch)),
-                    Task::perform(tokio::time::sleep(std::time::Duration::from_secs(100)), move |_| Message::StopTimeout(epoch)),
-                ])
+                // She got the signal. Her end reaches us as SapphireExited when we hold
+                // her Child, else as SapphireStopConfirmed from a pid watch (normally
+                // ~8 s either way). Reassure at 15 s, force at 100 s (core's worst case).
+                let mut tasks = vec![
+                    after(15, Message::StopStillWaiting(epoch)),
+                    after(100, Message::StopTimeout(epoch)),
+                ];
+                if !self.holding_child
+                    && let Some(pid) = self.attached.as_ref().map(|i| i.pid).filter(|p| *p > 0)
+                {
+                    // Outlasts the force timer on purpose: whichever notices her end
+                    // first finishes the stop; the other finds it over and is ignored.
+                    tasks.push(Task::perform(wait_pid_gone(pid, 220), Message::SapphireStopConfirmed));
+                }
+                Task::batch(tasks)
             }
             Message::StopStillWaiting(epoch) => {
                 if self.sapphire_stopping && epoch == self.stop_epoch {
@@ -911,53 +961,64 @@ impl App {
                 self.log_lines.push("Sapphire didn't stop in time — forcing it.".to_string());
                 self.force_stop(epoch)
             }
-            Message::StopSwept(epoch) => {
-                // Normally the runner's exit notice finished the stop seconds ago and
-                // this is stale. Still stopping 3 s after a SIGKILL/taskkill means she
-                // survived it — say so instead of pretending.
+            Message::StopSwept(epoch, alive) => {
+                // With her Child held, the exit notice normally finished the stop
+                // seconds ago and this is stale. Otherwise the kill's own look says
+                // whether she is gone — and a Sapphire still there 3 s after a
+                // SIGKILL/taskkill survived it: say so instead of pretending.
                 if !self.sapphire_stopping || epoch != self.stop_epoch {
                     return Task::none();
                 }
+                if !alive {
+                    self.log_lines.push("Sapphire stopped (forced).".to_string());
+                    return self.finish_stop();
+                }
                 self.sapphire_stopping = false;
                 self.sapphire_running = true;
+                self.after_stop = AfterStop::None;
                 self.log_lines.push("Couldn't force Sapphire to stop — she may be running with admin rights or as another user. Check for python processes yourself.".to_string());
-                match std::mem::take(&mut self.after_stop) {
-                    AfterStop::Close(id) => window::close(id),
-                    _ => Task::none(),
-                }
+                Task::none()
             }
-            Message::CloseRequested(id) => {
-                // Close stops the Sapphire WE launched (she lives while the window lives).
-                // A systemd unit or an instance started elsewhere is left alone.
-                // (A service-mode stop in flight finishes on its own: closing is safe.)
-                // "Ours" is the spawn follower + a pid — a unit detected later doesn't
-                // change who started her.
-                let ours = self.streaming_spawn && self.sapphire_pid.load(Ordering::Relaxed) > 0;
-                if !ours {
-                    return window::close(id);
-                }
-                if self.sapphire_stopping {
-                    self.log_lines.push("Closing once Sapphire has stopped...".to_string());
-                }
-                self.begin_stop(AfterStop::Close(id))
-            }
-            Message::HealthPoll => {
-                // Skip when our own flows already own the running-state.
-                if self.streaming_spawn || self.sapphire_stopping {
+            Message::InstancePoll => {
+                // Skip while our own flows own the running state.
+                if self.holding_child || self.sapphire_stopping {
                     return Task::none();
                 }
-                // Service mode: ask systemd, not the health endpoint (blind during boot).
+                // Service mode: ask systemd — the unit is the truth there.
                 if self.service.is_some() {
                     return Task::perform(
                         async { tokio::task::spawn_blocking(detect_sapphire_service).await.unwrap_or(None) },
                         Message::ServiceRefreshed,
                     );
                 }
-                Task::perform(health_up(self.web_port, 3), Message::HealthResult)
+                Task::perform(instance_lookup(self.install_path.clone(), self.web_port), Message::InstanceFound)
             }
-            Message::HealthResult(running) => {
-                if !self.streaming_spawn && !self.sapphire_stopping && self.service.is_none() {
-                    self.sapphire_running = running;
+            Message::InstanceFound(found) => {
+                if self.holding_child || self.sapphire_stopping || self.service.is_some() {
+                    return Task::none();
+                }
+                let same = match (&found, &self.attached) {
+                    (Some(i), Some(c)) => c.pid == i.pid && c.log == i.log,
+                    _ => false,
+                };
+                match found {
+                    Some(_) if same => self.sapphire_running = true, // the same her, still there
+                    Some(inst) => {
+                        // Found her (autostart, a terminal, an earlier launcher): say
+                        // who she is and follow her log.
+                        self.sapphire_running = true;
+                        self.sapphire_log.clear();
+                        self.log_lines.push(format!("{}.", inst.describe()));
+                        self.attached = Some(inst);
+                        self.tail_epoch += 1;
+                    }
+                    None if self.attached.is_some() => {
+                        self.sapphire_running = false;
+                        self.attached = None;
+                        self.sapphire_log.push("--- Sapphire is no longer running. ---".to_string());
+                        self.log_lines.push("Sapphire is no longer running.".to_string());
+                    }
+                    None => {}
                 }
                 Task::none()
             }
@@ -1334,6 +1395,11 @@ impl App {
             Message::ServiceDetected(info) => {
                 let mut tasks: Vec<Task<Message>> = vec![self.env_reload(&info)];
                 self.service = info.clone();
+                if info.is_none() {
+                    // No unit: is she running anyway (autostart, a terminal, an
+                    // earlier launcher)? Asked now, then every 5 s.
+                    tasks.push(Task::done(Message::InstancePoll));
+                }
                 if let Some(info) = info {
                     self.log_lines.push(format!("Detected sapphire.service ({}).", info.sub_state));
                     // Is the unit itself in shape (stop contract, paths still valid)?
@@ -1607,6 +1673,15 @@ impl App {
         self.confirm_reset_keys = false;
     }
 
+    /// A Sapphire we only found (not started) belongs to the folder we found her in:
+    /// drop her when the path changes; the next poll looks at the new folder.
+    fn let_go_of_found(&mut self) {
+        if !self.holding_child && !self.sapphire_stopping && self.attached.is_some() {
+            self.attached = None;
+            self.sapphire_running = false;
+        }
+    }
+
     /// Why a destructive action can't run right now (None = go ahead): she must be
     /// down, and — for the folder deletes — the path must really be a Sapphire install.
     fn uninstall_blocker(&self, needs_install: bool) -> Option<String> {
@@ -1640,9 +1715,10 @@ impl App {
         }
     }
 
-    /// The one stop path — Stop button, branch switch, update, window close.
-    /// Signals first (SIGTERM / CTRL_BREAK) and waits for the runner to exit; the
-    /// hard kill is only the fallback. Nothing here blocks the UI thread.
+    /// The one stop path — Stop button, branch switch, update. Signals first
+    /// (SIGTERM / CTRL_BREAK, by pid: our Child's or the one core's lock names) and
+    /// waits for the runner to be gone; the hard kill is only the fallback. Nothing
+    /// here blocks the UI thread.
     fn begin_stop(&mut self, after: AfterStop) -> Task<Message> {
         if self.sapphire_stopping {
             // A stop is already in flight: just update what happens afterwards.
@@ -1651,8 +1727,8 @@ impl App {
             }
             return Task::none();
         }
-        let pid = self.sapphire_pid.load(Ordering::Relaxed);
-        if self.streaming_spawn && pid == 0 {
+        let pid = self.attached.as_ref().map_or(0, |i| i.pid);
+        if self.holding_child && pid == 0 {
             // Launched a moment ago and the runner hasn't reported its pid yet: there
             // is nothing to signal, and the sweep would hit every sapphire-env python.
             self.log_lines.push("Sapphire is still starting — try again in a moment.".to_string());
@@ -1667,14 +1743,13 @@ impl App {
             AfterStop::None => "Stopping Sapphire...",
             AfterStop::Update => "Stopping Sapphire for the update...",
             AfterStop::SwitchBranch => "Stopping Sapphire for the branch switch...",
-            AfterStop::Close(_) => "Closing: stopping Sapphire first...",
         }.to_string());
 
-        // Ours (we spawned her: follower attached, pid known): ask nicely. The
-        // follower stays attached, so SapphireExited arrives when the runner is
-        // gone. Off the UI thread. Checked before service mode on purpose — a unit
+        // A pid (our Child's, or the one her lock names): ask nicely. Her end comes
+        // back as SapphireExited (Child held) or through the pid watch StopSignalSent
+        // starts. Off the UI thread. Checked before service mode on purpose — a unit
         // detected after a Launch doesn't change who started this one.
-        if self.streaming_spawn && pid > 0 {
+        if pid > 0 {
             return Task::perform(
                 async move { tokio::task::spawn_blocking(move || signal_stop(pid)).await.unwrap_or(false) },
                 move |sent| Message::StopSignalSent(sent, epoch),
@@ -1693,8 +1768,8 @@ impl App {
             );
         }
 
-        // Not ours (started outside this app): no runner to signal and no exit
-        // notice coming. Sweep, then confirm through the health probe.
+        // No pid to name (an old core started elsewhere, found on the web port only):
+        // sweep, then confirm through the port.
         Task::perform(
             async move {
                 let _ = tokio::task::spawn_blocking(|| kill_process_tree(0)).await;
@@ -1704,17 +1779,24 @@ impl App {
         )
     }
 
-    /// Hard kill (tree + sweep) off the UI thread. The runner's exit notice is what
-    /// finishes the stop — the follower is still attached and reports the kill like
-    /// any other exit. StopSwept, 3 s later, only reports a kill that did not take.
+    /// Hard kill off the UI thread — her tree by pid, the sweep only when no pid is
+    /// known — then a look 3 s later: is she still there? With her Child held, the
+    /// runner's exit notice normally finishes the stop first and StopSwept finds it
+    /// over; otherwise StopSwept's answer finishes it, or reports a kill that did not take.
     fn force_stop(&mut self, epoch: usize) -> Task<Message> {
-        let pid = self.sapphire_pid.load(Ordering::Relaxed);
+        let pid = self.attached.as_ref().map_or(0, |i| i.pid);
+        let port = self.web_port;
         Task::perform(
             async move {
                 let _ = tokio::task::spawn_blocking(move || kill_process_tree(pid)).await;
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                if pid > 0 {
+                    tokio::task::spawn_blocking(move || pid_is_hers(pid)).await.unwrap_or(true)
+                } else {
+                    health_up(port, 2).await
+                }
             },
-            move |_| Message::StopSwept(epoch),
+            move |alive| Message::StopSwept(epoch, alive),
         )
     }
 
@@ -1738,13 +1820,12 @@ impl App {
     fn finish_stop(&mut self) -> Task<Message> {
         self.sapphire_stopping = false;
         self.sapphire_running = false;
-        self.streaming_spawn = false;
-        self.sapphire_pid.store(0, Ordering::Relaxed);
+        self.holding_child = false;
+        self.attached = None;
         let next = match std::mem::take(&mut self.after_stop) {
             AfterStop::None => Task::none(),
             AfterStop::Update => self.update(Message::UpdateAfterStop),
             AfterStop::SwitchBranch => self.update(Message::SwitchBranch),
-            AfterStop::Close(id) => window::close(id),
         };
         if self.service.is_none() {
             return next;
@@ -1833,26 +1914,29 @@ impl App {
             subs.push(Subscription::run_with_id(self.journal_epoch, journal_log_stream()));
         }
 
-        // Spawn-mode follower (when WE launched Sapphire). A Subscription, not a
-        // Task::stream, so iced parks it when idle — fixes the redraw CPU-spin.
-        if self.streaming_spawn {
+        // The Child we started: a Subscription (so iced parks it when idle) that
+        // spawns her detached on first poll and waits for her exit.
+        if self.holding_child {
             subs.push(Subscription::run_with_id(
-                ("spawn", self.spawn_epoch),
-                spawn_log_stream(self.install_path.clone(), self.sapphire_pid.clone()),
+                ("child", self.child_epoch),
+                child_follower(self.install_path.clone(), launch_log_path(), run_state_path()),
             ));
         }
 
-        // Periodically detect an out-of-band Sapphire (e.g. started by the Windows
-        // autostart task, or the unit restarted from a terminal) so the header's
-        // Launch/Stop stays accurate. Skipped while we own the process (spawn
-        // follower) and while stopping. In service mode the poll asks systemd.
-        if !self.streaming_spawn && !self.sapphire_stopping {
-            subs.push(iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::HealthPoll));
+        // Her log, from a file: ours (Launch, autostart) or core's (started elsewhere).
+        // For our own Child it waits for SapphireStarted, when the file is fresh.
+        if let Some(i) = &self.attached
+            && !(self.holding_child && i.pid == 0)
+        {
+            subs.push(Subscription::run_with_id(("tail", self.tail_epoch), tail_log_stream(i.log.clone())));
         }
 
-        // Window close goes through us (exit_on_close_request is off) so the
-        // Sapphire we launched gets a graceful stop first.
-        subs.push(window::close_requests().map(Message::CloseRequested));
+        // Every 5 s: is she running on this install (autostart, a terminal, an
+        // earlier launcher — or gone)? Skipped while we hold her Child (its exit
+        // notice is the truth) and while stopping. In service mode the poll asks systemd.
+        if !self.holding_child && !self.sapphire_stopping {
+            subs.push(iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::InstancePoll));
+        }
 
         Subscription::batch(subs)
     }
@@ -2016,11 +2100,17 @@ mod tests {
         a.service = None;
         a
     }
-    /// She is OURS: spawned by this launcher, follower attached, pid known.
+    /// She is OURS: started by this launcher, Child held, pid known.
     fn ours(a: &mut App) {
-        a.sapphire_pid.store(4242, Ordering::Relaxed);
-        a.streaming_spawn = true;
+        a.attached = Some(Instance { pid: 4242, since: String::new(), origin: Origin::Launcher, log: PathBuf::from("/x/sapphire-launcher.log") });
+        a.holding_child = true;
         a.sapphire_running = true;
+    }
+    /// She was FOUND: started elsewhere, known through core's lock (pid), no Child.
+    fn found(a: &mut App) -> Instance {
+        let i = Instance { pid: 5151, since: "2026-10-20 08:01:02".into(), origin: Origin::Elsewhere, log: core_log_path(&a.install_path) };
+        let _ = a.update(Message::InstanceFound(Some(i.clone())));
+        i
     }
     fn logged(a: &App, needle: &str) -> bool {
         a.log_lines.iter().any(|l| l.contains(needle))
@@ -2031,7 +2121,7 @@ mod tests {
         let mut a = app();
         ours(&mut a);
         let _ = a.update(Message::SapphireExited(Ok(Some(43))));
-        assert!(!a.sapphire_running && !a.streaming_spawn);
+        assert!(!a.sapphire_running && !a.holding_child && a.attached.is_none());
         assert!(logged(&a, "Another Sapphire is already running"));
     }
 
@@ -2044,15 +2134,14 @@ mod tests {
         let _ = a.update(Message::SapphireExited(Ok(Some(1))));
         assert!(logged(&a, "Sapphire stopped."));
         assert!(logged(&a, "Starting update"));
-        assert!(!a.sapphire_stopping && !a.sapphire_running && !a.streaming_spawn);
-        assert_eq!(a.sapphire_pid.load(Ordering::Relaxed), 0);
+        assert!(!a.sapphire_stopping && !a.sapphire_running && !a.holding_child && a.attached.is_none());
         assert!(matches!(a.after_stop, AfterStop::None));
     }
 
     #[test]
     fn late_exit_after_a_forced_stop_is_ignored() {
         let mut a = app();
-        a.streaming_spawn = false;
+        a.holding_child = false;
         let _ = a.update(Message::SapphireExited(Ok(Some(1))));
         assert!(a.log_lines.is_empty());
     }
@@ -2065,7 +2154,8 @@ mod tests {
         a.stop_epoch = 5;
         let _ = a.update(Message::StopTimeout(4));
         let _ = a.update(Message::StopStillWaiting(4));
-        let _ = a.update(Message::StopSwept(4));
+        let _ = a.update(Message::StopSwept(4, true));
+        let _ = a.update(Message::StopSwept(4, false));
         let _ = a.update(Message::StopSignalSent(false, 4));
         assert!(a.log_lines.is_empty() && a.sapphire_stopping);
     }
@@ -2075,7 +2165,7 @@ mod tests {
         let mut a = app();
         ours(&mut a);
         let _ = a.begin_stop(AfterStop::None);
-        assert!(a.sapphire_stopping && a.stop_epoch == 1 && a.streaming_spawn, "follower stays attached");
+        assert!(a.sapphire_stopping && a.stop_epoch == 1 && a.holding_child, "the Child stays held");
         let _ = a.begin_stop(AfterStop::Update);
         assert!(a.stop_epoch == 1 && matches!(a.after_stop, AfterStop::Update));
         let _ = a.begin_stop(AfterStop::None);
@@ -2090,10 +2180,10 @@ mod tests {
         a.sapphire_stopping = true;
         a.stop_epoch = 1;
         a.after_stop = AfterStop::Update;
-        let _ = a.update(Message::StopSwept(1));
+        let _ = a.update(Message::StopSwept(1, true));
         assert!(logged(&a, "Couldn't force Sapphire to stop"));
         assert!(!logged(&a, "Starting update"), "no update on top of a live Sapphire");
-        assert!(!a.sapphire_stopping && a.sapphire_running && a.streaming_spawn);
+        assert!(!a.sapphire_stopping && a.sapphire_running && a.holding_child);
         assert!(matches!(a.after_stop, AfterStop::None));
     }
 
@@ -2108,20 +2198,74 @@ mod tests {
     }
 
     #[test]
-    fn close_leaves_a_foreign_sapphire_alone() {
+    fn a_found_sapphire_is_attached_followed_and_let_go() {
         let mut a = app();
-        a.sapphire_running = true; // health-detected, not spawned by us
-        let _ = a.update(Message::CloseRequested(window::Id::unique()));
-        assert!(!a.sapphire_stopping && !logged(&a, "Closing"));
+        let i = found(&mut a);
+        assert!(a.sapphire_running && !a.holding_child);
+        assert_eq!(a.attached.as_ref(), Some(&i));
+        assert_eq!(a.tail_epoch, 1, "her log is followed");
+        assert!(logged(&a, "Sapphire is running (started elsewhere, pid 5151, since 2026-10-20 08:01:02)."));
+        // The same her on the next poll: nothing to say, nothing restarted.
+        let _ = a.update(Message::InstanceFound(Some(i.clone())));
+        assert_eq!((a.tail_epoch, a.log_lines.len()), (1, 1));
+        // A different instance under the same lock (restarted by hand): re-attach.
+        let _ = a.update(Message::InstanceFound(Some(Instance { pid: 6161, ..i.clone() })));
+        assert_eq!(a.tail_epoch, 2);
+        // Gone: say so once, offer Launch again.
+        let _ = a.update(Message::InstanceFound(None));
+        assert!(!a.sapphire_running && a.attached.is_none() && logged(&a, "no longer running"));
+        let _ = a.update(Message::InstanceFound(None));
+        assert_eq!(a.log_lines.iter().filter(|l| l.contains("no longer running")).count(), 1);
     }
 
     #[test]
-    fn close_stops_our_sapphire_first() {
+    fn a_poll_never_touches_our_child_or_a_stop_in_flight() {
         let mut a = app();
         ours(&mut a);
-        let _ = a.update(Message::CloseRequested(window::Id::unique()));
-        assert!(a.sapphire_stopping && matches!(a.after_stop, AfterStop::Close(_)));
-        assert!(logged(&a, "Closing: stopping Sapphire first"));
+        let _ = a.update(Message::InstanceFound(None));
+        assert!(a.sapphire_running && a.attached.is_some(), "the Child's exit notice is the truth");
+        let mut b = app();
+        found(&mut b);
+        b.sapphire_stopping = true;
+        let _ = b.update(Message::InstanceFound(None));
+        assert!(b.sapphire_stopping && b.attached.is_some());
+    }
+
+    #[test]
+    fn stop_of_a_found_sapphire_signals_her_pid_and_a_pid_watch_confirms() {
+        let mut a = app();
+        found(&mut a);
+        let _ = a.update(Message::StopSapphire);
+        assert!(a.sapphire_stopping && a.stop_epoch == 1 && logged(&a, "Stopping Sapphire..."));
+        let _ = a.update(Message::StopSignalSent(true, 1));
+        assert!(a.sapphire_stopping, "the signal went out; the pid watch is on");
+        let _ = a.update(Message::SapphireStopConfirmed(true));
+        assert!(!a.sapphire_stopping && !a.sapphire_running && a.attached.is_none());
+        assert!(logged(&a, "Sapphire stopped."));
+    }
+
+    #[test]
+    fn a_forced_stop_that_took_finishes_the_stop() {
+        let mut a = app();
+        found(&mut a);
+        a.sapphire_stopping = true;
+        a.stop_epoch = 1;
+        a.after_stop = AfterStop::Update;
+        let _ = a.update(Message::StopSwept(1, false));
+        assert!(!a.sapphire_stopping && !a.sapphire_running && a.attached.is_none());
+        assert!(logged(&a, "Sapphire stopped (forced).") && logged(&a, "Starting update"));
+    }
+
+    #[test]
+    fn a_path_change_lets_go_of_a_found_sapphire_but_not_our_child() {
+        let mut a = app();
+        found(&mut a);
+        a.let_go_of_found();
+        assert!(!a.sapphire_running && a.attached.is_none());
+        let mut b = app();
+        ours(&mut b);
+        b.let_go_of_found();
+        assert!(b.sapphire_running && b.attached.is_some());
     }
 
     #[test]
@@ -2186,15 +2330,15 @@ mod tests {
     }
 
     #[test]
-    fn close_stops_our_sapphire_even_if_a_unit_was_detected_later() {
+    fn stop_signals_our_child_even_if_a_unit_was_detected_later() {
         let mut a = app();
         ours(&mut a);
         a.service = Some(ServiceInfo {
             active: false, active_state: "inactive".into(), enabled: true,
             sub_state: "dead".into(), working_dir: None, env_file: None,
         });
-        let _ = a.update(Message::CloseRequested(window::Id::unique()));
-        assert!(a.sapphire_stopping && matches!(a.after_stop, AfterStop::Close(_)));
+        let _ = a.update(Message::StopSapphire);
+        assert!(a.sapphire_stopping && !a.streaming_journal, "not a systemctl stop");
     }
 
     #[test]
@@ -2204,7 +2348,9 @@ mod tests {
         std::fs::write(d.join("main.py"), "").unwrap();
         a.install_path = d.to_string_lossy().into_owned();
         let _ = a.update(Message::Launch);
-        assert!(a.sapphire_running && a.streaming_spawn && a.launched_at.is_some());
+        assert!(a.sapphire_running && a.holding_child && a.launched_at.is_some());
+        assert_eq!(a.attached.as_ref().map(|i| (i.pid, i.origin)), Some((0, Origin::Launcher)));
+        assert_eq!(a.tail_epoch, 0, "no tail until the log file is fresh");
         let _ = a.update(Message::StopSapphire);
         assert!(!a.sapphire_stopping && logged(&a, "still starting"));
         // Past the debounce but before the runner reported a pid: nothing to signal,
@@ -2212,6 +2358,11 @@ mod tests {
         a.launched_at = None;
         let _ = a.update(Message::StopSapphire);
         assert!(!a.sapphire_stopping && a.stop_epoch == 0);
+        // The runner reports its pid: now her (fresh) log is followed, and Stop works.
+        let _ = a.update(Message::SapphireStarted(777));
+        assert_eq!((a.attached.as_ref().map(|i| i.pid), a.tail_epoch), (Some(777), 1));
+        let _ = a.update(Message::StopSapphire);
+        assert!(a.sapphire_stopping && a.stop_epoch == 1);
     }
 
     #[test]
@@ -2299,13 +2450,15 @@ mod tests {
     }
 
     #[test]
-    fn startup_probe_marks_an_external_instance() {
+    fn without_a_unit_the_startup_asks_whether_she_runs_anyway() {
+        // Only the state is checked here; the Task it returns is inert until polled.
         let mut a = app();
-        let _ = a.update(Message::LaunchPreCheck(true));
-        assert!(a.sapphire_running);
-        assert!(a.sapphire_log.iter().any(|l| l.contains("started outside this app")));
+        let _ = a.update(Message::ServiceDetected(None));
+        assert!(a.service.is_none() && !a.sapphire_running);
+        // In service mode a found instance is ignored: systemd owns the running state.
         let mut b = app();
-        let _ = b.update(Message::LaunchPreCheck(false));
-        assert!(!b.sapphire_running);
+        b.service = Some(ServiceInfo { active: false, active_state: "inactive".into(), enabled: true, sub_state: "dead".into(), working_dir: None, env_file: None });
+        let _ = b.update(Message::InstanceFound(Some(Instance { pid: 9, since: String::new(), origin: Origin::Elsewhere, log: PathBuf::new() })));
+        assert!(!b.sapphire_running && b.attached.is_none());
     }
 }

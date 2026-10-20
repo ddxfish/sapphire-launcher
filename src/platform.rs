@@ -78,22 +78,239 @@ pub(crate) fn autostart_marker_path() -> PathBuf {
     app_config_dir().join("autostart.on")
 }
 
-/// Windows: the autostart launch shim the logon task runs (via pythonw). Why a shim
-/// instead of `pythonw main.py` directly: under pythonw there is NO console, so
-/// `sys.stdout`/`sys.stderr` are None — Sapphire's first startup log write throws,
-/// main.py's supervisor retries, then gives up after 5 crashes (~17s) and the task
-/// exits 1. The shim redirects stdout/stderr to a real logfile before running main.py,
-/// which gives pythonw valid handles (no crash) AND captures logs for later tailing.
-/// Still windowless — it's pythonw, no cmd.exe console flash.
+/// Windows: the autostart launch shim the logon task runs (via pythonw, so nothing
+/// flashes at sign-in). The shim does what Launch does: starts the env's python.exe
+/// on main.py, hidden, in its own process group, with her output going to
+/// `launch_log_path()`, and leaves the `run_state_path()` handshake — so an
+/// autostarted Sapphire is one the launcher can follow and stop like its own.
+/// (v1/v2 ran main.py in-process under pythonw: no console, so no graceful Stop.)
 #[cfg(windows)]
 pub(crate) fn autostart_shim_path() -> PathBuf {
     app_config_dir().join("autostart_shim.py")
 }
 
-/// Windows: the logfile the autostart shim redirects Sapphire's output into.
-#[cfg(windows)]
-pub(crate) fn autostart_log_path() -> PathBuf {
+// ── Finding her ─────────────────────────────────────────────────────────────
+// The launcher starts Sapphire detached and is not her parent. To know whether she
+// is running, who started her and where her output goes, it reads two small files:
+// core's own instance lock (`user/.instance.lock`, written by her runner since
+// 2026-10-16) and our handshake (`sapphire-run.json`, written by Launch and by the
+// Windows autostart shim). Both name a pid, and a pid is believed only after it is
+// checked to be alive AND a sapphire-env python (`pid_is_hers`): notes outlive her,
+// and a reboot can hand the number to anything.
+
+/// Where Launch (and the Windows autostart shim) send her console output: the
+/// runner's own lines plus the console copy of her log. Core keeps writing its own
+/// `user/logs/sapphire.log` regardless.
+pub(crate) fn launch_log_path() -> PathBuf {
     app_config_dir().join("sapphire-launcher.log")
+}
+
+/// The handshake left for a later launcher: "this pid's output is in this file".
+pub(crate) fn run_state_path() -> PathBuf {
+    app_config_dir().join("sapphire-run.json")
+}
+
+/// Core's own log (TimedRotatingFileHandler, rotated at midnight): the live source
+/// for an instance started elsewhere (a terminal, an old shim).
+pub(crate) fn core_log_path(install: &str) -> PathBuf {
+    PathBuf::from(install).join("user").join("logs").join("sapphire.log")
+}
+
+/// Core's instance lock. Absent = never run, or a core from before the lock.
+pub(crate) fn lock_path(install: &str) -> PathBuf {
+    PathBuf::from(install).join("user").join(".instance.lock")
+}
+
+/// Who started the Sapphire we found: decides the wording and where her log is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    Launcher,
+    Autostart,
+    Elsewhere,
+}
+
+/// A running Sapphire: her runner's pid (0 = answering on the web port but no pid
+/// to be had — an old core started elsewhere), core's "since" note when there is
+/// one, who started her, and the file her output goes to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Instance {
+    pub(crate) pid: u32,
+    pub(crate) since: String,
+    pub(crate) origin: Origin,
+    pub(crate) log: PathBuf,
+}
+
+impl Instance {
+    /// Status words for the Log tab and the launcher log.
+    pub(crate) fn describe(&self) -> String {
+        let who = match self.origin {
+            Origin::Launcher => "started by this app".to_string(),
+            Origin::Autostart => "started at sign-in".to_string(),
+            Origin::Elsewhere if self.pid > 0 => format!("started elsewhere, pid {}", self.pid),
+            Origin::Elsewhere => "started outside this app".to_string(),
+        };
+        if self.since.is_empty() {
+            format!("Sapphire is running ({})", who)
+        } else {
+            format!("Sapphire is running ({}, since {})", who, self.since)
+        }
+    }
+}
+
+/// What Launch and the shim write to `run_state_path()`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunState {
+    pub(crate) pid: u32,
+    pub(crate) log: PathBuf,
+    pub(crate) origin: Origin,
+}
+
+/// Write the handshake atomically (tmp + rename): a reader never sees half a file.
+pub(crate) fn write_run_state(path: &std::path::Path, st: &RunState) -> std::io::Result<()> {
+    let by = match st.origin {
+        Origin::Launcher => "launcher",
+        Origin::Autostart => "autostart",
+        Origin::Elsewhere => "elsewhere",
+    };
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let json = serde_json::json!({ "pid": st.pid, "log": st.log.to_string_lossy(), "by": by, "started": started });
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, format!("{:#}\n", json))?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Read the handshake. Forgiving: anything odd is "no handshake".
+pub(crate) fn read_run_state(path: &std::path::Path) -> Option<RunState> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).ok()?;
+    let pid = u32::try_from(v.get("pid")?.as_u64()?).ok().filter(|p| *p > 0)?;
+    let log = PathBuf::from(v.get("log")?.as_str()?);
+    let origin = match v.get("by").and_then(|b| b.as_str()) {
+        Some("autostart") => Origin::Autostart,
+        _ => Origin::Launcher,
+    };
+    Some(RunState { pid, log, origin })
+}
+
+/// Core's lock note, read the way core itself reads it: from byte 1. Byte 0 carries
+/// the kernel lock, and Windows refuses to let another process read a locked byte.
+/// None = no file.
+pub(crate) fn read_lock_note(install: &str) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(lock_path(install)).ok()?;
+    f.seek(SeekFrom::Start(1)).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// `pid=N since=YYYY-MM-DD HH:MM:SS` → (N, "YYYY-MM-DD HH:MM:SS"). The note is
+/// whatever core wrote last; it is still there after she exits.
+pub(crate) fn parse_lock_note(note: &str) -> Option<(u32, String)> {
+    let words: Vec<&str> = note.split_whitespace().collect();
+    let pid = words.iter().find_map(|w| w.strip_prefix("pid=")?.parse::<u32>().ok()).filter(|p| *p > 0)?;
+    let since = words.iter().position(|w| w.starts_with("since=")).map(|i| {
+        let mut s = words[i]["since=".len()..].to_string();
+        if let Some(t) = words.get(i + 1)
+            && t.contains(':')
+        {
+            s.push(' ');
+            s.push_str(t); // the date and the time are two words
+        }
+        s
+    }).unwrap_or_default();
+    Some((pid, since))
+}
+
+/// The pure heart of `find_instance`: core's note, our handshake, and an "is this
+/// pid alive and hers" oracle (a closure, so the tests need no real processes).
+pub(crate) fn resolve_instance(
+    note: Option<&str>,
+    run: Option<RunState>,
+    hers: impl Fn(u32) -> bool,
+    install: &str,
+) -> Option<Instance> {
+    if let Some((pid, since)) = note.and_then(parse_lock_note)
+        && hers(pid)
+    {
+        // Her runner holds the lock. Our handshake naming the same pid means her
+        // output is in our file; otherwise she was started elsewhere.
+        let (origin, log) = match run {
+            Some(r) if r.pid == pid => (r.origin, r.log),
+            _ => (Origin::Elsewhere, core_log_path(install)),
+        };
+        return Some(Instance { pid, since, origin, log });
+    }
+    // No lock (a core from before 2026-10-16 — Stable, as of this writing) or a
+    // stale one: the handshake alone still finds a Sapphire Launch or the shim started.
+    let r = run?;
+    hers(r.pid).then(|| Instance { pid: r.pid, since: String::new(), origin: r.origin, log: r.log })
+}
+
+/// Is a Sapphire running on this install? Reads two small files and checks a pid;
+/// never spawns a process, so it is cheap enough to poll. None = nobody we can
+/// vouch for (an old core started elsewhere is still possible; the caller's web
+/// port probe covers that).
+pub(crate) fn find_instance(install: &str) -> Option<Instance> {
+    resolve_instance(read_lock_note(install).as_deref(), read_run_state(&run_state_path()), pid_is_hers, install)
+}
+
+/// Is `pid` alive and a sapphire-env python running her? Linux: /proc gives the
+/// executable (a gone or zombie pid has no exe link) and the command line. The
+/// identity half is what makes a recycled pid harmless: nothing that fails it is
+/// ever signalled.
+#[cfg(not(windows))]
+pub(crate) fn pid_is_hers(pid: u32) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", pid)) else { return false };
+    if !exe.to_string_lossy().contains("/envs/sapphire/") {
+        return false;
+    }
+    let Ok(cmd) = std::fs::read(format!("/proc/{}/cmdline", pid)) else { return false };
+    let cmd = String::from_utf8_lossy(&cmd);
+    cmd.contains("main.py") || cmd.contains("sapphire.py")
+}
+
+/// Is `pid` alive and a sapphire-env python? Windows: open the process for a look
+/// (no tasklist/CIM spawn), check it has not exited, read its image path. A pid we
+/// may not open (she runs elevated or as another user) is believed on the lock's
+/// word — the most we can know — and Stop says so when it cannot reach her.
+#[cfg(windows)]
+pub(crate) fn pid_is_hers(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid <= 4 {
+        return false; // the idle/system pseudo-pids
+    }
+    // SAFETY: plain Win32 calls; the handle is closed on every path and the name
+    // buffer's length is passed in and out exactly as the API requires.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return GetLastError() == ERROR_ACCESS_DENIED;
+        }
+        let mut code = 0u32;
+        let alive = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE as u32;
+        let mut name = [0u16; 1024];
+        let mut len = name.len() as u32;
+        let named = QueryFullProcessImageNameW(h, 0, name.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(h);
+        if !alive {
+            return false;
+        }
+        if !named {
+            return true; // no name to check: the lock's word stands
+        }
+        String::from_utf16_lossy(&name[..len as usize]).to_ascii_lowercase().contains("\\envs\\sapphire\\")
+    }
 }
 
 /// Base config dir, shared with Sapphire. Mirrors core/setup.py::get_config_dir():
@@ -204,6 +421,18 @@ fn signal_group(pid: u32, sig: libc::c_int) -> bool {
     unsafe { libc::killpg(pid as libc::pid_t, sig) == 0 }
 }
 
+/// Send `sig` to `pid` alone — only if it is alive and hers (`pid_is_hers`). For a
+/// runner started by hand inside someone else's group: it forwards SIGTERM to
+/// sapphire.py itself. Same no-/usr/bin/kill rule as `signal_group`.
+#[cfg(not(windows))]
+fn signal_one(pid: u32, sig: libc::c_int) -> bool {
+    if !pid_is_hers(pid) {
+        return false;
+    }
+    // SAFETY: plain syscall; pid was just verified alive and a sapphire-env python.
+    unsafe { libc::kill(pid as libc::pid_t, sig) == 0 }
+}
+
 /// Ask Sapphire to stop gracefully (core tears down in ~8 s, worst case ~100 s).
 /// Windows: CTRL_BREAK to the runner's process group — it is spawned with
 /// CREATE_NEW_PROCESS_GROUP so its pid is the group id, and main.py/sapphire.py
@@ -248,40 +477,42 @@ pub(crate) fn signal_stop(pid: u32) -> bool {
     }
     #[cfg(not(windows))]
     {
-        signal_group(pid, libc::SIGTERM)
+        // Her whole group when she leads one (we start her that way), else the runner
+        // alone (started by hand); never a pid that is not provably hers.
+        signal_group(pid, libc::SIGTERM) || signal_one(pid, libc::SIGTERM)
     }
 }
 
-/// Hard stop — the fallback when `signal_stop` can't be sent or Sapphire ignores it,
-/// and the only option for an instance we didn't spawn (pid 0: sweep only).
-/// Windows: taskkill the tree + sweep env pythons. Linux: SIGKILL the process group
-/// (we spawn Sapphire in its own group; SIGTERM already went unanswered) + a SIGTERM
-/// sweep. The sweep hits EVERY sapphire-env python (a user's own script too), which
-/// is why it is not the first move.
+/// Hard stop — the fallback when `signal_stop` can't be sent or Sapphire ignores it.
+/// With a pid: her tree / process group, precisely. Without one (pid 0: an old core
+/// started elsewhere, nothing to name): sweep every sapphire-env python — a user's
+/// own script in that env too, which is why the sweep is the last resort only.
 pub(crate) fn kill_process_tree(pid: u32) {
     #[cfg(windows)]
     {
-        // If we spawned it, the stored PID gives a fast, complete tree kill.
         if pid > 0 {
             let _ = hidden_cmd("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+            return;
         }
-        // Sweep every Sapphire-env interpreter — BOTH python.exe AND pythonw.exe. The
-        // autostart task runs pythonw.exe (windowless); the old python.exe-only sweep
-        // missed it, so Stop did nothing for task-started instances. Matching by an
-        // env-path substring also covers miniconda3/anaconda3/Anaconda3 variants. This
-        // kills main.py too, so its supervisor can't relaunch sapphire.py. Uses CIM, not
-        // the deprecated wmic (removed-by-default on Win11 24H2+).
+        // Sweep every Sapphire-env interpreter — BOTH python.exe AND pythonw.exe (an
+        // old autostart shim runs her under pythonw). Matching by an env-path substring
+        // covers miniconda3/anaconda3/Anaconda3 variants. This kills main.py too, so its
+        // supervisor can't relaunch sapphire.py. Uses CIM, not the deprecated wmic
+        // (removed-by-default on Win11 24H2+).
         let ps = "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" | Where-Object { $_.ExecutablePath -like '*\\envs\\sapphire\\*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
         let _ = hidden_cmd("powershell").args(["-NoProfile", "-Command", ps]).output();
     }
     #[cfg(not(windows))]
     {
         if pid > 0 {
-            // Whole process group (Sapphire is spawned into its own group at launch),
-            // child STT/TTS workers too. Direct syscall — see signal_group.
-            signal_group(pid, libc::SIGKILL);
+            // Her whole group (she leads one when we started her), child STT/TTS
+            // workers too; the runner alone otherwise. Direct syscalls — see signal_group.
+            if !signal_group(pid, libc::SIGKILL) {
+                signal_one(pid, libc::SIGKILL);
+            }
+            return;
         }
-        // Sweep any stray python running the sapphire env (e.g. started outside us).
+        // Sweep any stray python running the sapphire env (started outside us, no pid known).
         let _ = hidden_cmd("pkill").args(["-TERM", "-f", "envs/sapphire/bin/python"]).output();
     }
 }
@@ -445,5 +676,100 @@ pub(crate) fn find_conda_pip() -> (String, Vec<String>) {
     match sapphire_env_file(rel) {
         Some(p) => (p, vec![]),
         None => conda_run("pip"),
+    }
+}
+
+// ── Tests: the pure parts of finding her (any OS) ─────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sapphire-launcher-test-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn lock_note_parses_what_core_writes() {
+        // Core's exact shape as seen from byte 1 (byte 0 is the '\n' that carries the lock).
+        assert_eq!(parse_lock_note("pid=4242 since=2026-10-20 08:01:02\n"), Some((4242, "2026-10-20 08:01:02".into())));
+        assert_eq!(parse_lock_note("\r\n pid=7 since=2026-10-20 08:01:02 \r\n"), Some((7, "2026-10-20 08:01:02".into())));
+        assert_eq!(parse_lock_note("pid=9"), Some((9, String::new())));
+        for bad in ["", "\n", "pid=0 since=x", "pid=abc", "since=2026-10-20 08:01:02", "garbage", "id=12 since=x"] {
+            assert_eq!(parse_lock_note(bad), None, "{:?}", bad);
+        }
+    }
+
+    #[test]
+    fn lock_note_is_read_from_byte_one() {
+        let d = scratch("lock");
+        let install = d.to_string_lossy().into_owned();
+        assert_eq!(read_lock_note(&install), None, "no file");
+        std::fs::create_dir_all(d.join("user")).unwrap();
+        std::fs::write(lock_path(&install), b"\npid=4242 since=2026-10-20 08:01:02\n").unwrap();
+        assert_eq!(parse_lock_note(&read_lock_note(&install).unwrap()), Some((4242, "2026-10-20 08:01:02".into())));
+    }
+
+    #[test]
+    fn run_state_round_trips() {
+        let p = scratch("run").join("deep").join("sapphire-run.json");
+        let st = RunState {
+            pid: 31337,
+            log: PathBuf::from(r#"C:\Users\Krem's "lab"\AppData\Roaming\Sapphire\sapphire-launcher.log"#),
+            origin: Origin::Autostart,
+        };
+        write_run_state(&p, &st).unwrap();
+        assert_eq!(read_run_state(&p), Some(st));
+        assert!(!p.with_extension("json.tmp").exists(), "the tmp file was renamed away");
+        std::fs::write(&p, "{broken").unwrap();
+        assert_eq!(read_run_state(&p), None);
+        std::fs::write(&p, r#"{"pid": 0, "log": "x"}"#).unwrap();
+        assert_eq!(read_run_state(&p), None);
+        // What the Python shim writes (json.dump: different key order, no BOM).
+        std::fs::write(&p, r#"{"pid": 5, "log": "C:\\x\\sapphire-launcher.log", "by": "autostart", "started": 1}"#).unwrap();
+        let r = read_run_state(&p).unwrap();
+        assert_eq!((r.pid, r.origin, r.log.to_string_lossy().as_ref()), (5, Origin::Autostart, r"C:\x\sapphire-launcher.log"));
+    }
+
+    #[test]
+    fn instance_resolution_believes_only_live_pids() {
+        let note = Some("pid=100 since=2026-10-20 08:01:02\n");
+        let ours = || Some(RunState { pid: 100, log: PathBuf::from("/cfg/sapphire-launcher.log"), origin: Origin::Launcher });
+        let core_log = core_log_path("/inst");
+        // Lock and handshake agree: ours, our log, core's since.
+        let i = resolve_instance(note, ours(), |p| p == 100, "/inst").unwrap();
+        assert_eq!(i, Instance { pid: 100, since: "2026-10-20 08:01:02".into(), origin: Origin::Launcher, log: PathBuf::from("/cfg/sapphire-launcher.log") });
+        // Lock only (a terminal start): elsewhere, core's log.
+        let i = resolve_instance(note, None, |p| p == 100, "/inst").unwrap();
+        assert_eq!((i.origin, &i.log), (Origin::Elsewhere, &core_log));
+        // A handshake left by an older run names another pid: the lock wins.
+        let old = Some(RunState { pid: 55, log: PathBuf::from("/cfg/old.log"), origin: Origin::Launcher });
+        let i = resolve_instance(note, old, |p| p == 100, "/inst").unwrap();
+        assert_eq!((i.pid, i.origin), (100, Origin::Elsewhere));
+        // Stale note (pid dead, or recycled by something that is not her): nobody.
+        assert_eq!(resolve_instance(note, ours(), |_| false, "/inst"), None);
+        // No lock file (a core before the lock), but our handshake's pid is alive and hers.
+        let i = resolve_instance(None, ours(), |p| p == 100, "/inst").unwrap();
+        assert_eq!((i.pid, i.origin, i.since.as_str()), (100, Origin::Launcher, ""));
+        assert_eq!(resolve_instance(None, ours(), |_| false, "/inst"), None);
+        assert_eq!(resolve_instance(None, None, |_| true, "/inst"), None);
+        // The words.
+        assert_eq!(i.describe(), "Sapphire is running (started by this app)");
+        let e = Instance { pid: 100, since: "2026-10-20 08:01:02".into(), origin: Origin::Elsewhere, log: core_log };
+        assert_eq!(e.describe(), "Sapphire is running (started elsewhere, pid 100, since 2026-10-20 08:01:02)");
+        let a = Instance { pid: 3, since: String::new(), origin: Origin::Autostart, log: PathBuf::new() };
+        assert_eq!(a.describe(), "Sapphire is running (started at sign-in)");
+        let z = Instance { pid: 0, since: String::new(), origin: Origin::Elsewhere, log: PathBuf::new() };
+        assert_eq!(z.describe(), "Sapphire is running (started outside this app)");
+    }
+
+    #[test]
+    fn pid_identity_rejects_us_and_the_dead() {
+        // This test binary is alive, but it is not a sapphire-env python.
+        assert!(!pid_is_hers(std::process::id()));
+        assert!(!pid_is_hers(0));
+        assert!(!pid_is_hers(u32::MAX - 1)); // nobody
     }
 }

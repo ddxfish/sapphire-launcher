@@ -1,7 +1,7 @@
 // systemd --user service detection + log/launch streams.
 use crate::*;
 use crate::platform::*;
-use std::sync::{Arc, atomic::{AtomicU32, Ordering}};
+use std::sync::Arc;
 use tokio::io::BufReader;
 
 // Service mode is Linux-only today (Windows detect returns None), so on Windows the
@@ -129,9 +129,9 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
         Err(e) => (format!("Unit written, but enabling it failed: {}", e), false),
     }
 }
-/// Windows: enable autostart. Registers a per-user logon Scheduled Task that runs the
-/// env's windowless `pythonw main.py` directly (no console window), with the install
-/// dir as the working directory. We use PowerShell `Register-ScheduledTask` (not bare
+/// Windows: enable autostart. Registers a per-user logon Scheduled Task that runs our
+/// shim under the env's windowless pythonw (no console window), with the install dir
+/// as the working directory. We use PowerShell `Register-ScheduledTask` (not bare
 /// `schtasks.exe`) so we control the settings `schtasks` defaults wrong:
 ///   • trigger scoped to THIS user's logon (not "any user")
 ///   • runs on battery and doesn't stop on battery (laptop-friendly)
@@ -150,18 +150,16 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
         std::env::var("USERNAME").unwrap_or_default(),
     );
 
-    // Write the launch shim the task runs (instead of `pythonw main.py` directly).
-    // Under pythonw there's no console, so sys.stdout/stderr are None and Sapphire's
-    // startup logging crashes the child → supervisor gives up → task exits 1. The shim
-    // redirects output to a logfile first (valid handles, no crash) then runs main.py.
-    // See platform::autostart_shim_path for the full why.
+    // Write the launch shim the task runs (instead of `pythonw main.py` directly):
+    // it starts her the way Launch does — detached, hidden, own process group, output
+    // to our log file, handshake written. See platform::autostart_shim_path.
     let shim = autostart_shim_path();
-    let log = autostart_log_path();
+    let log = launch_log_path();
     if let Some(parent) = shim.parent()
         && let Err(e) = tokio::fs::create_dir_all(parent).await {
             return (format!("Couldn't create the autostart folder: {}", e), false);
         }
-    if let Err(e) = tokio::fs::write(&shim, shim_source(&install_path, &log.to_string_lossy())).await {
+    if let Err(e) = tokio::fs::write(&shim, shim_source(&install_path, &log.to_string_lossy(), &run_state_path().to_string_lossy())).await {
         return (format!("Couldn't write the autostart launcher: {}", e), false);
     }
 
@@ -262,43 +260,64 @@ pub(crate) async fn remove_service() -> (String, bool) {
 
 /// Bumped whenever the shim's shape changes; the header carries it so a launcher
 /// can tell a stale shim from a current one and regenerate it.
+/// v1 ran main.py in-process (died at import on core ≥ 2026-10-16), v2 fixed that,
+/// v3 starts her detached like Launch does (python.exe, hidden console, own process
+/// group) so the launcher can follow her log and stop her gracefully.
 #[cfg_attr(not(windows), allow(dead_code))] // only the Windows shim repair calls these
-pub(crate) const SHIM_VERSION: u32 = 2;
+pub(crate) const SHIM_VERSION: u32 = 3;
 
-/// The autostart shim the logon task runs under pythonw. Why each line is there:
-/// the log first (pythonw has no console — without real handles Sapphire's first
-/// print crashes; and if the chdir below fails, the error has somewhere to go),
-/// "w" so each sign-in starts a fresh log (main.py's own restarts within one session
-/// still accumulate), then the install dir on sys.path: core's runner does
-/// `from core.single_instance import …` unconditionally (2026-10-16), and runpy does
-/// NOT put a script's folder on the path — without this line autostart dies at
-/// import. Absolute main.py path so `__file__` (the lock's anchor) is absolute too.
+/// The autostart shim the logon task runs under pythonw (nothing flashes). It is
+/// Launch in Python: truncate the log, then start the env's python.exe (next to the
+/// pythonw running the shim) on main.py — hidden console, own process group (so
+/// Stop's CTRL_BREAK has a group to send to), stdin closed, stdout+stderr appended
+/// to the log, UTF-8 like Launch — write the `sapphire-run.json` handshake
+/// atomically, and exit. The log is created first so a failure has somewhere to go;
+/// a traceback lands there too. Absolute main.py path so `__file__` (the lock's
+/// anchor) is absolute.
 #[cfg_attr(not(windows), allow(dead_code))] // only the Windows shim repair calls these
-pub(crate) fn shim_source(cwd: &str, log: &str) -> String {
+pub(crate) fn shim_source(cwd: &str, log: &str, run: &str) -> String {
     // Python string literal: escape backslashes then double-quotes (handles spaces
     // and any path safely — avoids raw-string's can't-end-in-backslash gotcha).
     let py_lit = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    format!(
-        "# sapphire-launcher autostart shim v{v} (regenerated by the launcher; edits are overwritten)\r\n\
-         import runpy, sys, os\r\n\
-         _cwd = \"{cwd}\"\r\n\
-         _log = \"{log}\"\r\n\
-         os.makedirs(os.path.dirname(_log), exist_ok=True)\r\n\
-         sys.stdout = sys.stderr = open(_log, \"w\", buffering=1, encoding=\"utf-8\", errors=\"replace\")\r\n\
-         os.chdir(_cwd)\r\n\
-         sys.path.insert(0, _cwd)\r\n\
-         runpy.run_path(os.path.join(_cwd, \"main.py\"), run_name=\"__main__\")\r\n",
-        v = SHIM_VERSION, cwd = py_lit(cwd), log = py_lit(log),
-    )
+    let lines: Vec<String> = vec![
+        format!("# sapphire-launcher autostart shim v{} (regenerated by the launcher; edits are overwritten)", SHIM_VERSION),
+        "import json, os, subprocess, sys, time".into(),
+        format!("_cwd = \"{}\"", py_lit(cwd)),
+        format!("_log = \"{}\"", py_lit(log)),
+        format!("_run = \"{}\"", py_lit(run)),
+        "os.makedirs(os.path.dirname(_log), exist_ok=True)".into(),
+        "open(_log, \"w\").close()".into(),
+        "try:".into(),
+        "    _env = dict(os.environ, PYTHONUTF8=\"1\", PYTHONIOENCODING=\"utf-8\")".into(),
+        "    _py = os.path.join(os.path.dirname(sys.executable), \"python.exe\")".into(),
+        "    with open(_log, \"ab\") as _f:".into(),
+        "        _p = subprocess.Popen([_py, \"-u\", os.path.join(_cwd, \"main.py\")], cwd=_cwd, env=_env,".into(),
+        "                              stdin=subprocess.DEVNULL, stdout=_f, stderr=subprocess.STDOUT,".into(),
+        "                              creationflags=0x08000000 | 0x00000200)".into(),
+        "    with open(_run + \".tmp\", \"w\", encoding=\"utf-8\") as _f:".into(),
+        "        json.dump({\"pid\": _p.pid, \"log\": _log, \"by\": \"autostart\", \"started\": int(time.time())}, _f)".into(),
+        "    os.replace(_run + \".tmp\", _run)".into(),
+        "except Exception:".into(),
+        "    import traceback".into(),
+        "    with open(_log, \"a\", encoding=\"utf-8\") as _f:".into(),
+        "        _f.write(\"[autostart shim] \" + traceback.format_exc())".into(),
+    ];
+    lines.join("\r\n") + "\r\n"
 }
 
-/// Is this shim text the current shape? (Header line carries the version.)
+/// The version in a shim's header line (`# sapphire-launcher autostart shim vN …`);
+/// None for v1, which had no header.
 #[cfg_attr(not(windows), allow(dead_code))] // only the Windows shim repair calls these
-pub(crate) fn shim_is_current(src: &str) -> bool {
+pub(crate) fn shim_version(src: &str) -> Option<u32> {
     src.lines().next()
         .and_then(|l| l.trim().strip_prefix("# sapphire-launcher autostart shim v"))
         .and_then(|rest| rest.split_whitespace().next()?.parse::<u32>().ok())
-        .is_some_and(|v| v >= SHIM_VERSION)
+}
+
+/// Is this shim text the current shape?
+#[cfg_attr(not(windows), allow(dead_code))] // only the Windows shim repair calls these
+pub(crate) fn shim_is_current(src: &str) -> bool {
+    shim_version(src).is_some_and(|v| v >= SHIM_VERSION)
 }
 
 /// The install folder a shim (any version) points at: `_cwd = "…"` now,
@@ -343,8 +362,12 @@ pub(crate) fn repair_autostart_shim(install_path: &str) -> Option<String> {
     let Some(cwd) = cwd else {
         return Some("Autostart is turned on, but points at a folder with no Sapphire in it — turn it off and on again once the path is right.".to_string());
     };
-    match std::fs::write(&shim, shim_source(&cwd, &autostart_log_path().to_string_lossy())) {
-        Ok(()) => Some("Updated the autostart launcher: Sapphire changed how it starts (2026-10-16) and the old one couldn't start her. Takes effect at your next sign-in — hit Launch to start her now.".to_string()),
+    let note = match shim_version(&old) {
+        Some(2) => "Updated the autostart launcher: Sapphire now starts detached at sign-in, so this app can follow her log and stop her gracefully. Takes effect at your next sign-in.",
+        _ => "Updated the autostart launcher: Sapphire changed how it starts (2026-10-16) and the old one couldn't start her. Takes effect at your next sign-in — hit Launch to start her now.",
+    };
+    match std::fs::write(&shim, shim_source(&cwd, &launch_log_path().to_string_lossy(), &run_state_path().to_string_lossy())) {
+        Ok(()) => Some(note.to_string()),
         Err(e) => Some(format!("Autostart needs an update but the launcher file couldn't be written: {}", e)),
     }
 }
@@ -658,161 +681,214 @@ pub(crate) fn journal_log_stream() -> impl futures::Stream<Item = Message> {
     })
 }
 
-/// One message from the spawned Sapphire process: a log line, or the final exit
-/// notice — Ok(exit code; None = killed by a signal) or Err(why it never started).
-/// The wording lives in main.rs, which knows whether WE asked her to stop.
-enum SpawnItem {
-    Line(String),
-    Exited(Result<Option<i32>, String>),
-}
+// ── Launch (detached) ─────────────────────────────────────────────────────────
 
-/// Spawn `python -u main.py` and pump its stdout+stderr (lossy UTF-8, ANSI-stripped,
-/// `\r` progress bars collapsed) as `SpawnItem::Line`s into `tx`, then one final
-/// `SpawnItem::Exited`. Note: this task owns the child, NOT the subscription — so
-/// dropping the follower does not kill her. `kill_on_drop` only fires when the whole
-/// runtime goes away (launcher exit/crash); the Stop flow in main.rs signals first and
-/// only falls back to `kill_process_tree`.
-async fn spawn_reader(
-    install_path: String,
-    pid_store: Arc<AtomicU32>,
-    tx: tokio::sync::mpsc::UnboundedSender<SpawnItem>,
-) {
-    // Resolve the env's python directly (avoids conda-run buffering) or conda run.
+/// Start her detached: `python -u main.py` with stdout/stderr in `log` (no pipes —
+/// a pipe whose reader has gone kills the writer), nothing killed when the Child or
+/// the launcher goes away, her own session / process group. The launcher is an
+/// assistant, not a parent: closing it leaves her running, and a later launcher
+/// finds her through the handshake written to `run` (`find_instance`). Returns the
+/// Child, its pid and the grace (ms) to give the log tail once she has exited.
+fn spawn_detached(
+    install_path: &str,
+    log: &std::path::Path,
+    run: &std::path::Path,
+) -> Result<(tokio::process::Child, u32, u64), String> {
+    use std::io::Write;
     let (program, mut args) = sapphire_python_cmd();
     let is_direct = args.is_empty();
     args.push("-u".to_string());
     args.push("main.py".to_string());
 
+    // Her output file: truncated per Launch (she is not running — Launch is not
+    // offered while she is), then opened for append: everyone who holds it writes
+    // at the end, so a second writer could never leave holes in it.
+    let what = |e: std::io::Error| format!("Couldn't write {}: {}", log.display(), e);
+    if let Some(parent) = log.parent() {
+        std::fs::create_dir_all(parent).map_err(what)?;
+    }
+    std::fs::File::create(log).map_err(what)?;
+    let mut out = std::fs::OpenOptions::new().append(true).open(log).map_err(what)?;
+    if is_direct {
+        let _ = writeln!(out, "[Launcher] Using {}", program);
+    }
+    let err = out.try_clone().map_err(what)?;
+
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args)
-        .current_dir(&install_path)
-        .stdin(std::process::Stdio::null()) // see run_cmd_streamed; systemd gives her /dev/null too
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .current_dir(install_path)
+        .stdin(std::process::Stdio::null()) // never inherit ours: see run_cmd_streamed
+        .stdout(std::process::Stdio::from(out))
+        .stderr(std::process::Stdio::from(err))
         .env("PYTHONIOENCODING", "utf-8")
         .env("PYTHONUTF8", "1")
-        .kill_on_drop(true);
+        .kill_on_drop(false); // she outlives us by design
     #[cfg(windows)]
     {
         // Own process group (its pid = the group id) so Stop can send CTRL_BREAK to
-        // the runner and everything it spawned; hidden console so nothing flashes.
+        // the runner and everything it spawned; hidden console so nothing flashes —
+        // and that console is hers, so it stays when the launcher closes.
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     }
     #[cfg(unix)]
     {
-        // Own process group so Stop can signal the whole tree (child workers).
-        cmd.process_group(0);
-    }
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            let _ = tx.send(SpawnItem::Exited(Err(format!("Failed to start: {}", e))));
-            return;
-        }
-    };
-
-    // Store PID for the Stop button.
-    if let Some(pid) = child.id() {
-        pid_store.store(pid, Ordering::Relaxed);
-    }
-
-    if is_direct {
-        let _ = tx.send(SpawnItem::Line(format!("Using {}", program)));
-    }
-
-    async fn pump(
-        r: impl tokio::io::AsyncRead + Unpin,
-        tx: tokio::sync::mpsc::UnboundedSender<SpawnItem>,
-    ) {
-        use tokio::io::AsyncBufReadExt;
-        let mut reader = BufReader::new(r);
-        let mut buf = Vec::new();
-        while reader.read_until(b'\n', &mut buf).await.unwrap_or(0) > 0 {
-            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') { buf.pop(); }
-            let mut s = strip_ansi(&String::from_utf8_lossy(&buf));
-            if let Some(i) = s.rfind('\r') { s = s[i + 1..].to_string(); }
-            buf.clear();
-            if tx.send(SpawnItem::Line(s)).is_err() { break; }
+        // Own session: hence her own process group with pid = pgid (what Stop's
+        // killpg checks) and no controlling terminal, so a terminal the launcher was
+        // started from cannot HUP her. setpgid is the fallback if setsid is refused.
+        // SAFETY: setsid/setpgid are async-signal-safe and act on the child only.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    libc::setpgid(0, 0);
+                }
+                Ok(())
+            });
         }
     }
-
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let a = tokio::spawn(pump(stdout, tx.clone()));
-    let b = tokio::spawn(pump(stderr, tx.clone()));
-    // Report the exit as soon as the runner itself is gone. The pumps only end once
-    // every holder of the pipes is gone (sapphire.py, Kokoro inherit them), so give
-    // them a short grace to flush the last teardown lines — but never let a lingering
-    // grandchild delay the exit notice.
-    let status = child.wait().await;
-    let grace = if is_direct { 2 } else { 10 }; // `conda run` adds a wrapper between us and her
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(grace), async {
-        let _ = a.await;
-        let _ = b.await;
-    })
-    .await;
-    let result = match status {
-        Ok(s) => Ok(s.code()),
-        Err(e) => Err(format!("Error: {}", e)),
-    };
-    let _ = tx.send(SpawnItem::Exited(result));
+    let child = cmd.spawn().map_err(|e| format!("Failed to start: {}", e))?;
+    let pid = child.id().unwrap_or(0);
+    // The handshake for a later launcher (and for find_instance on a core without
+    // the lock file). Best effort: without it she still runs; we just can't claim her.
+    let _ = write_run_state(run, &RunState { pid, log: log.to_path_buf(), origin: Origin::Launcher });
+    // `conda run` puts a wrapper between us and her: a longer grace for her last lines.
+    Ok((child, pid, if is_direct { 700 } else { 1500 }))
 }
 
-/// `Subscription`-driven follower of a spawned Sapphire process. **Lazy** — the
-/// process starts on first poll (inside the tokio runtime), so building the stream
-/// repeatedly in `subscription()` is cheap and iced parks it when idle. That's the
-/// fix for the `Task::stream` redraw-spin (idle ~55% CPU). Each poll drains all
-/// queued lines into one `SapphireLines` batch (one redraw per burst), then emits a
-/// final `SapphireExited`.
-pub(crate) fn spawn_log_stream(install_path: String, pid_store: Arc<AtomicU32>) -> impl futures::Stream<Item = Message> {
+/// `Subscription`-driven: start her (on first poll, inside the tokio runtime) and
+/// report `SapphireStarted(pid)`, then wait for the runner to end and report
+/// `SapphireExited`. Holding the Child is what gets us the exit code; it has no say
+/// over her life (no kill_on_drop, no pipes). Her lines reach the pane through
+/// `tail_log_stream` on `log`, which is why the exit notice waits a moment. Lazy
+/// like the journal follower, so building it in `subscription()` is cheap.
+pub(crate) fn child_follower(install_path: String, log: PathBuf, run: PathBuf) -> impl futures::Stream<Item = Message> {
     enum St {
-        Start,
-        Run(tokio::sync::mpsc::UnboundedReceiver<SpawnItem>),
-        ExitPending(Result<Option<i32>, String>),
+        Start(String, PathBuf, PathBuf),
+        Running(tokio::process::Child, u64),
         Done,
     }
-    futures::stream::unfold(St::Start, move |state| {
-        let install_path = install_path.clone();
-        let pid_store = pid_store.clone();
-        async move {
-            let mut rx = match state {
-                St::Start => {
-                    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-                    // Spawned here (inside the polled stream → tokio runtime context).
-                    tokio::spawn(spawn_reader(install_path, pid_store, tx));
-                    rx
+    futures::stream::unfold(St::Start(install_path, log, run), |st| async move {
+        match st {
+            St::Start(install, log, run) => match spawn_detached(&install, &log, &run) {
+                Ok((child, pid, grace)) => Some((Message::SapphireStarted(pid), St::Running(child, grace))),
+                Err(e) => Some((Message::SapphireExited(Err(e)), St::Done)),
+            },
+            St::Running(mut child, grace) => {
+                let result = child.wait().await.map(|s| s.code()).map_err(|e| format!("Error: {}", e));
+                tokio::time::sleep(std::time::Duration::from_millis(grace)).await;
+                Some((Message::SapphireExited(result), St::Done))
+            }
+            St::Done => None,
+        }
+    })
+}
+
+// ── Following a log file ──────────────────────────────────────────────────────
+
+/// `tail -F` for one file, driven by `tail_log_stream`. Opens the path afresh on
+/// every poll — so core's midnight rotation (rename, then a new file) is followed by
+/// name with no inode bookkeeping on either OS — and starts over when the file is
+/// shorter than where it was (truncated by a new Launch, or just rotated). The one
+/// blind spot: a replacement that already outgrew the old file within one poll; a
+/// day's log replaced by 300 ms of a fresh one does not happen.
+struct Tail {
+    path: PathBuf,
+    pos: u64,
+    partial: Vec<u8>,      // bytes after the last newline seen
+    primed: bool,          // the first sight shows the last lines, not the whole file
+    prime_pending: bool,   // ...and that first batch is capped to LAST_LINES
+    skip_to_newline: bool, // we started mid-line: drop up to the next newline
+}
+
+impl Tail {
+    const LAST_LINES: usize = 200;
+    const LAST_BYTES: u64 = 64 * 1024;
+
+    fn new(path: PathBuf) -> Self {
+        Tail { path, pos: 0, partial: Vec::new(), primed: false, prime_pending: false, skip_to_newline: false }
+    }
+
+    /// The complete lines that appeared since the last call (empty = nothing yet).
+    fn poll(&mut self) -> Vec<String> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut lines = Vec::new();
+        // Not there yet (she is booting) or mid-rotation: try again next time.
+        let Ok(mut f) = std::fs::File::open(&self.path) else { return lines };
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        if len < self.pos {
+            self.pos = 0;
+            self.partial.clear();
+            self.skip_to_newline = false;
+        }
+        if !self.primed {
+            self.primed = true;
+            self.prime_pending = true;
+            self.pos = len.saturating_sub(Self::LAST_BYTES);
+            self.skip_to_newline = self.pos > 0;
+        }
+        if self.pos > 0 && f.seek(SeekFrom::Start(self.pos)).is_err() {
+            return lines;
+        }
+        let mut buf = Vec::new();
+        match f.read_to_end(&mut buf) {
+            Ok(0) | Err(_) => return lines,
+            Ok(n) => self.pos += n as u64,
+        }
+        self.partial.extend_from_slice(&buf);
+        if self.skip_to_newline {
+            match self.partial.iter().position(|&b| b == b'\n') {
+                Some(i) => {
+                    self.partial.drain(..=i);
+                    self.skip_to_newline = false;
                 }
-                St::Run(rx) => rx,
-                St::ExitPending(msg) => return Some((Message::SapphireExited(msg), St::Done)),
-                St::Done => return None,
-            };
-            let first = rx.recv().await?;
-            let mut batch = Vec::new();
-            let mut exit = None;
-            match first {
-                SpawnItem::Line(l) => batch.push(l),
-                SpawnItem::Exited(m) => exit = Some(m),
-            }
-            if exit.is_none() {
-                loop {
-                    match rx.try_recv() {
-                        Ok(SpawnItem::Line(l)) => {
-                            batch.push(l);
-                            if batch.len() >= 2000 { break; }
-                        }
-                        Ok(SpawnItem::Exited(m)) => { exit = Some(m); break; }
-                        Err(_) => break,
-                    }
+                None => {
+                    self.partial.clear();
+                    return lines;
                 }
             }
-            // One Message per step: if a poll caught both lines and the exit, emit the
-            // lines now and the exit next (St::ExitPending).
-            match exit {
-                Some(m) if batch.is_empty() => Some((Message::SapphireExited(m), St::Done)),
-                Some(m) => Some((Message::SapphireLines(batch), St::ExitPending(m))),
-                None => Some((Message::SapphireLines(batch), St::Run(rx))),
+        }
+        let Some(last_nl) = self.partial.iter().rposition(|&b| b == b'\n') else {
+            // A writer with no newlines at all: don't hoard forever.
+            if self.partial.len() as u64 > Self::LAST_BYTES {
+                lines.push(clean_line(&std::mem::take(&mut self.partial)));
             }
+            return lines;
+        };
+        let complete: Vec<u8> = self.partial.drain(..=last_nl).collect();
+        let mut parts: Vec<&[u8]> = complete.split(|&b| b == b'\n').collect();
+        parts.pop(); // the empty piece after the final newline
+        lines.extend(parts.into_iter().map(clean_line));
+        if std::mem::take(&mut self.prime_pending) && lines.len() > Self::LAST_LINES {
+            lines.drain(..lines.len() - Self::LAST_LINES);
+        }
+        lines
+    }
+}
+
+/// One raw log line → what the pane shows: lossy UTF-8, ANSI colour stripped, a
+/// `\r` progress bar collapsed to its last segment, the CR of a CRLF dropped.
+fn clean_line(raw: &[u8]) -> String {
+    let raw = raw.strip_suffix(b"\r").unwrap_or(raw);
+    let mut s = strip_ansi(&String::from_utf8_lossy(raw));
+    if let Some(i) = s.rfind('\r') {
+        s = s[i + 1..].to_string();
+    }
+    s
+}
+
+/// `Subscription`-driven follower of a log file: the last ~200 lines first, then
+/// whatever gets appended, polled every 300 ms and batched into one `SapphireLines`
+/// per poll (one redraw per burst). Used for her launch log (Launch, autostart) and
+/// for core's own `sapphire.log` when she was started elsewhere; journalctl stays
+/// the source in service mode. No inotify on purpose: one code path on both OSes,
+/// and the file may not exist yet.
+pub(crate) fn tail_log_stream(path: PathBuf) -> impl futures::Stream<Item = Message> {
+    futures::stream::unfold(Tail::new(path), |mut tail| async move {
+        loop {
+            let lines = tail.poll();
+            if !lines.is_empty() {
+                return Some((Message::SapphireLines(lines), tail));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         }
     })
 }
@@ -824,27 +900,41 @@ mod pure_tests {
     use super::*;
 
     #[test]
-    fn shim_round_trips_awkward_paths_and_is_current() {
+    fn shim_round_trips_awkward_paths_and_starts_her_detached() {
         let cwd = r#"C:\Users\Krem's "lab"\sapphire"#;
         let log = r#"C:\Users\Krem's "lab"\AppData\Roaming\Sapphire\sapphire-launcher.log"#;
-        let src = shim_source(cwd, log);
+        let run = r#"C:\Users\Krem's "lab"\AppData\Roaming\Sapphire\sapphire-run.json"#;
+        let src = shim_source(cwd, log, run);
         assert!(shim_is_current(&src));
+        assert_eq!(shim_version(&src), Some(SHIM_VERSION));
         assert_eq!(shim_cwd(&src).as_deref(), Some(cwd));
-        assert!(src.contains("sys.path.insert(0, _cwd)"), "{}", src);
-        assert!(src.contains("open(_log, \"w\""), "{}", src);
-        assert!(src.contains("os.path.join(_cwd, \"main.py\")"), "{}", src);
-        // The log is opened before chdir: a bad folder still leaves a trace.
-        assert!(src.find("open(_log").unwrap() < src.find("os.chdir(").unwrap());
+        // Like Launch: python.exe (not pythonw), hidden, own process group, stdin
+        // closed, output appended to the log, UTF-8, handshake written atomically.
+        for needle in [
+            "\"python.exe\"", "subprocess.Popen(", "creationflags=0x08000000 | 0x00000200",
+            "stdin=subprocess.DEVNULL", "stdout=_f, stderr=subprocess.STDOUT", "open(_log, \"ab\")",
+            "PYTHONUTF8=\"1\"", "\"by\": \"autostart\"", "os.replace(_run + \".tmp\", _run)",
+            "os.path.join(_cwd, \"main.py\")", "traceback.format_exc()",
+        ] {
+            assert!(src.contains(needle), "missing {:?} in:\n{}", needle, src);
+        }
+        // The log is created before anything can fail: a bad folder still leaves a trace.
+        assert!(src.find("open(_log, \"w\")").unwrap() < src.find("subprocess.Popen(").unwrap());
+        assert!(src.contains(&format!("_run = \"{}\"", run.replace('\\', "\\\\").replace('"', "\\\""))));
     }
 
     #[test]
-    fn v1_shim_is_stale_but_its_folder_is_recoverable() {
+    fn older_shims_are_stale_but_their_folder_is_recoverable() {
         let v1 = "import runpy, sys, os\r\nos.chdir(\"C:\\\\Users\\\\krem\\\\sapphire\")\r\n_log = \"x\"\r\nrunpy.run_path(\"main.py\", run_name=\"__main__\")\r\n";
         assert!(!shim_is_current(v1));
+        assert_eq!(shim_version(v1), None);
         assert_eq!(shim_cwd(v1).as_deref(), Some(r"C:\Users\krem\sapphire"));
+        let v2 = "# sapphire-launcher autostart shim v2 (regenerated by the launcher; edits are overwritten)\r\nimport runpy, sys, os\r\n_cwd = \"C:\\\\Users\\\\krem\\\\sapphire\"\r\n";
+        assert_eq!(shim_version(v2), Some(2));
+        assert!(!shim_is_current(v2), "v2 ran her under pythonw: no console, no graceful Stop");
+        assert_eq!(shim_cwd(v2).as_deref(), Some(r"C:\Users\krem\sapphire"));
         assert!(!shim_is_current(""));
         assert_eq!(shim_cwd("print(1)"), None);
-        assert!(!shim_is_current("# sapphire-launcher autostart shim v1 (old)\n"));
         assert!(shim_is_current(&format!("# sapphire-launcher autostart shim v{} (newer)\n", SHIM_VERSION + 1)));
     }
 
@@ -912,54 +1002,147 @@ mod pure_tests {
     }
 }
 
-// ── Tests (Linux dev box): the spawn follower + graceful stop, end to end ─────
-// Uses the real sapphire env python to run a throwaway fake main.py, so the whole
-// chain is exercised: spawn in its own process group, pid stored, lines pumped,
-// SIGTERM via signal_stop, exit code reported, last teardown lines not lost.
+// ── Tests: the log tail (any OS) ──────────────────────────────────────────────
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+    use futures::StreamExt;
+    use std::io::Write;
+    use std::time::Duration;
+
+    type Pinned<S> = std::pin::Pin<Box<S>>;
+
+    async fn next_lines(s: &mut Pinned<impl futures::Stream<Item = Message>>) -> Vec<String> {
+        match tokio::time::timeout(Duration::from_secs(5), s.next()).await {
+            Ok(Some(Message::SapphireLines(l))) => l,
+            Ok(Some(_)) => panic!("unexpected message"),
+            Ok(None) => panic!("tail ended"),
+            Err(_) => panic!("no lines within 5 s"),
+        }
+    }
+
+    /// Batches until `n` lines have arrived (a big append may land in two polls).
+    async fn lines_until(s: &mut Pinned<impl futures::Stream<Item = Message>>, n: usize) -> Vec<String> {
+        let mut all = Vec::new();
+        while all.len() < n {
+            all.extend(next_lines(s).await);
+        }
+        all
+    }
+
+    fn append(path: &std::path::Path, bytes: &[u8]) {
+        let mut f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("sapphire-launcher-test-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn tail_shows_the_end_then_follows_appends_truncation_and_rotation() {
+        let dir = scratch("tail");
+        let path = dir.join("sapphire.log");
+        let body: String = (0..300).map(|i| format!("line {}\n", i)).collect();
+        std::fs::write(&path, &body).unwrap();
+
+        let mut s = Box::pin(tail_log_stream(path.clone()));
+        let first = next_lines(&mut s).await;
+        assert_eq!(first.len(), 200, "the last 200 lines, not all 300");
+        assert_eq!((first[0].as_str(), first[199].as_str()), ("line 100", "line 299"));
+
+        // Appended: CRLF, a colour code, a \r progress bar.
+        append(&path, b"\x1b[31mred\x1b[0m\r\n10%\r50%\r100% done\n");
+        assert_eq!(lines_until(&mut s, 2).await, vec!["red", "100% done"]);
+
+        // Truncated and rewritten (a new Launch): from the top again.
+        std::fs::write(&path, "fresh\n").unwrap();
+        assert_eq!(next_lines(&mut s).await, vec!["fresh"]);
+
+        // Rotated the way core does at midnight: the full file renamed away, a new
+        // (smaller) one under the same name.
+        append(&path, body.as_bytes());
+        assert_eq!(lines_until(&mut s, 300).await.len(), 300);
+        std::fs::rename(&path, dir.join("sapphire.log.2026-10-19")).unwrap();
+        std::fs::write(&path, "after rotation\n").unwrap();
+        assert_eq!(next_lines(&mut s).await, vec!["after rotation"]);
+
+        // A partial line waits for its newline.
+        append(&path, b"half");
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        append(&path, b" and whole\n");
+        assert_eq!(next_lines(&mut s).await, vec!["half and whole"]);
+    }
+
+    #[tokio::test]
+    async fn tail_waits_for_a_file_that_is_not_there_yet() {
+        let path = scratch("tail-late").join("late.log");
+        let mut s = Box::pin(tail_log_stream(path.clone()));
+        let p = path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            std::fs::write(&p, "born\n").unwrap();
+        });
+        assert_eq!(next_lines(&mut s).await, vec!["born"]);
+        assert_eq!(clean_line(b"plain\r"), "plain");
+        assert_eq!(clean_line(b"\xff\xfebad utf8"), "\u{fffd}\u{fffd}bad utf8");
+    }
+}
+
+// ── Tests (Linux dev box): detached launch, end to end ───────────────────────
+// Uses the real sapphire env python to run a throwaway fake main.py that behaves
+// like core's runner: writes the instance lock note, handles SIGTERM, prints. The
+// whole chain is exercised: detached spawn in its own session, handshake written,
+// pid reported, lines read back from the log file, find_instance agreeing with the
+// Child, SIGTERM via signal_stop, exit code reported, last lines not lost, and the
+// stale note believed by nobody afterwards.
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use futures::StreamExt;
     use std::time::Duration;
 
-    /// A throwaway install dir holding a fake `main.py` with the given body.
-    fn fake_install(name: &str, body: &str) -> String {
-        let dir = std::env::temp_dir()
-            .join(format!("sapphire-launcher-test-{}-{}", std::process::id(), name));
+    type Pinned<S> = std::pin::Pin<Box<S>>;
+
+    /// A throwaway install dir with a fake `main.py`, plus a log and handshake path
+    /// inside it (never the real config dir).
+    fn fake_install(name: &str, body: &str) -> (String, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("sapphire-launcher-test-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("main.py"), body).unwrap();
-        dir.to_string_lossy().into_owned()
+        (dir.to_string_lossy().into_owned(), dir.join("cfg").join("sapphire-launcher.log"), dir.join("cfg").join("sapphire-run.json"))
     }
 
-    /// Drive the follower until it reports the exit. `on_line` sees every log line
-    /// (the test reacts to the fake runner's "starting" line from there).
-    async fn run_until_exit(
-        stream: impl futures::Stream<Item = Message>,
-        mut on_line: impl FnMut(&str),
-    ) -> (Vec<String>, Result<Option<i32>, String>) {
-        futures::pin_mut!(stream);
-        let mut lines = Vec::new();
-        while let Some(msg) = stream.next().await {
-            match msg {
-                Message::SapphireLines(batch) => {
-                    for l in &batch { on_line(l); }
-                    lines.extend(batch);
+    async fn next_msg(s: &mut Pinned<impl futures::Stream<Item = Message>>) -> Message {
+        tokio::time::timeout(Duration::from_secs(15), s.next()).await.expect("follower timed out").expect("follower ended")
+    }
+
+    /// Tail batches until one holds `needle`; everything seen so far.
+    async fn tail_until(t: &mut Pinned<impl futures::Stream<Item = Message>>, needle: &str) -> Vec<String> {
+        let mut all = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(15), t.next()).await {
+                Ok(Some(Message::SapphireLines(l))) => {
+                    all.extend(l);
+                    if all.iter().any(|x| x.contains(needle)) {
+                        return all;
+                    }
                 }
-                Message::SapphireExited(r) => return (lines, r),
-                _ => {}
+                _ => panic!("tail never showed {:?}; got {:?}", needle, all),
             }
         }
-        panic!("follower ended without an exit notice");
     }
 
-    #[tokio::test]
-    async fn graceful_stop_exits_zero_and_keeps_last_lines() {
-        if sapphire_env_python().is_none() {
-            eprintln!("skipped: no sapphire env python on this box");
-            return;
-        }
-        let dir = fake_install("graceful", r#"
-import signal, sys, time
+    /// Core's runner in miniature: the lock note, a SIGTERM handler, two prints.
+    const RUNNER: &str = r#"
+import os, signal, sys, time
+os.makedirs("user", exist_ok=True)
+with open("user/.instance.lock", "wb") as f:
+    f.write(b"\n" + f"pid={os.getpid()} since=2026-10-20 08:01:02\n".encode())
 stop = False
 def h(sig, frame):
     global stop
@@ -971,47 +1154,55 @@ while not stop:
 print("[Runner] fake stopping", flush=True)
 time.sleep(0.3)
 sys.exit(0)
-"#);
-        let pid = Arc::new(AtomicU32::new(0));
-        let p = pid.clone();
-        let mut signaled = false;
-        let fut = run_until_exit(spawn_log_stream(dir, pid.clone()), move |line| {
-            // Signal only once the handler is installed (the fake says so).
-            if !signaled && line.contains("fake starting") {
-                signaled = true;
-                let pid = p.load(Ordering::Relaxed);
-                assert!(pid > 1, "pid not stored before the first line");
-                // The runner must lead its own process group — signal_group refuses
-                // anything else, and this is what keeps the signal off the session.
-                assert_eq!(process_group_of(pid), Some(pid as i32), "runner is not a process-group leader");
-                assert!(signal_stop(pid), "signal_stop could not send SIGTERM");
-            }
-        });
-        let (lines, exit) = tokio::time::timeout(Duration::from_secs(15), fut)
-            .await
-            .expect("follower did not report an exit in time");
-        assert_eq!(exit, Ok(Some(0)));
-        assert!(lines.iter().any(|l| l.contains("fake stopping")), "teardown line lost: {:?}", lines);
-    }
+"#;
 
     #[tokio::test]
-    async fn twin_exit_code_is_passed_through() {
+    async fn detached_launch_is_found_followed_and_stopped_gracefully() {
         if sapphire_env_python().is_none() {
             eprintln!("skipped: no sapphire env python on this box");
             return;
         }
-        let dir = fake_install(
+        let (dir, log, run) = fake_install("detached", RUNNER);
+        let mut follower = Box::pin(child_follower(dir.clone(), log.clone(), run.clone()));
+        let Message::SapphireStarted(pid) = next_msg(&mut follower).await else { panic!("expected SapphireStarted") };
+        assert!(pid > 1);
+        // Her own session: she leads her process group (what signal_group checks).
+        assert_eq!(process_group_of(pid), Some(pid as i32), "runner is not a process-group leader");
+        // The handshake is on disk before the pid is reported.
+        assert_eq!(read_run_state(&run), Some(RunState { pid, log: log.clone(), origin: Origin::Launcher }));
+
+        let mut tail = Box::pin(tail_log_stream(log.clone()));
+        let lines = tail_until(&mut tail, "fake starting").await;
+        assert!(lines.iter().any(|l| l.starts_with("[Launcher] Using ")), "{:?}", lines);
+
+        // What a later launcher sees: the lock names her, the handshake claims her.
+        let found = resolve_instance(read_lock_note(&dir).as_deref(), read_run_state(&run), pid_is_hers, &dir);
+        assert_eq!(found, Some(Instance { pid, since: "2026-10-20 08:01:02".into(), origin: Origin::Launcher, log: log.clone() }));
+
+        assert!(signal_stop(pid), "signal_stop could not send SIGTERM");
+        assert!(matches!(next_msg(&mut follower).await, Message::SapphireExited(Ok(Some(0)))));
+        tail_until(&mut tail, "fake stopping").await;
+
+        // Gone: the note is stale, nobody is found, nothing can be signalled.
+        assert!(!pid_is_hers(pid));
+        assert_eq!(resolve_instance(read_lock_note(&dir).as_deref(), read_run_state(&run), pid_is_hers, &dir), None);
+        assert!(!signal_stop(pid));
+    }
+
+    #[tokio::test]
+    async fn twin_exit_code_is_passed_through_and_its_line_lands_in_the_log() {
+        if sapphire_env_python().is_none() {
+            eprintln!("skipped: no sapphire env python on this box");
+            return;
+        }
+        let (dir, log, run) = fake_install(
             "twin",
             "import sys\nprint('[Runner] Another Sapphire is already running (fake)', flush=True)\nsys.exit(43)\n",
         );
-        let pid = Arc::new(AtomicU32::new(0));
-        let (lines, exit) = tokio::time::timeout(
-            Duration::from_secs(15),
-            run_until_exit(spawn_log_stream(dir, pid), |_| {}),
-        )
-        .await
-        .expect("follower did not report an exit in time");
-        assert_eq!(exit, Ok(Some(43)));
-        assert!(lines.iter().any(|l| l.contains("Another Sapphire")), "runner line lost: {:?}", lines);
+        let mut follower = Box::pin(child_follower(dir, log.clone(), run));
+        assert!(matches!(next_msg(&mut follower).await, Message::SapphireStarted(p) if p > 1));
+        assert!(matches!(next_msg(&mut follower).await, Message::SapphireExited(Ok(Some(43)))));
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("Another Sapphire"), "runner line lost: {}", text);
     }
 }

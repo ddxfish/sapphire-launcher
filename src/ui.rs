@@ -808,7 +808,8 @@ impl App {
 
     fn view_running_tab(&self) -> Element<'_, Message> {
         let status_text = if self.sapphire_running {
-            text("Sapphire is running").size(13).color(color!(0x4caf50))
+            let words = self.attached.as_ref().map_or_else(|| "Sapphire is running".to_string(), |i| i.describe());
+            text(words).size(13).color(color!(0x4caf50))
         } else if self.sapphire_log.is_empty() {
             text("Hit Launch to start Sapphire.").size(13).color(color!(0x7f849c))
         } else {
