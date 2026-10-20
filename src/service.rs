@@ -556,8 +556,14 @@ pub(crate) async fn run_cmd_streamed(
         }
     }
 
+    // stdin is never inherited: ours is null (GUI app) or, if a Stop just made the
+    // console trip in signal_stop, a dead handle — and inheriting a dead handle fails
+    // the spawn with "The handle is invalid". Same rule for every child we start.
     let mut cmd = tokio::process::Command::new(&program);
-    cmd.args(&args).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+    cmd.args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .env("CONDA_PLUGINS_AUTO_ACCEPT_TOS", "yes"); // see run_cmd_full_async
     if let Some(d) = cwd { cmd.current_dir(d); }
     #[cfg(windows)]
@@ -586,6 +592,7 @@ async fn journal_reader(tx: tokio::sync::mpsc::UnboundedSender<String>) {
     use tokio::io::AsyncBufReadExt;
     let mut cmd = tokio::process::Command::new("journalctl");
     cmd.args(["--user", "-u", "sapphire", "-f", "-n", "200", "-o", "cat"])
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .kill_on_drop(true);
@@ -679,6 +686,7 @@ async fn spawn_reader(
     let mut cmd = tokio::process::Command::new(&program);
     cmd.args(&args)
         .current_dir(&install_path)
+        .stdin(std::process::Stdio::null()) // see run_cmd_streamed; systemd gives her /dev/null too
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .env("PYTHONIOENCODING", "utf-8")

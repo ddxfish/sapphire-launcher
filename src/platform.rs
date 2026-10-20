@@ -147,20 +147,28 @@ pub(crate) fn sapphire_python_cmd() -> (String, Vec<String>) {
     }
 }
 
+/// Start a child we never talk to again, with none of our stdio. A plain `spawn()`
+/// inherits all three standard handles, and a GUI app's are null or — after
+/// `signal_stop`'s console trip — dead, which fails the spawn outright.
+fn fire(cmd: &mut Command) {
+    use std::process::Stdio;
+    let _ = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+}
+
 /// Open a URL in the user's default browser.
 pub(crate) fn open_url(url: &str) {
     #[cfg(windows)]
-    { let _ = hidden_cmd("cmd").args(["/c", "start", url]).spawn(); }
+    fire(hidden_cmd("cmd").args(["/c", "start", url]));
     #[cfg(not(windows))]
-    { let _ = hidden_cmd("xdg-open").arg(url).spawn(); }
+    fire(hidden_cmd("xdg-open").arg(url));
 }
 
 /// Open a file in the user's default viewer/editor.
 pub(crate) fn open_file(path: &std::path::Path) {
     #[cfg(windows)]
-    { let _ = hidden_cmd("notepad").arg(path).spawn(); }
+    fire(hidden_cmd("notepad").arg(path));
     #[cfg(not(windows))]
-    { let _ = hidden_cmd("xdg-open").arg(path).spawn(); }
+    fire(hidden_cmd("xdg-open").arg(path));
 }
 
 /// Platform null device for discarding command output.
@@ -200,7 +208,12 @@ fn signal_group(pid: u32, sig: libc::c_int) -> bool {
 /// Windows: CTRL_BREAK to the runner's process group — it is spawned with
 /// CREATE_NEW_PROCESS_GROUP so its pid is the group id, and main.py/sapphire.py
 /// handle SIGBREAK as a stop. The launcher is a GUI app with no console of its own,
-/// so it briefly attaches to the runner's hidden console to send the event.
+/// so it briefly attaches to the runner's hidden console to send the event, and puts
+/// its standard handles back afterwards: AttachConsole repoints stdin/stdout/stderr
+/// at that console and FreeConsole closes them without restoring the old values, so
+/// without the restore every later child that inherits a handle (tokio's spawn
+/// inherits stdin) would fail at birth with "The handle is invalid (os error 6)" —
+/// pip after an update-stop, the next Launch.
 /// Linux: SIGTERM to the process group. Returns false if the signal could not be
 /// sent; the caller then falls back to `kill_process_tree`.
 pub(crate) fn signal_stop(pid: u32) -> bool {
@@ -210,20 +223,26 @@ pub(crate) fn signal_stop(pid: u32) -> bool {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::Console::{
-            AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler,
-            CTRL_BREAK_EVENT,
+            AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, GetStdHandle,
+            SetConsoleCtrlHandler, SetStdHandle, CTRL_BREAK_EVENT, STD_ERROR_HANDLE,
+            STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
         };
         // SAFETY: plain Win32 calls against our own process; the only pointer argument
         // is the null handler (None), which is the documented "ignore Ctrl+C" form.
         unsafe {
+            let std_ids = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+            let saved = std_ids.map(|id| GetStdHandle(id));
             FreeConsole();
-            if AttachConsole(pid) == 0 {
-                return false;
+            let mut sent = false;
+            if AttachConsole(pid) != 0 {
+                SetConsoleCtrlHandler(None, 1);
+                sent = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
+                FreeConsole();
+                SetConsoleCtrlHandler(None, 0);
             }
-            SetConsoleCtrlHandler(None, 1);
-            let sent = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
-            FreeConsole();
-            SetConsoleCtrlHandler(None, 0);
+            for (id, h) in std_ids.into_iter().zip(saved) {
+                SetStdHandle(id, h);
+            }
             sent
         }
     }
