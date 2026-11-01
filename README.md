@@ -67,10 +67,10 @@ The Linux script needs Docker: the binary is compiled in an Ubuntu 22.04 contain
 Publishing a beta (pre-release) from the repo root, after both builds:
 
 ```
-gh release create v0.9.6 dist/* --prerelease --title "Sapphire Launcher v0.9.6 (beta)" --generate-notes
+gh release create v0.9.7 dist/* --prerelease --title "Sapphire Launcher v0.9.7 (beta)" --generate-notes
 ```
 
-Add a file built elsewhere later with `gh release upload v0.9.6 <file>`; promote it with `gh release edit v0.9.6 --prerelease=false`.
+Add a file built elsewhere later with `gh release upload v0.9.7 <file>`; promote it with `gh release edit v0.9.7 --prerelease=false`.
 
 CI (`.github/workflows/ci.yml`) runs clippy with warnings-as-errors and the tests on Linux and Windows for every push, and keeps the Windows release exe as a build artifact. The launcher checks the GitHub releases of this repo on start and shows a badge when a newer one exists.
 

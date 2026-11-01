@@ -453,6 +453,7 @@ enum Message {
     // Launch
     InstancePoll,                    // startup + every 5 s: is a Sapphire running on this install?
     InstanceFound(Option<Instance>), // the answer (None = nobody we can vouch for)
+    TwinLookup(Option<Instance>),    // the same question after a Launch exited 43
     SapphireStarted(u32),            // our detached runner is up: its pid
     SapphireLines(Vec<String>), // a coalesced batch of log lines (burst-safe)
     SapphireExited(Result<Option<i32>, String>), // runner ended: Ok(exit code) / Err(never started)
@@ -572,7 +573,7 @@ async fn wait_health_down(port: u16, tries: usize) -> bool {
 /// by the sweep. Off the UI thread.
 async fn instance_lookup(install: String, port: u16) -> Option<Instance> {
     let i = install.clone();
-    let (found, has_lock) = tokio::task::spawn_blocking(move || (find_instance(&i), lock_path(&i).exists()))
+    let (found, has_lock) = tokio::task::spawn_blocking(move || (find_instance(&i), has_lock_file(&i)))
         .await
         .unwrap_or((None, true));
     match (found, has_lock) {
@@ -691,6 +692,15 @@ impl App {
                     return Task::none();
                 }
 
+                // Already up? Attach instead of starting a twin, whose start would
+                // wipe the log she is writing to. A unit mid-start is handled below.
+                if !self.service.as_ref().is_some_and(|s| s.holds_her())
+                    && let Some(her) = find_instance(&self.install_path)
+                {
+                    self.active_tab = Tab::Running;
+                    return self.update(Message::InstanceFound(Some(her)));
+                }
+
                 // Service mode: start the systemd unit + follow journalctl instead.
                 if self.service.is_some() {
                     return self.update(Message::ServiceStart);
@@ -705,8 +715,8 @@ impl App {
                     return Task::none();
                 }
 
-                // Just start her. If another Sapphire already holds this user/, core
-                // says so and exits 43 within a second — SapphireExited shows the line.
+                // Start her. If one we could not see holds this user/, core says so and
+                // exits 43 within a second; SapphireExited then goes looking for her.
                 // The child follower is a Subscription keyed on child_epoch: flipping
                 // holding_child on (and bumping the epoch) starts her, detached.
                 // SapphireStarted brings her pid and starts the log tail.
@@ -896,6 +906,7 @@ impl App {
                 if !self.holding_child {
                     return Task::none();
                 }
+                let twin = !self.sapphire_stopping && matches!(result, Ok(Some(43)));
                 let msg = exit_message(result, self.sapphire_stopping);
                 self.sapphire_log.push(format!("--- {} ---", msg));
                 self.log_lines.push(msg);
@@ -905,8 +916,19 @@ impl App {
                     self.sapphire_running = false;
                     self.holding_child = false;
                     self.attached = None;
+                    if twin {
+                        // She is up and we have a way to reach her: get the Stop button back.
+                        return Task::perform(instance_lookup(self.install_path.clone(), self.web_port), Message::TwinLookup);
+                    }
                     Task::none()
                 }
+            }
+            Message::TwinLookup(found) => {
+                if found.is_some() {
+                    return self.update(Message::InstanceFound(found));
+                }
+                self.log_lines.push("Couldn't find that Sapphire from here. It may belong to another Windows or Linux user, or another app may be using her web port. See the line above.".to_string());
+                Task::none()
             }
             Message::SapphireStopConfirmed(stopped) => {
                 if !self.sapphire_stopping {
@@ -985,17 +1007,30 @@ impl App {
                     return Task::none();
                 }
                 // Service mode: ask systemd — the unit is the truth there.
-                if self.service.is_some() {
-                    return Task::perform(
-                        async { tokio::task::spawn_blocking(detect_sapphire_service).await.unwrap_or(None) },
-                        Message::ServiceRefreshed,
-                    );
-                }
-                Task::perform(instance_lookup(self.install_path.clone(), self.web_port), Message::InstanceFound)
+                let lookup = Task::perform(instance_lookup(self.install_path.clone(), self.web_port), Message::InstanceFound);
+                let Some(unit) = &self.service else { return lookup };
+                let holds = unit.holds_her();
+                let refresh = Task::perform(
+                    async { tokio::task::spawn_blocking(detect_sapphire_service).await.unwrap_or(None) },
+                    Message::ServiceRefreshed,
+                );
+                // A unit that isn't running her doesn't rule out a Sapphire started
+                // some other way: Launch would just exit 43 against her.
+                if holds { refresh } else { Task::batch([refresh, lookup]) }
             }
             Message::InstanceFound(found) => {
-                if self.holding_child || self.sapphire_stopping || self.service.is_some() {
+                if self.holding_child || self.sapphire_stopping {
                     return Task::none();
+                }
+                // With a unit: it owns her while it runs her. Otherwise only a pid is
+                // worth attaching to; the no-pid sweep is not for a box with a unit.
+                if let Some(unit) = &self.service {
+                    if unit.holds_her() {
+                        return Task::none();
+                    }
+                    if found.as_ref().is_some_and(|i| i.pid == 0) {
+                        return Task::none();
+                    }
                 }
                 let same = match (&found, &self.attached) {
                     (Some(i), Some(c)) => c.pid == i.pid && c.log == i.log,
@@ -1007,6 +1042,7 @@ impl App {
                         // Found her (autostart, a terminal, an earlier launcher): say
                         // who she is and follow her log.
                         self.sapphire_running = true;
+                        self.streaming_journal = false;
                         self.sapphire_log.clear();
                         self.log_lines.push(format!("{}.", inst.describe()));
                         self.attached = Some(inst);
@@ -1395,9 +1431,9 @@ impl App {
             Message::ServiceDetected(info) => {
                 let mut tasks: Vec<Task<Message>> = vec![self.env_reload(&info)];
                 self.service = info.clone();
-                if info.is_none() {
-                    // No unit: is she running anyway (autostart, a terminal, an
-                    // earlier launcher)? Asked now, then every 5 s.
+                if info.as_ref().is_none_or(|i| !i.holds_her()) {
+                    // No unit running her: is she running anyway (autostart, a terminal,
+                    // an earlier launcher)? Asked now, then every 5 s.
                     tasks.push(Task::done(Message::InstancePoll));
                 }
                 if let Some(info) = info {
@@ -1505,7 +1541,11 @@ impl App {
                 if let Some(info) = &info
                     && !self.sapphire_stopping
                 {
-                    self.sapphire_running = info.active;
+                    // The unit took over from an instance we had found.
+                    if info.holds_her() && !self.holding_child {
+                        self.attached = None;
+                    }
+                    self.sapphire_running = info.active || self.attached.is_some();
                     // She came up behind our back (crash restart, a terminal start):
                     // attach the log follower.
                     if info.active && !self.streaming_journal {
@@ -2455,10 +2495,52 @@ mod tests {
         let mut a = app();
         let _ = a.update(Message::ServiceDetected(None));
         assert!(a.service.is_none() && !a.sapphire_running);
-        // In service mode a found instance is ignored: systemd owns the running state.
+    }
+
+    #[test]
+    fn a_unit_owns_her_only_while_it_runs_her() {
+        let unit = |state: &str| ServiceInfo { active: state == "active", active_state: state.into(), enabled: true, sub_state: "x".into(), working_dir: None, env_file: None };
+        let her = Instance { pid: 9, since: String::new(), origin: Origin::Elsewhere, log: PathBuf::new() };
+        // Unit running: a found instance is the unit's own.
+        let mut a = app();
+        a.service = Some(unit("active"));
+        let _ = a.update(Message::InstanceFound(Some(her.clone())));
+        assert!(a.attached.is_none());
+        // Unit down, Sapphire up: she was started some other way. Stop reaches her by pid.
         let mut b = app();
-        b.service = Some(ServiceInfo { active: false, active_state: "inactive".into(), enabled: true, sub_state: "dead".into(), working_dir: None, env_file: None });
-        let _ = b.update(Message::InstanceFound(Some(Instance { pid: 9, since: String::new(), origin: Origin::Elsewhere, log: PathBuf::new() })));
-        assert!(!b.sapphire_running && b.attached.is_none());
+        b.service = Some(unit("inactive"));
+        let _ = b.update(Message::InstanceFound(Some(her.clone())));
+        assert!(b.sapphire_running && b.attached.as_ref().is_some_and(|i| i.pid == 9));
+        let _ = b.update(Message::ServiceRefreshed(Some(unit("inactive"))));
+        assert!(b.sapphire_running, "the unit being down doesn't make her down");
+        let _ = b.update(Message::StopSapphire);
+        assert!(b.sapphire_stopping && b.stop_epoch == 1);
+        // No pid: never the sweep on a box with a unit.
+        let mut c = app();
+        c.service = Some(unit("inactive"));
+        let _ = c.update(Message::InstanceFound(Some(Instance { pid: 0, ..her.clone() })));
+        assert!(c.attached.is_none());
+        // She went away and the unit came up: back to the unit.
+        let mut d = app();
+        d.service = Some(unit("inactive"));
+        let _ = d.update(Message::InstanceFound(Some(her)));
+        let _ = d.update(Message::ServiceRefreshed(Some(unit("active"))));
+        assert!(d.attached.is_none() && d.sapphire_running);
+    }
+
+    #[test]
+    fn a_launch_that_loses_to_a_twin_attaches_to_the_winner() {
+        let mut a = app();
+        ours(&mut a);
+        let _ = a.update(Message::SapphireExited(Ok(Some(43))));
+        assert!(!a.sapphire_running && !a.holding_child && a.attached.is_none());
+        let winner = Instance { pid: 5151, since: String::new(), origin: Origin::Elsewhere, log: PathBuf::from("/core.log") };
+        let _ = a.update(Message::TwinLookup(Some(winner.clone())));
+        assert!(a.sapphire_running && a.attached == Some(winner), "Stop is back");
+        let mut b = app();
+        ours(&mut b);
+        let _ = b.update(Message::SapphireExited(Ok(Some(43))));
+        let _ = b.update(Message::TwinLookup(None));
+        assert!(!b.sapphire_running && logged(&b, "Couldn't find that Sapphire"));
     }
 }

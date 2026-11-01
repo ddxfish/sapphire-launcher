@@ -92,8 +92,8 @@ pub(crate) fn autostart_shim_path() -> PathBuf {
 // ── Finding her ─────────────────────────────────────────────────────────────
 // The launcher starts Sapphire detached and is not her parent. To know whether she
 // is running, who started her and where her output goes, it reads two small files:
-// core's own instance lock (`user/.instance.lock`, written by her runner since
-// 2026-10-16) and our handshake (`sapphire-run.json`, written by Launch and by the
+// core's own instance lock (`<config>/locks/instance-<key>.lock` since 2026-10-27,
+// `user/.instance.lock` before that) and our handshake (`sapphire-run.json`, written by Launch and by the
 // Windows autostart shim). Both name a pid, and a pid is believed only after it is
 // checked to be alive AND a sapphire-env python (`pid_is_hers`): notes outlive her,
 // and a reboot can hand the number to anything.
@@ -116,9 +116,57 @@ pub(crate) fn core_log_path(install: &str) -> PathBuf {
     PathBuf::from(install).join("user").join("logs").join("sapphire.log")
 }
 
-/// Core's instance lock. Absent = never run, or a core from before the lock.
-pub(crate) fn lock_path(install: &str) -> PathBuf {
+/// Where a runner from before 2026-10-27 keeps its lock. One can still be up after an
+/// update; core deletes this file as soon as a newer runner takes the lock.
+pub(crate) fn legacy_lock_path(install: &str) -> PathBuf {
     PathBuf::from(install).join("user").join(".instance.lock")
+}
+
+/// What Python's `os.path.normcase` does on Windows, after `realpath`'s prefix strip:
+/// no `\\\\?\\` prefix, backslashes, lower case.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_normcase(path: &str) -> String {
+    let plain = match (path.strip_prefix(r"\\?\UNC\"), path.strip_prefix(r"\\?\")) {
+        (Some(unc), _) => format!(r"\\{}", unc),
+        (_, Some(p)) => p.to_string(),
+        _ => path.to_string(),
+    };
+    plain.replace('/', "\\").to_lowercase()
+}
+
+/// A path the way core spells it: `normcase(realpath(path))`. None = it does not exist.
+fn core_spelling(path: &std::path::Path) -> Option<String> {
+    let real = std::fs::canonicalize(path).ok()?.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    return Some(windows_normcase(&real));
+    #[cfg(not(windows))]
+    Some(real)
+}
+
+/// Core's lock key: the first 16 hex digits of the sha256 of that spelling.
+/// MUST match `core/single_instance.py::lock_path`; the test vectors pin it.
+fn lock_key(spelled_user_dir: &str) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(spelled_user_dir.as_bytes())[..8].iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Core's instance lock for this install. None = no user/ folder, so she never ran here.
+pub(crate) fn instance_lock_path(install: &str) -> Option<PathBuf> {
+    let user = core_spelling(&PathBuf::from(install).join("user"))?;
+    Some(app_config_dir().join("locks").join(format!("instance-{}.lock", lock_key(&user))))
+}
+
+/// Does this install have a lock file at all? No = a core from before the lock.
+pub(crate) fn has_lock_file(install: &str) -> bool {
+    legacy_lock_path(install).exists() || instance_lock_path(install).is_some_and(|p| p.exists())
+}
+
+/// Do two paths name the same install folder?
+fn same_install(a: &str, b: &str) -> bool {
+    a == b || match (core_spelling(a.as_ref()), core_spelling(b.as_ref())) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
 }
 
 /// Who started the Sapphire we found: decides the wording and where her log is.
@@ -163,6 +211,34 @@ pub(crate) struct RunState {
     pub(crate) pid: u32,
     pub(crate) log: PathBuf,
     pub(crate) origin: Origin,
+    pub(crate) install: Option<String>, // None = written by a shim before v4
+    pub(crate) started: u64,            // unix seconds; 0 = unknown
+}
+
+/// Seconds since the epoch, for the handshake.
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// When this machine booted (unix seconds). None = unknown.
+fn boot_time() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        // SAFETY: GetTickCount64 takes nothing and cannot fail.
+        let up = unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() } / 1000;
+        now_secs().checked_sub(up)
+    }
+    #[cfg(not(windows))]
+    {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        stat.lines().find_map(|l| l.strip_prefix("btime ")?.trim().parse().ok())
+    }
+}
+
+/// A handshake from before this boot names a pid from a previous life. The slack
+/// covers clock jitter between the two readings.
+pub(crate) fn handshake_is_stale(started: u64, boot: Option<u64>) -> bool {
+    boot.is_some_and(|b| started > 0 && started + 5 < b)
 }
 
 /// Write the handshake atomically (tmp + rename): a reader never sees half a file.
@@ -172,9 +248,7 @@ pub(crate) fn write_run_state(path: &std::path::Path, st: &RunState) -> std::io:
         Origin::Autostart => "autostart",
         Origin::Elsewhere => "elsewhere",
     };
-    let started = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-    let json = serde_json::json!({ "pid": st.pid, "log": st.log.to_string_lossy(), "by": by, "started": started });
+    let json = serde_json::json!({ "pid": st.pid, "log": st.log.to_string_lossy(), "by": by, "started": st.started, "install": st.install });
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -193,15 +267,17 @@ pub(crate) fn read_run_state(path: &std::path::Path) -> Option<RunState> {
         Some("autostart") => Origin::Autostart,
         _ => Origin::Launcher,
     };
-    Some(RunState { pid, log, origin })
+    let install = v.get("install").and_then(|i| i.as_str()).map(str::to_string);
+    let started = v.get("started").and_then(|s| s.as_u64()).unwrap_or(0);
+    Some(RunState { pid, log, origin, install, started })
 }
 
 /// Core's lock note, read the way core itself reads it: from byte 1. Byte 0 carries
 /// the kernel lock, and Windows refuses to let another process read a locked byte.
 /// None = no file.
-pub(crate) fn read_lock_note(install: &str) -> Option<String> {
+pub(crate) fn read_lock_note(path: &std::path::Path) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut f = std::fs::File::open(lock_path(install)).ok()?;
+    let mut f = std::fs::File::open(path).ok()?;
     f.seek(SeekFrom::Start(1)).ok()?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).ok()?;
@@ -246,8 +322,9 @@ pub(crate) fn resolve_instance(
         return Some(Instance { pid, since, origin, log });
     }
     // No lock (a core from before 2026-10-16 — Stable, as of this writing) or a
-    // stale one: the handshake alone still finds a Sapphire Launch or the shim started.
-    let r = run?;
+    // stale one: the handshake alone still finds a Sapphire Launch or the shim started
+    // — on this install: a handshake from another checkout is not about this one.
+    let r = run.filter(|r| r.install.as_deref().is_none_or(|i| same_install(i, install)))?;
     hers(r.pid).then(|| Instance { pid: r.pid, since: String::new(), origin: r.origin, log: r.log })
 }
 
@@ -256,7 +333,36 @@ pub(crate) fn resolve_instance(
 /// vouch for (an old core started elsewhere is still possible; the caller's web
 /// port probe covers that).
 pub(crate) fn find_instance(install: &str) -> Option<Instance> {
-    resolve_instance(read_lock_note(install).as_deref(), read_run_state(&run_state_path()), pid_is_hers, install)
+    let locks: Vec<PathBuf> = instance_lock_path(install).into_iter().chain([legacy_lock_path(install)]).collect();
+    // A pid we may not look at counts only while a lock's byte is really held: after
+    // a reboot a stale note's number can belong to a system process.
+    let hers = |pid: u32| pid_look(pid).unwrap_or_else(|| locks.iter().any(|l| lock_is_held(l)));
+    // The first note naming a live her (a stale new lock must not hide an old runner).
+    let note = locks.iter().filter_map(|l| read_lock_note(l))
+        .find(|n| parse_lock_note(n).is_some_and(|(pid, _)| hers(pid)));
+    let run = read_run_state(&run_state_path()).filter(|r| !handshake_is_stale(r.started, boot_time()));
+    resolve_instance(note.as_deref(), run, hers, install)
+}
+
+/// Is the lock's byte 0 held? Windows refuses a read of a byte another process has
+/// locked (ERROR_LOCK_VIOLATION), so this asks without ever taking the lock, which
+/// could make a booting Sapphire exit 43.
+#[cfg(windows)]
+pub(crate) fn lock_is_held(path: &std::path::Path) -> bool {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return false };
+    f.read(&mut [0u8; 1]).is_err_and(|e| e.raw_os_error() == Some(33))
+}
+/// Linux never answers "can't tell" (see `pid_look`), so this is never asked there.
+#[cfg(not(windows))]
+pub(crate) fn lock_is_held(_path: &std::path::Path) -> bool {
+    false
+}
+
+/// Alive and hers, or possibly so: what a Stop in progress must keep waiting on, and
+/// the check before any signal.
+pub(crate) fn pid_is_hers(pid: u32) -> bool {
+    pid_look(pid) != Some(false)
 }
 
 /// Is `pid` alive and a sapphire-env python running her? Linux: /proc gives the
@@ -264,38 +370,38 @@ pub(crate) fn find_instance(install: &str) -> Option<Instance> {
 /// identity half is what makes a recycled pid harmless: nothing that fails it is
 /// ever signalled.
 #[cfg(not(windows))]
-pub(crate) fn pid_is_hers(pid: u32) -> bool {
+pub(crate) fn pid_look(pid: u32) -> Option<bool> {
     if pid <= 1 {
-        return false;
+        return Some(false);
     }
-    let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", pid)) else { return false };
+    let Ok(exe) = std::fs::read_link(format!("/proc/{}/exe", pid)) else { return Some(false) };
     if !exe.to_string_lossy().contains("/envs/sapphire/") {
-        return false;
+        return Some(false);
     }
-    let Ok(cmd) = std::fs::read(format!("/proc/{}/cmdline", pid)) else { return false };
+    let Ok(cmd) = std::fs::read(format!("/proc/{}/cmdline", pid)) else { return Some(false) };
     let cmd = String::from_utf8_lossy(&cmd);
-    cmd.contains("main.py") || cmd.contains("sapphire.py")
+    Some(cmd.contains("main.py") || cmd.contains("sapphire.py"))
 }
 
 /// Is `pid` alive and a sapphire-env python? Windows: open the process for a look
 /// (no tasklist/CIM spawn), check it has not exited, read its image path. A pid we
-/// may not open (she runs elevated or as another user) is believed on the lock's
-/// word — the most we can know — and Stop says so when it cannot reach her.
+/// may not open or name (she runs elevated, or it is a system process now) is None:
+/// we can't tell, and the caller decides what that means.
 #[cfg(windows)]
-pub(crate) fn pid_is_hers(pid: u32) -> bool {
+pub(crate) fn pid_look(pid: u32) -> Option<bool> {
     use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ACCESS_DENIED, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     if pid <= 4 {
-        return false; // the idle/system pseudo-pids
+        return Some(false); // the idle/system pseudo-pids
     }
     // SAFETY: plain Win32 calls; the handle is closed on every path and the name
     // buffer's length is passed in and out exactly as the API requires.
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
-            return GetLastError() == ERROR_ACCESS_DENIED;
+            return (GetLastError() != ERROR_ACCESS_DENIED).then_some(false);
         }
         let mut code = 0u32;
         let alive = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE as u32;
@@ -304,12 +410,12 @@ pub(crate) fn pid_is_hers(pid: u32) -> bool {
         let named = QueryFullProcessImageNameW(h, 0, name.as_mut_ptr(), &mut len) != 0;
         CloseHandle(h);
         if !alive {
-            return false;
+            return Some(false);
         }
         if !named {
-            return true; // no name to check: the lock's word stands
+            return None;
         }
-        String::from_utf16_lossy(&name[..len as usize]).to_ascii_lowercase().contains("\\envs\\sapphire\\")
+        Some(String::from_utf16_lossy(&name[..len as usize]).to_ascii_lowercase().contains("\\envs\\sapphire\\"))
     }
 }
 
@@ -706,10 +812,77 @@ mod tests {
     fn lock_note_is_read_from_byte_one() {
         let d = scratch("lock");
         let install = d.to_string_lossy().into_owned();
-        assert_eq!(read_lock_note(&install), None, "no file");
+        let lock = legacy_lock_path(&install);
+        assert_eq!(read_lock_note(&lock), None, "no file");
         std::fs::create_dir_all(d.join("user")).unwrap();
-        std::fs::write(lock_path(&install), b"\npid=4242 since=2026-10-20 08:01:02\n").unwrap();
-        assert_eq!(parse_lock_note(&read_lock_note(&install).unwrap()), Some((4242, "2026-10-20 08:01:02".into())));
+        std::fs::write(&lock, b"\npid=4242 since=2026-10-20 08:01:02\n").unwrap();
+        assert_eq!(parse_lock_note(&read_lock_note(&lock).unwrap()), Some((4242, "2026-10-20 08:01:02".into())));
+    }
+
+    #[test]
+    fn lock_key_matches_core() {
+        // hashlib.sha256(path.encode()).hexdigest()[:16], the formula in
+        // core/single_instance.py. The first is a real lock file core wrote on Krem's box.
+        assert_eq!(lock_key("/home/bander/sapphire/sapphire/user"), "2e3c5a5b5ad02f2f");
+        assert_eq!(lock_key(&windows_normcase(r"C:\Users\Krem Bander\sapphire\user")), "344c39081385b5fc");
+        assert_eq!(windows_normcase(r"\\?\C:\Users/X"), r"c:\users\x");
+        assert_eq!(windows_normcase(r"\\?\UNC\Box\Share"), r"\\box\share");
+    }
+
+    #[test]
+    fn the_lock_is_in_the_config_dir_named_by_the_user_folder() {
+        let d = scratch("lockpath");
+        let install = d.to_string_lossy().into_owned();
+        assert_eq!(instance_lock_path(&install), None, "no user/ folder yet");
+        std::fs::create_dir_all(d.join("user")).unwrap();
+        let p = instance_lock_path(&install).unwrap();
+        assert!(p.starts_with(app_config_dir().join("locks")), "{:?}", p);
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(name.starts_with("instance-") && name.ends_with(".lock") && name.len() == "instance-.lock".len() + 16, "{}", name);
+    }
+
+    #[test]
+    fn a_handshake_from_before_this_boot_is_stale() {
+        assert!(handshake_is_stale(1000, Some(2000)));
+        assert!(!handshake_is_stale(2000, Some(1000)));
+        assert!(!handshake_is_stale(998, Some(1000)), "clock jitter");
+        assert!(!handshake_is_stale(0, Some(1000)), "no timestamp: the pid check decides");
+        assert!(!handshake_is_stale(1000, None));
+        let boot = boot_time().unwrap();
+        assert!(boot > 0 && boot <= now_secs());
+    }
+
+    #[test]
+    fn a_handshake_for_another_install_is_not_about_this_one() {
+        let st = |install: Option<&str>| Some(RunState { pid: 7, log: PathBuf::from("/l"), origin: Origin::Launcher, install: install.map(str::to_string), started: 1 });
+        assert_eq!(resolve_instance(None, st(Some("/inst/a")), |_| true, "/inst/b"), None);
+        assert!(resolve_instance(None, st(Some("/inst/a")), |_| true, "/inst/a").is_some());
+        assert!(resolve_instance(None, st(None), |_| true, "/inst/b").is_some(), "a v3 shim names no install");
+    }
+
+    /// Real Windows only: the probe sees another handle's lock on byte 0
+    /// and the note after it stays readable.
+    #[cfg(windows)]
+    #[test]
+    fn a_locked_byte_reads_as_held_without_taking_it() {
+        use std::os::windows::io::AsRawHandle;
+        unsafe extern "system" {
+            fn LockFile(h: *mut core::ffi::c_void, lo: u32, hi: u32, nlo: u32, nhi: u32) -> i32;
+        }
+        // Wine keeps LockFile between handles but does not make reads honor it.
+        if std::path::Path::new(r"C:\windows\system32\winemenubuilder.exe").exists() {
+            eprintln!("skipped: Wine does not enforce byte locks on reads");
+            return;
+        }
+        let p = scratch("held").join("x.lock");
+        std::fs::write(&p, b"\npid=4242 since=2026-10-20 08:01:02\n").unwrap();
+        assert!(!lock_is_held(&p), "nobody holds it");
+        let f = std::fs::OpenOptions::new().read(true).write(true).open(&p).unwrap();
+        assert!(unsafe { LockFile(f.as_raw_handle(), 0, 0, 1, 0) } != 0);
+        assert!(lock_is_held(&p));
+        assert_eq!(parse_lock_note(&read_lock_note(&p).unwrap()).map(|n| n.0), Some(4242));
+        drop(f);
+        assert!(!lock_is_held(&p));
     }
 
     #[test]
@@ -719,6 +892,8 @@ mod tests {
             pid: 31337,
             log: PathBuf::from(r#"C:\Users\Krem's "lab"\AppData\Roaming\Sapphire\sapphire-launcher.log"#),
             origin: Origin::Autostart,
+            install: Some(r"C:\Users\Krem\sapphire".into()),
+            started: 1234,
         };
         write_run_state(&p, &st).unwrap();
         assert_eq!(read_run_state(&p), Some(st));
@@ -736,7 +911,7 @@ mod tests {
     #[test]
     fn instance_resolution_believes_only_live_pids() {
         let note = Some("pid=100 since=2026-10-20 08:01:02\n");
-        let ours = || Some(RunState { pid: 100, log: PathBuf::from("/cfg/sapphire-launcher.log"), origin: Origin::Launcher });
+        let ours = || Some(RunState { pid: 100, log: PathBuf::from("/cfg/sapphire-launcher.log"), origin: Origin::Launcher, install: Some("/inst".into()), started: 1 });
         let core_log = core_log_path("/inst");
         // Lock and handshake agree: ours, our log, core's since.
         let i = resolve_instance(note, ours(), |p| p == 100, "/inst").unwrap();
@@ -745,7 +920,7 @@ mod tests {
         let i = resolve_instance(note, None, |p| p == 100, "/inst").unwrap();
         assert_eq!((i.origin, &i.log), (Origin::Elsewhere, &core_log));
         // A handshake left by an older run names another pid: the lock wins.
-        let old = Some(RunState { pid: 55, log: PathBuf::from("/cfg/old.log"), origin: Origin::Launcher });
+        let old = Some(RunState { pid: 55, log: PathBuf::from("/cfg/old.log"), origin: Origin::Launcher, install: None, started: 1 });
         let i = resolve_instance(note, old, |p| p == 100, "/inst").unwrap();
         assert_eq!((i.pid, i.origin), (100, Origin::Elsewhere));
         // Stale note (pid dead, or recycled by something that is not her): nobody.

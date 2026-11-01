@@ -17,6 +17,14 @@ pub(crate) struct ServiceInfo {
     pub(crate) env_file: Option<String>,    // first EnvironmentFile= (what the env editor edits)
 }
 
+impl ServiceInfo {
+    /// Is the unit running her (or on its way up or down)? If not, a Sapphire on this
+    /// install was started some other way and the unit can't stop her.
+    pub(crate) fn holds_her(&self) -> bool {
+        matches!(self.active_state.as_str(), "active" | "activating" | "reloading" | "deactivating")
+    }
+}
+
 /// Detect a systemd --user `sapphire.service`. Returns None if no such unit
 /// (or on Windows, or if systemctl is absent). This is what flips the launcher
 /// into "service mode" — Launch/Stop drive the unit instead of spawning python.
@@ -136,6 +144,8 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
 ///   • trigger scoped to THIS user's logon (not "any user")
 ///   • runs on battery and doesn't stop on battery (laptop-friendly)
 ///   • no execution time limit (`schtasks` defaults to stop after 3 days)
+///   • normal priority (the default, 7, is below-normal CPU with low I/O, which her
+///     processes would inherit)
 /// Registration needs admin, so we elevate a generated `.ps1` via `Start-Process
 /// -Verb RunAs` (one UAC prompt). The trigger/principal user is captured from OUR
 /// (non-elevated) process, so it's correct even if UAC elevates a different admin.
@@ -159,7 +169,7 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
         && let Err(e) = tokio::fs::create_dir_all(parent).await {
             return (format!("Couldn't create the autostart folder: {}", e), false);
         }
-    if let Err(e) = tokio::fs::write(&shim, shim_source(&install_path, &log.to_string_lossy(), &run_state_path().to_string_lossy())).await {
+    if let Err(e) = tokio::fs::write(&shim, shim_source(&install_path, &log.to_string_lossy(), &run_state_path().to_string_lossy(), &shim_lock(&install_path))).await {
         return (format!("Couldn't write the autostart launcher: {}", e), false);
     }
 
@@ -179,7 +189,7 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
          $a = New-ScheduledTaskAction -Execute '{pyw}' -Argument '\"{shim}\"' -WorkingDirectory '{cwd}'\r\n\
          $t = New-ScheduledTaskTrigger -AtLogOn -User '{user}'\r\n\
          $p = New-ScheduledTaskPrincipal -UserId '{user}' -LogonType Interactive\r\n\
-         $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable\r\n\
+         $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -Priority 4\r\n\
          Register-ScheduledTask -TaskName Sapphire -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null\r\n\
          }} catch {{ $_ | Out-String | Set-Content -Path '{err}' -Encoding UTF8; exit 1 }}\r\n",
         pyw = esc(&pyw), shim = esc(&shim.to_string_lossy()), cwd = esc(&install_path), user = esc(&user),
@@ -263,8 +273,16 @@ pub(crate) async fn remove_service() -> (String, bool) {
 /// v1 ran main.py in-process (died at import on core ≥ 2026-10-16), v2 fixed that,
 /// v3 starts her detached like Launch does (python.exe, hidden console, own process
 /// group) so the launcher can follow her log and stop her gracefully.
+/// v4 won't start a twin: it checks her lock first and doesn't leave a losing start's
+/// pid in the handshake, and the handshake names the install.
 #[cfg_attr(not(windows), allow(dead_code))] // only the Windows shim repair calls these
-pub(crate) const SHIM_VERSION: u32 = 3;
+pub(crate) const SHIM_VERSION: u32 = 4;
+
+/// The lock path written into a shim. Empty = no user/ folder yet: nothing to hold it.
+#[cfg(windows)]
+fn shim_lock(install: &str) -> String {
+    instance_lock_path(install).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+}
 
 /// The autostart shim the logon task runs under pythonw (nothing flashes). It is
 /// Launch in Python: truncate the log, then start the env's python.exe (next to the
@@ -273,9 +291,10 @@ pub(crate) const SHIM_VERSION: u32 = 3;
 /// to the log, UTF-8 like Launch — write the `sapphire-run.json` handshake
 /// atomically, and exit. The log is created first so a failure has somewhere to go;
 /// a traceback lands there too. Absolute main.py path so `__file__` (the lock's
-/// anchor) is absolute.
+/// anchor) is absolute. If her lock is already held it does nothing at all: reading a
+/// byte another process locked raises PermissionError, and that never takes the lock.
 #[cfg_attr(not(windows), allow(dead_code))] // only the Windows shim repair calls these
-pub(crate) fn shim_source(cwd: &str, log: &str, run: &str) -> String {
+pub(crate) fn shim_source(cwd: &str, log: &str, run: &str, lock: &str) -> String {
     // Python string literal: escape backslashes then double-quotes (handles spaces
     // and any path safely — avoids raw-string's can't-end-in-backslash gotcha).
     let py_lit = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
@@ -285,6 +304,18 @@ pub(crate) fn shim_source(cwd: &str, log: &str, run: &str) -> String {
         format!("_cwd = \"{}\"", py_lit(cwd)),
         format!("_log = \"{}\"", py_lit(log)),
         format!("_run = \"{}\"", py_lit(run)),
+        format!("_lock = \"{}\"", py_lit(lock)),
+        "def _held(p):".into(),
+        "    try:".into(),
+        "        with open(p, \"rb\") as _f:".into(),
+        "            _f.read(1)".into(),
+        "    except PermissionError:".into(),
+        "        return True".into(),
+        "    except OSError:".into(),
+        "        pass".into(),
+        "    return False".into(),
+        "if _held(_lock) or _held(os.path.join(_cwd, \"user\", \".instance.lock\")):".into(),
+        "    sys.exit(0)".into(),
         "os.makedirs(os.path.dirname(_log), exist_ok=True)".into(),
         "open(_log, \"w\").close()".into(),
         "try:".into(),
@@ -294,9 +325,23 @@ pub(crate) fn shim_source(cwd: &str, log: &str, run: &str) -> String {
         "        _p = subprocess.Popen([_py, \"-u\", os.path.join(_cwd, \"main.py\")], cwd=_cwd, env=_env,".into(),
         "                              stdin=subprocess.DEVNULL, stdout=_f, stderr=subprocess.STDOUT,".into(),
         "                              creationflags=0x08000000 | 0x00000200)".into(),
-        "    with open(_run + \".tmp\", \"w\", encoding=\"utf-8\") as _f:".into(),
-        "        json.dump({\"pid\": _p.pid, \"log\": _log, \"by\": \"autostart\", \"started\": int(time.time())}, _f)".into(),
-        "    os.replace(_run + \".tmp\", _run)".into(),
+        "    _prior = None".into(),
+        "    if os.path.exists(_run):".into(),
+        "        with open(_run, encoding=\"utf-8\") as _f:".into(),
+        "            _prior = _f.read()".into(),
+        "    def _put(text):".into(),
+        "        with open(_run + \".tmp\", \"w\", encoding=\"utf-8\") as _f:".into(),
+        "            _f.write(text)".into(),
+        "        os.replace(_run + \".tmp\", _run)".into(),
+        "    _put(json.dumps({\"pid\": _p.pid, \"log\": _log, \"by\": \"autostart\", \"started\": int(time.time()), \"install\": _cwd}))".into(),
+        "    try:".into(),
+        "        if _p.wait(timeout=5) == 43:  # lost to a twin: the handshake stays about the winner".into(),
+        "            if _prior is None:".into(),
+        "                os.remove(_run)".into(),
+        "            else:".into(),
+        "                _put(_prior)".into(),
+        "    except subprocess.TimeoutExpired:".into(),
+        "        pass".into(),
         "except Exception:".into(),
         "    import traceback".into(),
         "    with open(_log, \"a\", encoding=\"utf-8\") as _f:".into(),
@@ -363,10 +408,11 @@ pub(crate) fn repair_autostart_shim(install_path: &str) -> Option<String> {
         return Some("Autostart is turned on, but points at a folder with no Sapphire in it — turn it off and on again once the path is right.".to_string());
     };
     let note = match shim_version(&old) {
+        Some(3) => "Updated the autostart launcher: it no longer starts a second Sapphire over a running one. Takes effect at your next sign-in. To also run her at normal priority, turn autostart off and on again.",
         Some(2) => "Updated the autostart launcher: Sapphire now starts detached at sign-in, so this app can follow her log and stop her gracefully. Takes effect at your next sign-in.",
         _ => "Updated the autostart launcher: Sapphire changed how it starts (2026-10-16) and the old one couldn't start her. Takes effect at your next sign-in — hit Launch to start her now.",
     };
-    match std::fs::write(&shim, shim_source(&cwd, &launch_log_path().to_string_lossy(), &run_state_path().to_string_lossy())) {
+    match std::fs::write(&shim, shim_source(&cwd, &launch_log_path().to_string_lossy(), &run_state_path().to_string_lossy(), &shim_lock(&cwd))) {
         Ok(()) => Some(note.to_string()),
         Err(e) => Some(format!("Autostart needs an update but the launcher file couldn't be written: {}", e)),
     }
@@ -693,7 +739,7 @@ fn spawn_detached(
     install_path: &str,
     log: &std::path::Path,
     run: &std::path::Path,
-) -> Result<(tokio::process::Child, u32, u64), String> {
+) -> Result<(tokio::process::Child, u32, u64, Option<String>), String> {
     use std::io::Write;
     let (program, mut args) = sapphire_python_cmd();
     let is_direct = args.is_empty();
@@ -749,9 +795,17 @@ fn spawn_detached(
     let pid = child.id().unwrap_or(0);
     // The handshake for a later launcher (and for find_instance on a core without
     // the lock file). Best effort: without it she still runs; we just can't claim her.
-    let _ = write_run_state(run, &RunState { pid, log: log.to_path_buf(), origin: Origin::Launcher });
+    // The old one comes back if this start loses to a twin (see child_follower).
+    let prior = std::fs::read_to_string(run).ok();
+    let _ = write_run_state(run, &RunState {
+        pid,
+        log: log.to_path_buf(),
+        origin: Origin::Launcher,
+        install: Some(install_path.to_string()),
+        started: now_secs(),
+    });
     // `conda run` puts a wrapper between us and her: a longer grace for her last lines.
-    Ok((child, pid, if is_direct { 700 } else { 1500 }))
+    Ok((child, pid, if is_direct { 700 } else { 1500 }, prior))
 }
 
 /// `Subscription`-driven: start her (on first poll, inside the tokio runtime) and
@@ -763,17 +817,25 @@ fn spawn_detached(
 pub(crate) fn child_follower(install_path: String, log: PathBuf, run: PathBuf) -> impl futures::Stream<Item = Message> {
     enum St {
         Start(String, PathBuf, PathBuf),
-        Running(tokio::process::Child, u64),
+        Running(tokio::process::Child, u64, PathBuf, Option<String>),
         Done,
     }
     futures::stream::unfold(St::Start(install_path, log, run), |st| async move {
         match st {
             St::Start(install, log, run) => match spawn_detached(&install, &log, &run) {
-                Ok((child, pid, grace)) => Some((Message::SapphireStarted(pid), St::Running(child, grace))),
+                Ok((child, pid, grace, prior)) => Some((Message::SapphireStarted(pid), St::Running(child, grace, run, prior))),
                 Err(e) => Some((Message::SapphireExited(Err(e)), St::Done)),
             },
-            St::Running(mut child, grace) => {
+            St::Running(mut child, grace, run, prior) => {
                 let result = child.wait().await.map(|s| s.code()).map_err(|e| format!("Error: {}", e));
+                // Lost to a twin: the handshake must not keep naming the loser, it may
+                // be the only pointer to the one who won.
+                if matches!(result, Ok(Some(43))) {
+                    let _ = match prior {
+                        Some(text) => std::fs::write(&run, text),
+                        None => std::fs::remove_file(&run),
+                    };
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(grace)).await;
                 Some((Message::SapphireExited(result), St::Done))
             }
@@ -904,7 +966,8 @@ mod pure_tests {
         let cwd = r#"C:\Users\Krem's "lab"\sapphire"#;
         let log = r#"C:\Users\Krem's "lab"\AppData\Roaming\Sapphire\sapphire-launcher.log"#;
         let run = r#"C:\Users\Krem's "lab"\AppData\Roaming\Sapphire\sapphire-run.json"#;
-        let src = shim_source(cwd, log, run);
+        let lock = r#"C:\Users\Krem's "lab"\AppData\Roaming\Sapphire\locks\instance-abc.lock"#;
+        let src = shim_source(cwd, log, run, lock);
         assert!(shim_is_current(&src));
         assert_eq!(shim_version(&src), Some(SHIM_VERSION));
         assert_eq!(shim_cwd(&src).as_deref(), Some(cwd));
@@ -914,10 +977,13 @@ mod pure_tests {
             "\"python.exe\"", "subprocess.Popen(", "creationflags=0x08000000 | 0x00000200",
             "stdin=subprocess.DEVNULL", "stdout=_f, stderr=subprocess.STDOUT", "open(_log, \"ab\")",
             "PYTHONUTF8=\"1\"", "\"by\": \"autostart\"", "os.replace(_run + \".tmp\", _run)",
+            "\"install\": _cwd", "_p.wait(timeout=5) == 43", "except PermissionError:",
             "os.path.join(_cwd, \"main.py\")", "traceback.format_exc()",
         ] {
             assert!(src.contains(needle), "missing {:?} in:\n{}", needle, src);
         }
+        // A held lock means she is up: nothing is touched, her log least of all.
+        assert!(src.find("sys.exit(0)").unwrap() < src.find("open(_log, \"w\")").unwrap());
         // The log is created before anything can fail: a bad folder still leaves a trace.
         assert!(src.find("open(_log, \"w\")").unwrap() < src.find("subprocess.Popen(").unwrap());
         assert!(src.contains(&format!("_run = \"{}\"", run.replace('\\', "\\\\").replace('"', "\\\""))));
@@ -1169,14 +1235,16 @@ sys.exit(0)
         // Her own session: she leads her process group (what signal_group checks).
         assert_eq!(process_group_of(pid), Some(pid as i32), "runner is not a process-group leader");
         // The handshake is on disk before the pid is reported.
-        assert_eq!(read_run_state(&run), Some(RunState { pid, log: log.clone(), origin: Origin::Launcher }));
+        let st = read_run_state(&run).unwrap();
+        assert_eq!((st.pid, &st.log, st.origin, st.install.as_deref()), (pid, &log, Origin::Launcher, Some(dir.as_str())));
+        assert!(st.started > 0);
 
         let mut tail = Box::pin(tail_log_stream(log.clone()));
         let lines = tail_until(&mut tail, "fake starting").await;
         assert!(lines.iter().any(|l| l.starts_with("[Launcher] Using ")), "{:?}", lines);
 
         // What a later launcher sees: the lock names her, the handshake claims her.
-        let found = resolve_instance(read_lock_note(&dir).as_deref(), read_run_state(&run), pid_is_hers, &dir);
+        let found = resolve_instance(read_lock_note(&legacy_lock_path(&dir)).as_deref(), read_run_state(&run), pid_is_hers, &dir);
         assert_eq!(found, Some(Instance { pid, since: "2026-10-20 08:01:02".into(), origin: Origin::Launcher, log: log.clone() }));
 
         assert!(signal_stop(pid), "signal_stop could not send SIGTERM");
@@ -1185,7 +1253,7 @@ sys.exit(0)
 
         // Gone: the note is stale, nobody is found, nothing can be signalled.
         assert!(!pid_is_hers(pid));
-        assert_eq!(resolve_instance(read_lock_note(&dir).as_deref(), read_run_state(&run), pid_is_hers, &dir), None);
+        assert_eq!(resolve_instance(read_lock_note(&legacy_lock_path(&dir)).as_deref(), read_run_state(&run), pid_is_hers, &dir), None);
         assert!(!signal_stop(pid));
     }
 
@@ -1199,9 +1267,14 @@ sys.exit(0)
             "twin",
             "import sys\nprint('[Runner] Another Sapphire is already running (fake)', flush=True)\nsys.exit(43)\n",
         );
-        let mut follower = Box::pin(child_follower(dir, log.clone(), run));
+        // The handshake names the Sapphire who is really running.
+        let winner = "{\"pid\": 5151, \"log\": \"/her.log\", \"by\": \"autostart\"}";
+        std::fs::create_dir_all(run.parent().unwrap()).unwrap();
+        std::fs::write(&run, winner).unwrap();
+        let mut follower = Box::pin(child_follower(dir, log.clone(), run.clone()));
         assert!(matches!(next_msg(&mut follower).await, Message::SapphireStarted(p) if p > 1));
         assert!(matches!(next_msg(&mut follower).await, Message::SapphireExited(Ok(Some(43)))));
+        assert_eq!(std::fs::read_to_string(&run).unwrap(), winner, "the loser must not replace her");
         let text = std::fs::read_to_string(&log).unwrap();
         assert!(text.contains("Another Sapphire"), "runner line lost: {}", text);
     }
