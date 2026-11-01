@@ -86,5 +86,9 @@ cargo test
 - Async command execution via Tokio
 - Source modules: `src/main.rs` (app state + message loop), `src/ui.rs`, `src/install.rs`, `src/troubleshoot.rs`, `src/service.rs`, `src/platform.rs`
 - Config stored alongside Sapphire's own: `%APPDATA%\Sapphire\launcher.json` on Windows, `$XDG_CONFIG_HOME/sapphire/launcher.json` (or `~/.config/sapphire/launcher.json`) on Linux. Her console output from Launch/autostart goes to `sapphire-launcher.log` in the same folder (core's own `user/logs/sapphire.log` is unaffected); `sapphire-run.json` there is how a reopened launcher finds her
-</content>
-</invoke>
+
+## License
+
+Copyright (C) 2026 ddxfish
+
+[AGPL-3.0](LICENSE), the same license as Sapphire. Free to use, modify and share. If you distribute it, or modify it and run it as a service, you must share your source code changes.

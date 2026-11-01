@@ -2,6 +2,7 @@
 name = "sapphire-launcher"
 version = "0.9.7"
 edition = "2024"
+license = "AGPL-3.0-only"
 
 [dependencies]
 # Software renderer only (tiny-skia, no wgpu): one render path on every platform,
