@@ -817,13 +817,13 @@ fn spawn_detached(
 pub(crate) fn child_follower(install_path: String, log: PathBuf, run: PathBuf) -> impl futures::Stream<Item = Message> {
     enum St {
         Start(String, PathBuf, PathBuf),
-        Running(tokio::process::Child, u64, PathBuf, Option<String>),
+        Running(Box<tokio::process::Child>, u64, PathBuf, Option<String>),
         Done,
     }
     futures::stream::unfold(St::Start(install_path, log, run), |st| async move {
         match st {
             St::Start(install, log, run) => match spawn_detached(&install, &log, &run) {
-                Ok((child, pid, grace, prior)) => Some((Message::SapphireStarted(pid), St::Running(child, grace, run, prior))),
+                Ok((child, pid, grace, prior)) => Some((Message::SapphireStarted(pid), St::Running(Box::new(child), grace, run, prior))),
                 Err(e) => Some((Message::SapphireExited(Err(e)), St::Done)),
             },
             St::Running(mut child, grace, run, prior) => {
