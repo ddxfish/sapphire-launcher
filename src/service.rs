@@ -9,7 +9,6 @@ use tokio::io::BufReader;
 #[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Clone)]
 pub(crate) struct ServiceInfo {
-    pub(crate) active: bool,            // ActiveState == "active" (running now)
     pub(crate) active_state: String,    // raw ActiveState (active/failed/activating/inactive)
     pub(crate) enabled: bool,           // UnitFileState == "enabled" (autostart at sign-in)
     pub(crate) sub_state: String,
@@ -23,6 +22,11 @@ impl ServiceInfo {
     pub(crate) fn holds_her(&self) -> bool {
         matches!(self.active_state.as_str(), "active" | "activating" | "reloading" | "deactivating")
     }
+}
+
+/// Does this unit run the folder at `install`? (No WorkingDirectory: assume yes.)
+pub(crate) fn unit_runs(unit: &ServiceInfo, install: &str) -> bool {
+    unit.working_dir.as_deref().is_none_or(|w| same_install(w, install))
 }
 
 /// Detect a systemd --user `sapphire.service`. Returns None if no such unit
@@ -52,7 +56,6 @@ pub(crate) fn detect_sapphire_service() -> Option<ServiceInfo> {
         return None; // unit doesn't exist
     }
     Some(ServiceInfo {
-        active: active == "active",
         active_state: active.to_string(),
         enabled: ufs == "enabled",
         sub_state: sub.to_string(),
@@ -192,7 +195,9 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
          $s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) -StartWhenAvailable -Priority 4\r\n\
          Register-ScheduledTask -TaskName Sapphire -Action $a -Trigger $t -Principal $p -Settings $s -Force | Out-Null\r\n\
          }} catch {{ $_ | Out-String | Set-Content -Path '{err}' -Encoding UTF8; exit 1 }}\r\n",
-        pyw = esc(&pyw), shim = esc(&shim.to_string_lossy()), cwd = esc(&install_path), user = esc(&user),
+        // Start-in is our config dir, not the install: a task whose start folder is gone
+        // can't launch at all, and the shim sets her folder itself.
+        pyw = esc(&pyw), shim = esc(&shim.to_string_lossy()), cwd = esc(&app_config_dir().to_string_lossy()), user = esc(&user),
         err = esc(&err_file.to_string_lossy()),
     );
     let ps1 = std::env::temp_dir().join("sapphire-enable.ps1");
@@ -225,6 +230,25 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
                 None => ("Couldn't enable autostart — the admin prompt may have been declined. Try again and choose Yes.".to_string(), false),
             }
         }
+    }
+}
+
+/// Windows: which folder autostart starts Sapphire from (the shim's own word).
+#[cfg(windows)]
+pub(crate) fn autostart_folder() -> Option<String> {
+    if !autostart_marker_path().exists() {
+        return None;
+    }
+    shim_cwd(&std::fs::read_to_string(autostart_shim_path()).ok()?)
+}
+
+/// Windows: point autostart at this folder. Only the shim changes, so no admin prompt.
+#[cfg(windows)]
+pub(crate) fn repoint_autostart(install: &str) -> String {
+    let src = shim_source(install, &launch_log_path().to_string_lossy(), &run_state_path().to_string_lossy(), &shim_lock(install));
+    match std::fs::write(autostart_shim_path(), src) {
+        Ok(()) => format!("Autostart now starts Sapphire from {}.", install),
+        Err(e) => format!("Couldn't update autostart: {}", e),
     }
 }
 

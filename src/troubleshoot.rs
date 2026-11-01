@@ -18,6 +18,7 @@ pub(crate) enum TsStatus {
     Checking,
     Ok(String),
     Problem(String),
+    Warning(String), // worth knowing, but no button here can fix it
     Fixing,
     Fixed(String),
 }
@@ -59,33 +60,59 @@ pub(crate) async fn ts_check_webui(port: u16) -> (TsCheck, TsStatus) {
     }
 }
 
-pub(crate) async fn ts_check_deps() -> (TsCheck, TsStatus) {
-    match pip_run(vec!["check".into()]).await {
-        Ok(output) if output.contains("No broken requirements") => {
-            (TsCheck::DepsHealth, TsStatus::Ok("All dependencies look good".into()))
-        }
-        Ok(output) => {
-            let problems: Vec<&str> = output.lines().take(5).collect();
-            (TsCheck::DepsHealth, TsStatus::Problem(format!("Broken packages:\n{}", problems.join("\n"))))
-        }
-        Err(e) => {
-            // pip check returns non-zero when deps are broken — that's the actual output
-            if e.contains("has requirement") || e.contains("not installed") {
-                let problems: Vec<&str> = e.lines().take(5).collect();
-                (TsCheck::DepsHealth, TsStatus::Problem(format!("Broken packages:\n{}", problems.join("\n"))))
-            } else {
-                (TsCheck::DepsHealth, TsStatus::Problem(format!("Couldn't check: {}", e)))
-            }
-        }
+/// What `pip check` found. A missing package is broken and Fix can install it. A
+/// version conflict is different: everything is installed, so `pip install -r` changes
+/// nothing, and it's often an optional plugin's package with a tight pin (gTTS's
+/// click<8.2 against typer's click>=8.2.1). That's a warning with no button.
+pub(crate) fn deps_status(output: &str) -> Option<TsStatus> {
+    if output.contains("No broken requirements") {
+        return Some(TsStatus::Ok("All dependencies look good".into()));
     }
+    // Only pip's findings: the output can also carry its own warnings.
+    let missing = |l: &&str| l.contains("not installed");
+    let findings: Vec<&str> = output.lines()
+        .filter(|l| missing(l) || l.contains("has requirement") || l.contains("not supported on this platform"))
+        .collect();
+    if findings.is_empty() {
+        return None;
+    }
+    let listed = findings.iter().take(5).copied().collect::<Vec<_>>().join("\n");
+    Some(if findings.iter().any(missing) {
+        TsStatus::Problem(format!("Missing packages:\n{}", listed))
+    } else {
+        TsStatus::Warning(format!(
+            "Packages want different versions. There's nothing to repair here, and Sapphire can usually still run. This often comes from an optional plugin.\n{}",
+            listed
+        ))
+    })
+}
+
+pub(crate) async fn ts_check_deps(install_path: String) -> (TsCheck, TsStatus) {
+    // `pip check` only looks at what's installed: a package that never landed reads
+    // as healthy. Her requirements file knows.
+    let req = PathBuf::from(&install_path).join("requirements.txt");
+    if let Ok(missing) = requirements_missing(&req).await
+        && !missing.is_empty()
+    {
+        return (TsCheck::DepsHealth, TsStatus::Problem(format!("Sapphire's packages need installing: {}", name_some(&missing))));
+    }
+    // pip check exits non-zero when it finds something, so its findings can be in Err.
+    let output = pip_run(vec!["check".into()]).await;
+    let text = match &output {
+        Ok(o) => o,
+        Err(e) => e,
+    };
+    let status = deps_status(text).unwrap_or_else(|| TsStatus::Problem(format!("Couldn't check: {}", text)));
+    (TsCheck::DepsHealth, status)
 }
 
 
 pub(crate) async fn ts_fix_deps(install_path: String, sink: Arc<std::sync::Mutex<Vec<String>>>) -> (TsCheck, String, bool) {
     let req = PathBuf::from(&install_path).join("requirements.txt");
+    let sink2 = sink.clone();
     match pip_install_streamed(vec!["-r".into(), req.to_string_lossy().to_string()], sink).await {
         Ok(_) => (TsCheck::DepsHealth, "Repaired! Restart Sapphire to apply.".to_string(), true),
-        Err(e) => (TsCheck::DepsHealth, format!("Repair failed: {}", e), false),
+        Err(e) => (TsCheck::DepsHealth, pip_failure("Repair failed.", &sink2, &e), false),
     }
 }
 
@@ -370,6 +397,23 @@ mod tests {
         assert_eq!(enabled_plugin_deps(&r.to_string_lossy()).await, vec![("alpha".to_string(), vec!["foo".to_string()])]);
         let empty = root("plugins-none");
         assert!(enabled_plugin_deps(&empty.to_string_lossy()).await.is_empty());
+    }
+
+    #[test]
+    fn only_a_missing_package_is_offered_a_repair() {
+        let conflict = "gtts 2.5.4 has requirement click<8.2,>=7.1, but you have click 8.3.1.";
+        let missing = "kokoro 0.9 requires misaki, which is not installed.";
+        assert!(matches!(deps_status("No broken requirements found."), Some(TsStatus::Ok(_))));
+        let Some(TsStatus::Warning(w)) = deps_status(conflict) else { panic!("a conflict is a warning") };
+        assert!(w.contains(conflict));
+        assert!(matches!(deps_status("foo 1.0 is not supported on this platform"), Some(TsStatus::Warning(_))));
+        let Some(TsStatus::Problem(p)) = deps_status(&format!("{}\n{}", conflict, missing)) else { panic!("missing wins") };
+        assert!(p.contains(missing) && p.contains(conflict));
+        // pip's own chatter is not a finding.
+        let chatty = format!("WARNING: pip is old\n{}", conflict);
+        let Some(TsStatus::Warning(w)) = deps_status(&chatty) else { panic!() };
+        assert!(!w.contains("pip is old"));
+        assert_eq!(deps_status("conda: command not found"), None);
     }
 
     #[test]

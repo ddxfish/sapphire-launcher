@@ -14,6 +14,7 @@ impl App {
     pub(crate) fn view(&self) -> Element<'_, Message> {
         column![
             self.view_header(),
+            self.view_notices(),
             self.view_tab_bar(),
             self.view_tab_content(),
             self.view_log_panel(),
@@ -28,29 +29,27 @@ impl App {
 
     fn view_header(&self) -> Element<'_, Message> {
         let placeholder = if cfg!(windows) { "C:\\Users\\You\\Sapphire" } else { "/home/you/sapphire" };
-        let path_input = text_input(placeholder, &self.install_path)
-            .on_input(Message::PathChanged)
-            .width(Length::FillPortion(3));
+        // Read-only while a job is working on this folder.
+        let frozen = self.path_frozen();
+        let mut path_input = text_input(placeholder, &self.install_path).width(Length::FillPortion(3));
+        if !frozen {
+            path_input = path_input.on_input(Message::PathChanged);
+        }
 
-        let browse_btn = button("Browse").on_press(Message::BrowsePath);
+        let browse_btn = button("Browse").on_press_maybe((!frozen).then_some(Message::BrowsePath));
 
         // At-a-glance: does the chosen folder actually hold a Sapphire install?
-        let p = PathBuf::from(&self.install_path);
-        let (hint_txt, hint_color) = if p.join("main.py").exists() {
-            ("installed", color!(0x4caf50))
-        } else if p.exists() {
-            ("no install here", color!(0xf9e154))
-        } else {
-            ("empty path", color!(0x7f849c))
+        let (hint_txt, hint_color) = match install_kind(&self.install_path) {
+            InstallKind::Sapphire => ("installed", color!(0x4caf50)),
+            InstallKind::Unfinished => ("unfinished", color!(0xf9e154)),
+            InstallKind::Other => ("not Sapphire", color!(0xf9e154)),
+            InstallKind::Nothing => ("empty", color!(0x7f849c)),
         };
         let path_hint = text(hint_txt).size(11).color(hint_color);
 
-        let branch_picker = pick_list(
-            BRANCHES,
-            self.selected_branch,
-            Message::BranchSelected,
-        )
-        .placeholder("Branch...");
+        let picked = self.pending_branch.or(self.selected_branch);
+        let branch_picker = pick_list(BRANCHES, picked, Message::BranchSelected)
+            .placeholder(self.off_branch.as_ref().map_or("Branch...".to_string(), |b| format!("On {}", b)));
 
         let mut header = row![
             path_input,
@@ -102,7 +101,8 @@ impl App {
             .on_press(Message::OpenBrowser)
             .style(button::primary);
 
-            let stop_btn = button(text("Stop").font(Font {
+            let stop_label = if self.is_armed(Arm::Sweep) { "Click to confirm" } else { "Stop" };
+            let stop_btn = button(text(stop_label).font(Font {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
             }))
@@ -115,7 +115,7 @@ impl App {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
             }))
-            .on_press_maybe(if self.updating || self.installing { None } else { Some(Message::Launch) })
+            .on_press_maybe(self.idle().then_some(Message::Launch))
             .style(button::success);
 
             header = header.push(launch_btn);
@@ -128,6 +128,68 @@ impl App {
                 ..Default::default()
             })
             .into()
+    }
+
+    /// Lines under the header for things that need a decision: a proposed branch switch,
+    /// autostart pointed elsewhere, a close that needs confirming.
+    fn view_notices(&self) -> Element<'_, Message> {
+        let warn = color!(0xf9e154);
+        let mut col = Column::new().spacing(6).width(Length::Fill);
+
+        if let Some(b) = self.pending_branch {
+            let what = if self.sapphire_running {
+                format!("Switch this install to {}? This stops Sapphire, swaps her code and installs the packages it needs.", b)
+            } else {
+                format!("Switch this install to {}? This swaps her code and installs the packages it needs.", b)
+            };
+            col = col.push(row![
+                text(what).size(12).color(warn).width(Length::Fill),
+                button(text(format!("Switch to {}", b)).size(12)).on_press_maybe(self.idle().then_some(Message::BranchConfirm)).style(button::primary).padding([3, 10]),
+                button(text("Cancel").size(12)).on_press(Message::BranchCancel).style(button::secondary).padding([3, 10]),
+            ].spacing(8).align_y(iced::Alignment::Center));
+        }
+        if let Some(note) = &self.branch_note {
+            col = col.push(text(note).size(12).color(color!(0xe74c3c)));
+        }
+        if let Some(name) = &self.off_branch {
+            col = col.push(text(format!("This install is on {}, which isn't Stable or Development. Pick one to get updates.", name)).size(12).color(warn));
+        }
+        if let Some(target) = self.autostart_target()
+            && !same_install(&target, &self.install_path)
+        {
+            let gone = !PathBuf::from(&target).join("main.py").exists();
+            let what = if gone {
+                format!("Autostart points at {}, and Sapphire isn't there anymore.", target)
+            } else {
+                format!("Autostart starts Sapphire from {}, not this folder.", target)
+            };
+            let mut line = row![text(what).size(12).color(warn).width(Length::Fill)].spacing(8).align_y(iced::Alignment::Center);
+            if !gone {
+                line = line.push(button(text("Go to that folder").size(12)).on_press_maybe((!self.path_frozen()).then_some(Message::PathChanged(target))).style(button::secondary).padding([3, 10]));
+            }
+            #[cfg(windows)]
+            if looks_like_install(&self.install_path) {
+                line = line.push(button(text("Use this folder").size(12)).on_press(Message::AutostartRepoint).style(button::primary).padding([3, 10]));
+            }
+            col = col.push(line);
+        }
+        if self.is_armed(Arm::CloseWindow) {
+            col = col.push(text(format!("The {} is still running. Closing now can leave Sapphire half-changed. Close again to close anyway.", self.op.words())).size(12).color(warn));
+        }
+        if self.is_armed(Arm::Sweep) {
+            col = col.push(text("Sapphire was started outside this app. Stopping her also ends anything else using her Python environment. Click Stop again to confirm.").size(12).color(warn));
+        }
+
+        let pad = if self.pending_branch.is_some() || self.branch_note.is_some() || self.off_branch.is_some() { 8 } else { 0 };
+        container(col).padding([0, pad]).width(Length::Fill).into()
+    }
+
+    /// Which folder autostart starts her from, if autostart is set up.
+    fn autostart_target(&self) -> Option<String> {
+        #[cfg(windows)]
+        return crate::service::autostart_folder();
+        #[cfg(not(windows))]
+        self.service.as_ref().and_then(|u| u.working_dir.clone())
     }
 
     // ── Tab bar ────────────────────────────────────────────────────────────
@@ -262,16 +324,17 @@ impl App {
 
         let all_not_started = self.steps.iter().all(|(_, st)| *st == StepStatus::NotStarted);
 
+        // Before any slow step: this folder can't take a clone, or she has packages open.
+        let clone_blocked = clone_blocker(&self.install_path).is_some();
+        let she_is_up = self.sapphire_running || self.sapphire_stopping;
+        let can_go = self.idle() && !clone_blocked && !she_is_up;
+
         let mut buttons_row = row![].spacing(10);
 
         // Scan button
         let scan_label = if all_not_started { "Scan System" } else { "Re-scan" };
         let scan_btn = button(text(scan_label))
-            .on_press_maybe(if self.scanning || self.installing {
-                None
-            } else {
-                Some(Message::ScanClicked)
-            })
+            .on_press_maybe(self.idle().then_some(Message::ScanClicked))
             .style(button::primary);
         buttons_row = buttons_row.push(scan_btn);
 
@@ -283,11 +346,7 @@ impl App {
                     ..Font::DEFAULT
                 }),
             )
-            .on_press_maybe(if self.scanning || self.installing {
-                None
-            } else {
-                Some(Message::GoClicked)
-            })
+            .on_press_maybe(can_go.then_some(Message::GoClicked))
             .style(button::success);
             buttons_row = buttons_row.push(go_btn);
         }
@@ -299,6 +358,7 @@ impl App {
             }),
             steps_col,
             buttons_row,
+            text(if has_not_found && she_is_up { "Stop Sapphire before installing." } else { "" }).size(11).color(color!(0xf9e154)),
         ]
         .spacing(8)
         .padding(Padding { top: 0.0, right: 0.0, bottom: 12.0, left: 0.0 })
@@ -327,7 +387,7 @@ impl App {
             steps_col = steps_col.push(row_items);
         }
 
-        let update_label = if self.updating {
+        let update_label = if self.op == Op::Updating {
             "Updating..."
         } else if self.sapphire_running || self.sapphire_stopping {
             "Stop & Update"
@@ -336,14 +396,12 @@ impl App {
         };
 
         let update_btn = button(text(update_label))
-            .on_press_maybe(if self.updating || self.installing || self.sapphire_stopping {
-                None
-            } else {
-                Some(Message::UpdateClicked)
-            })
+            .on_press_maybe(self.idle().then_some(Message::UpdateClicked))
             .style(button::primary);
 
         let status_text = match self.updates_available {
+            _ if self.update_unfinished && self.op != Op::Updating && self.op != Op::SwitchingBranch => text("The last update didn't finish, so Sapphire may not start correctly. Click Update to finish it.")
+                .size(13).color(color!(0xf9e154)),
             Some(0) => text("Up to date.").size(13).color(color!(0x4caf50)),
             Some(n) => text(format!("{} update{} available.", n, if n == 1 { "" } else { "s" }))
                 .size(13).color(color!(0x3d85c6)),
@@ -385,23 +443,33 @@ impl App {
         // Nothing here runs while she is up: a live Sapphire rewrites credentials.json
         // from memory, and deleting folders under her is how installs get half-eaten.
         let blocked = self.sapphire_running || self.sapphire_stopping;
-        let busy = self.uninstalling || blocked;
+        let busy = !self.idle() || blocked;
+        let armed_red = color!(0xe74c3c);
 
         // ═══════════════════════════════════════════════════════════
         // Quick Resets — safe, non-destructive to the install
         // ═══════════════════════════════════════════════════════════
 
-        let reset_pw_btn = button(text("Reset Password").size(13))
-            .on_press(Message::ResetPassword)
-            .style(button::primary)
+        let pw_armed = self.is_armed(Arm::ResetPassword);
+        let reset_pw_btn = button(text(if pw_armed { "YES, reset password" } else { "Reset Password" }).size(13))
+            .on_press_maybe(if busy { None } else { Some(Message::ResetPassword) })
+            .style(if pw_armed { button::danger } else { button::primary })
             .padding([4, 12]);
+        let pw_desc = if pw_armed {
+            text("Click again to confirm. Sapphire will ask you to set a new password.").size(11).color(armed_red)
+        } else if blocked {
+            text("Stop Sapphire first.").size(11).color(color!(0xf9e154))
+        } else {
+            text("Forgot your password? This clears it so Sapphire asks for a new one.").size(11).color(color!(0x7f849c))
+        };
 
-        let keys_label = if self.confirm_reset_keys { "YES, clear API keys" } else { "Reset API Keys" };
+        let keys_armed = self.is_armed(Arm::ResetKeys);
+        let keys_label = if keys_armed { "YES, clear API keys" } else { "Reset API Keys" };
         let reset_creds_btn = button(text(keys_label).size(13))
-            .on_press_maybe(if blocked { None } else { Some(Message::ResetCredentials) })
-            .style(if self.confirm_reset_keys { button::danger } else { button::primary })
+            .on_press_maybe(if busy { None } else { Some(Message::ResetCredentials) })
+            .style(if keys_armed { button::danger } else { button::primary })
             .padding([4, 12]);
-        let keys_desc = if self.confirm_reset_keys {
+        let keys_desc = if keys_armed {
             text("Click again to confirm. Only the LLM/service API keys are cleared — accounts, wallets and passwords stay.")
                 .size(11).color(color!(0xe74c3c))
         } else if blocked {
@@ -417,11 +485,7 @@ impl App {
                 ..Font::DEFAULT
             }),
             row![
-                column![
-                    reset_pw_btn,
-                    text("Forgot your password? This clears it so Sapphire asks for a new one.")
-                        .size(11).color(color!(0x7f849c)),
-                ].spacing(3).width(Length::FillPortion(1)),
+                column![reset_pw_btn, pw_desc].spacing(3).width(Length::FillPortion(1)),
                 column![reset_creds_btn, keys_desc].spacing(3).width(Length::FillPortion(1)),
             ].spacing(16),
         ].spacing(8);
@@ -431,53 +495,75 @@ impl App {
         // ═══════════════════════════════════════════════════════════
 
         // Remove conda env
-        let env_label = if self.confirm_remove_env { "YES, remove it" } else { "Remove conda env" };
+        let env_armed = self.is_armed(Arm::RemoveEnv);
+        let env_label = if env_armed { "YES, remove it" } else { "Remove conda env" };
         let remove_env_btn = button(text(env_label).size(13))
             .on_press_maybe(if busy { None } else { Some(Message::UninstallCondaEnvClick) })
             .style(button::danger)
             .padding([4, 12]);
-        let env_desc = if self.confirm_remove_env {
+        let env_desc = if env_armed {
             text("Click again to confirm.").size(11).color(color!(0xe74c3c))
         } else {
             text("Deletes the 'sapphire' Python environment and all packages.").size(11).color(color!(0x7f849c))
         };
 
         // Delete user data
-        let ud_label = if self.confirm_delete_userdata { "YES, delete user data" } else { "Delete user data" };
+        let ud_armed = self.is_armed(Arm::DeleteUserData);
+        let ud_label = if ud_armed { "YES, delete user data" } else { "Delete user data" };
         let delete_ud_btn = button(text(ud_label).size(13))
             .on_press_maybe(if busy { None } else { Some(Message::UninstallDeleteUserdataClick) })
             .style(button::danger)
             .padding([4, 12]);
-        let ud_desc = if self.confirm_delete_userdata {
-            text("Click again to confirm.").size(11).color(color!(0xe74c3c))
+        let user_dir = PathBuf::from(&self.install_path).join("user");
+        let ud_desc = if ud_armed {
+            text(format!("Click again to permanently delete {}.", user_dir.display())).size(11).color(armed_red)
         } else {
-            text("Removes sapphire/user/ — your settings and personal data.").size(11).color(color!(0x7f849c))
+            text("Removes your settings, chats and personal data in this folder.").size(11).color(color!(0x7f849c))
         };
 
         // Delete everything
-        let folder_label = if self.confirm_delete_folder { "YES, delete everything" } else { "Delete Sapphire folder" };
+        let folder_armed = self.is_armed(Arm::DeleteFolder);
+        let folder_label = if folder_armed { "YES, delete everything" } else { "Delete Sapphire folder" };
         let delete_folder_btn = button(text(folder_label).size(13))
             .on_press_maybe(if busy { None } else { Some(Message::UninstallDeleteFolderClick) })
             .style(button::danger)
             .padding([4, 12]);
-        let folder_desc = if self.confirm_delete_folder {
-            text("FINAL WARNING. Everything will be permanently deleted.").size(11).color(color!(0xe74c3c))
+        let folder_desc = if folder_armed {
+            text(format!("FINAL WARNING. Click again to permanently delete {} and everything in it.", self.install_path)).size(11).color(armed_red)
         } else {
-            text(format!("Nukes {} — code, settings, everything. Cannot be undone.", self.install_path))
+            text(format!("Deletes {}, including Sapphire's code and the settings and chats inside it. Cannot be undone.", self.install_path))
                 .size(11).color(color!(0x7f849c))
         };
+
+        // What none of these touch: say so, and offer the one that would keep firing.
+        let config_dir = crate::platform::app_config_dir();
+        let stays = text(format!(
+            "These keep your API keys and passwords in {}, and Git and Miniconda. Delete that folder yourself to remove your saved secrets.",
+            config_dir.display()
+        )).size(11).color(color!(0x7f849c));
+        let remove_armed = self.is_armed(Arm::RemoveService);
+        let autostart_row = self.autostart_target().map(|_| {
+            column![
+                button(text(if remove_armed { "YES, turn off autostart" } else { "Turn off autostart" }).size(13))
+                    .on_press_maybe((!busy).then_some(Message::ServiceRemoveClick))
+                    .style(button::danger)
+                    .padding([4, 12]),
+                text(if remove_armed { "Click again to confirm." } else { "Autostart is on, and stays on unless you turn it off here." }).size(11)
+                    .color(if remove_armed { armed_red } else { color!(0x7f849c) }),
+            ].spacing(2)
+        });
 
         let danger_section = column![
             text("Danger Zone").size(16).font(Font {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
             }).color(color!(0xe74c3c)),
-            text("These actions are destructive. Won't touch Git or Miniconda.").size(11).color(color!(0x7f849c)),
+            stays,
             text(if blocked { "Stop Sapphire before using these." } else { "" }).size(11).color(color!(0xf9e154)),
             column![remove_env_btn, env_desc].spacing(2),
             column![delete_ud_btn, ud_desc].spacing(2),
             column![delete_folder_btn, folder_desc].spacing(2),
-        ].spacing(8);
+        ].push_maybe(autostart_row).spacing(8);
 
         // Divider between sections
         let divider = container(text(""))
@@ -501,7 +587,7 @@ impl App {
         let mut checks_col = Column::new().spacing(8);
         // Fixes pip-install into her env: one at a time, and only while she is down
         // (Windows keeps the files she has open locked — half-installed packages).
-        let fix_blocked = self.ts_running || self.ts_fixing || self.sapphire_running || self.sapphire_stopping;
+        let fix_blocked = self.ts_running || !self.idle() || self.sapphire_running;
         let mut any_fixable = false;
 
         for (check, status) in &self.ts_checks {
@@ -511,11 +597,12 @@ impl App {
                 TsStatus::Checking | TsStatus::Fixing => (SPINNER[self.spinner_tick % SPINNER.len()], color!(0x3d85c6)),
                 TsStatus::Ok(_) | TsStatus::Fixed(_) => ("+", color!(0x4caf50)),
                 TsStatus::Problem(_) => ("!", color!(0xe74c3c)),
+                TsStatus::Warning(_) => ("!", color!(0xf9e154)),
             };
 
             let label_text = ts_label(*check);
             let detail = match status {
-                TsStatus::Ok(s) | TsStatus::Problem(s) | TsStatus::Fixed(s) => Some(s.as_str()),
+                TsStatus::Ok(s) | TsStatus::Problem(s) | TsStatus::Warning(s) | TsStatus::Fixed(s) => Some(s.as_str()),
                 TsStatus::Checking => Some("checking..."),
                 TsStatus::Fixing => Some("fixing..."),
                 TsStatus::NotChecked => None,
@@ -557,7 +644,7 @@ impl App {
         }
 
         let check_btn = button(text("Check Sapphire"))
-            .on_press_maybe(if self.ts_running || self.ts_fixing { None } else { Some(Message::TroubleshootCheck) })
+            .on_press_maybe(if self.ts_running || (self.op == Op::Fixing) { None } else { Some(Message::TroubleshootCheck) })
             .style(button::primary);
 
         let note = if any_fixable && (self.sapphire_running || self.sapphire_stopping) {
@@ -610,7 +697,7 @@ impl App {
             };
             let workdir = info.working_dir.clone().unwrap_or_else(|| "unknown".to_string());
 
-            let run_row = if info.active {
+            let run_row = if info.holds_her() {
                 row![
                     button(text("Stop").size(13)).on_press(Message::ServiceStop).style(button::danger).padding([4, 14]),
                     button(text("Restart").size(13)).on_press(Message::ServiceRestart).style(button::primary).padding([4, 14]),
@@ -621,7 +708,7 @@ impl App {
                 ].spacing(10)
             };
 
-            let remove_label = if self.confirm_remove_service { "Click again to confirm removal" } else { "Remove service" };
+            let remove_label = if self.is_armed(Arm::RemoveService) { "Click again to confirm removal" } else { "Remove service" };
             let remove_btn = button(text(remove_label).size(13))
                 .on_press(Message::ServiceRemoveClick).style(button::danger).padding([4, 14]);
 
@@ -711,12 +798,12 @@ impl App {
         // is running: `enable --now` would start a twin under the one we follow, wipe
         // her log and leave the first one orphaned when the window closes.
         let running = self.sapphire_running || self.sapphire_stopping;
-        let can_enable = self.systemd_available && installed && !self.installing && !self.scanning && !running;
+        let can_enable = self.systemd_available && installed && self.idle() && !running;
         let enable_btn = button(text("Enable Sapphire service").font(bold))
             .on_press_maybe(if can_enable { Some(Message::ServiceInstall) } else { None })
             .style(button::success);
 
-        let will_run = if self.installing {
+        let will_run = if self.op == Op::Installing {
             "Finishing install — the button unlocks when it's done.".to_string()
         } else if running {
             "Stop Sapphire first — the service takes over running her.".to_string()
@@ -760,7 +847,7 @@ impl App {
             } else {
                 ("stopped", muted)
             };
-            let remove_label = if self.confirm_remove_service {
+            let remove_label = if self.is_armed(Arm::RemoveService) {
                 "Click again to confirm"
             } else {
                 "Turn off autostart"
@@ -786,7 +873,7 @@ impl App {
         } else {
             ("[ ]", color!(0xf9e154), "Sapphire install: not found — install it first (Install tab)".to_string())
         };
-        let can_enable = installed && !self.installing && !self.scanning;
+        let can_enable = installed && self.idle();
         let enable_btn = button(text("Enable at sign-in").font(bold))
             .on_press_maybe(if can_enable { Some(Message::ServiceInstall) } else { None })
             .style(button::success);

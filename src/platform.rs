@@ -162,7 +162,7 @@ pub(crate) fn has_lock_file(install: &str) -> bool {
 }
 
 /// Do two paths name the same install folder?
-fn same_install(a: &str, b: &str) -> bool {
+pub(crate) fn same_install(a: &str, b: &str) -> bool {
     a == b || match (core_spelling(a.as_ref()), core_spelling(b.as_ref())) {
         (Some(x), Some(y)) => x == y,
         _ => false,
@@ -218,6 +218,17 @@ pub(crate) struct RunState {
 /// Seconds since the epoch, for the handshake.
 pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Written before an update changes anything and removed once its packages are in:
+/// a launcher opening with this file finds new code on old packages.
+pub(crate) fn update_marker_path() -> PathBuf {
+    app_config_dir().join("update-unfinished")
+}
+
+/// Did an update on this install stop partway?
+pub(crate) fn update_unfinished(marker: &std::path::Path, install: &str) -> bool {
+    std::fs::read_to_string(marker).is_ok_and(|p| same_install(p.trim(), install))
 }
 
 /// When this machine booted (unix seconds). None = unknown.
@@ -682,7 +693,8 @@ pub(crate) async fn run_cmd_async(program: String, args: Vec<String>) -> Result<
 pub(crate) async fn run_cmd_full_async(program: String, args: Vec<String>) -> Result<String, String> {
     let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
         let mut cmd = Command::new(&program);
-        cmd.args(&args).env("CONDA_PLUGINS_AUTO_ACCEPT_TOS", "yes");
+        // GIT_TERMINAL_PROMPT: with no terminal, a credentials prompt would hang forever.
+        cmd.args(&args).env("CONDA_PLUGINS_AUTO_ACCEPT_TOS", "yes").env("GIT_TERMINAL_PROMPT", "0");
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
@@ -706,6 +718,21 @@ pub(crate) async fn run_cmd_full_async(program: String, args: Vec<String>) -> Re
     result.map_err(|e| e.to_string())?
 }
 
+
+/// Run a command, returning its exit code and combined output even when it fails.
+/// Err = it couldn't be started at all. For tools whose numeric code is the contract.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) async fn run_cmd_code(program: String, args: Vec<String>) -> Result<(i32, String), String> {
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = hidden_cmd(&program);
+        cmd.args(&args);
+        let out = cmd.output().map_err(|e| e.to_string())?;
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        Ok((out.status.code().unwrap_or(-1), text.trim().to_string()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
 
 /// Find git executable on disk (Linux: rely on PATH).
 #[cfg(not(windows))]

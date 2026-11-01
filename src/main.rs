@@ -26,7 +26,7 @@ fn config_path() -> PathBuf {
     app_config_dir().join("launcher.json")
 }
 
-fn load_config() -> (String, Branch) {
+fn load_config() -> (String, Option<Branch>) {
     let install_path = read_install_path(&config_path()).unwrap_or_else(default_install_path);
     // Detect actual branch from the repo instead of trusting config
     let branch = detect_git_branch(&install_path);
@@ -39,23 +39,44 @@ fn read_install_path(path: &std::path::Path) -> Option<String> {
     v.get("install_path")?.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string)
 }
 
-fn detect_git_branch(install_path: &str) -> Branch {
-    let git_dir = PathBuf::from(install_path).join(".git");
-    if !git_dir.exists() {
-        return Branch::Stable;
+/// The branch a checkout is on: None when it's on anything but Stable or Development
+/// (a feature branch, a detached commit), which the picker must not dress up as Stable.
+/// No checkout yet: Stable, what an install would clone.
+fn detect_git_branch(install_path: &str) -> Option<Branch> {
+    if !PathBuf::from(install_path).join(".git").exists() {
+        return Some(Branch::Stable);
     }
-    let mut cmd = hidden_cmd(&find_git());
-    cmd.args(["-C", install_path, "rev-parse", "--abbrev-ref", "HEAD"]);
-    match cmd.output() {
-        Ok(out) if out.status.success() => {
-            let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            if branch == "dev" { Branch::Development } else { Branch::Stable }
-        }
-        _ => Branch::Stable,
+    match git_head_name(install_path).as_deref() {
+        Some("dev") => Some(Branch::Development),
+        Some("main") => Some(Branch::Stable),
+        _ => None,
     }
 }
 
+/// `rev-parse --abbrev-ref HEAD`: a branch name, or "HEAD" when detached.
+fn git_head_name(install_path: &str) -> Option<String> {
+    let mut cmd = hidden_cmd(&find_git());
+    cmd.args(["-C", install_path, "rev-parse", "--abbrev-ref", "HEAD"]);
+    let out = cmd.output().ok().filter(|o| o.status.success())?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// What to show for a checkout on neither branch.
+fn off_branch_name(install_path: &str, branch: Option<Branch>) -> Option<String> {
+    if branch.is_some() {
+        return None;
+    }
+    Some(match git_head_name(install_path).as_deref() {
+        Some("HEAD") | None => "a specific commit".to_string(),
+        Some(name) => name.to_string(),
+    })
+}
+
 fn save_config(install_path: &str, branch: Branch) {
+    // Tests drive PathChanged and friends; they must never touch the real config.
+    if cfg!(test) {
+        return;
+    }
     let _ = write_config(&config_path(), install_path, branch);
 }
 
@@ -94,6 +115,7 @@ fn main() -> iced::Result {
     let win_settings = window::Settings {
         size: iced::Size::new(800.0, 550.0),
         icon,
+        exit_on_close_request: false,
         // Linux only: app_id must match the .desktop StartupWMClass so the
         // compositor shows our icon. (The field doesn't exist on Windows.)
         #[cfg(not(windows))]
@@ -120,11 +142,12 @@ fn main() -> iced::Result {
         .subscription(App::subscription)
         .window(win_settings)
         // Closing the window just closes it: Sapphire is started detached and keeps
-        // running (the launcher is an assistant, not a parent).
+        // running (the launcher is an assistant, not a parent). Only the launcher's own
+        // long jobs make us ask first; see CloseRequested.
         .run_with(|| {
             let app = App::default();
             let path = app.install_path.clone();
-            let branch = app.selected_branch.unwrap_or(Branch::Stable);
+            let branch = app.selected_branch;
             #[cfg(windows)]
             let shim_path = path.clone();
             #[allow(unused_mut)] // Windows pushes the autostart check below
@@ -257,23 +280,26 @@ struct App {
     log_visible: bool,
     log_lines: Vec<String>,
     steps: Vec<(Step, StepStatus)>,
-    scanning: bool,
-    installing: bool,
-    uninstalling: bool,
-    // Confirmation states for destructive actions — must click twice
-    confirm_remove_env: bool,
-    confirm_delete_folder: bool,
-    confirm_delete_userdata: bool,
-    confirm_reset_keys: bool,
+    // The one long job running. Its folder is `install_path`, which is frozen until
+    // it ends (see `path_frozen`).
+    op: Op,
+    // Bumped per scan, so results from a scan of another folder are dropped.
+    scan_epoch: usize,
+    // The one two-click confirmation armed right now, and when.
+    armed: Option<(Arm, Instant)>,
+    // A branch picked but not yet switched to, and why the last switch failed.
+    pending_branch: Option<Branch>,
+    branch_note: Option<String>,
+    // The branch or commit a checkout is on when it's neither Stable nor Development.
+    off_branch: Option<String>,
     // Update
     updates_available: Option<u32>, // None = unknown, Some(0) = up to date, Some(n) = behind
     checking_updates: bool,
-    updating: bool,
+    update_unfinished: bool, // an update stopped between new code and new packages
     update_status: Vec<(String, StepStatus)>, // label, status
     // Troubleshoot
     ts_checks: Vec<(TsCheck, TsStatus)>,
     ts_running: bool,
-    ts_fixing: bool, // one Fix at a time (two pips in one env is how envs break)
     // Animation
     spinner_tick: usize,
     // Sapphire process
@@ -309,7 +335,6 @@ struct App {
     // Autostart tab (Linux): whether systemd --user is available; remove confirm;
     // what an older/hand-written unit is missing (None = fine or no unit).
     systemd_available: bool,
-    confirm_remove_service: bool,
     #[cfg(not(windows))]
     unit_issues: Option<UnitIssues>,
     // Service env vars (the unit's EnvironmentFile), edited in the manage view.
@@ -324,10 +349,12 @@ impl Default for App {
     fn default() -> Self {
         let (install_path, branch) = load_config();
         let port = web_port(&install_path);
+        let off_branch = off_branch_name(&install_path, branch);
+        let update_unfinished = update_unfinished(&update_marker_path(), &install_path);
 
         Self {
             install_path,
-            selected_branch: Some(branch),
+            selected_branch: branch,
             active_tab: Tab::default(),
             log_visible: true,
             log_lines: vec![format!("Sapphire Launcher v{} ({}). Ready.", env!("CARGO_PKG_VERSION"), std::env::consts::OS)],
@@ -335,13 +362,16 @@ impl Default for App {
                 .iter()
                 .map(|s| (*s, StepStatus::NotStarted))
                 .collect(),
-            scanning: false,
-            installing: false,
-            uninstalling: false,
+            op: Op::Idle,
+            scan_epoch: 0,
+            armed: None,
+            pending_branch: None,
+            branch_note: None,
+            off_branch,
             spinner_tick: 0,
             updates_available: None,
             checking_updates: false,
-            updating: false,
+            update_unfinished,
             update_status: vec![
                 ("Pull latest changes".into(), StepStatus::NotStarted),
                 ("Update dependencies".into(), StepStatus::NotStarted),
@@ -355,11 +385,6 @@ impl Default for App {
                 (TsCheck::Gpu, TsStatus::NotChecked),
             ],
             ts_running: false,
-            ts_fixing: false,
-            confirm_remove_env: false,
-            confirm_delete_folder: false,
-            confirm_delete_userdata: false,
-            confirm_reset_keys: false,
             sapphire_running: false,
             sapphire_stopping: false,
             sapphire_log: Vec::new(),
@@ -376,7 +401,6 @@ impl Default for App {
             web_port: port,
             launcher_check: LauncherCheck::Pending,
             systemd_available: false,
-            confirm_remove_service: false,
             #[cfg(not(windows))]
             unit_issues: None,
             #[cfg(not(windows))]
@@ -417,6 +441,55 @@ const BRANCHES: &[Branch] = &[Branch::Stable, Branch::Development];
 
 // ── Messages ───────────────────────────────────────────────────────────────
 
+/// The long job the launcher is running: one at a time, and every button that could
+/// start another asks `refuse_if_busy` / `idle()` first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Op {
+    #[default]
+    Idle,
+    Scanning,
+    Installing,
+    Updating,
+    Uninstalling,
+    Fixing,
+    SwitchingBranch,
+}
+
+impl Op {
+    fn words(self) -> &'static str {
+        match self {
+            Op::Idle => "current job",
+            Op::Scanning => "scan",
+            Op::Installing => "install",
+            Op::Updating => "update",
+            Op::Uninstalling => "uninstall",
+            Op::Fixing => "repair",
+            Op::SwitchingBranch => "branch switch",
+        }
+    }
+    /// Stopping partway through this would leave the install half-changed.
+    fn unsafe_to_close(self) -> bool {
+        !matches!(self, Op::Idle | Op::Scanning)
+    }
+}
+
+/// A two-click confirmation. A second click counts only after a beat (so a double-click
+/// can't be both clicks) and before it expires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arm {
+    RemoveEnv,
+    DeleteFolder,
+    DeleteUserData,
+    ResetKeys,
+    ResetPassword,
+    RemoveService,
+    Sweep,
+    CloseWindow,
+}
+
+const ARM_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const ARM_SECS: u64 = 10;
+
 /// What a Stop was for — runs once Sapphire is actually down. (Closing the window
 /// is not one: she keeps running.)
 #[derive(Debug, Clone, Copy, Default)]
@@ -437,14 +510,19 @@ enum Message {
     Launch,
     StopSapphire,
     OpenBrowser,
+    BranchConfirm,
+    BranchCancel,
     SwitchBranch,
-    SwitchBranchResult(String, bool),
+    SwitchBranchResult(Branch, String, bool),
+    SwitchDepsDone(String, bool),
+    ArmExpired,
+    CloseRequested(window::Id),
     TabSelected(Tab),
     ToggleLog,
     // Install flow
     ScanClicked,
     GoClicked,
-    StepResult(Step, StepStatus),
+    StepResult(usize, Step, StepStatus), // scan epoch, step, status
     InstallStepResult(Step, StepStatus, String), // step, status, log output
     Log(String),
     CopyRunLog,
@@ -509,6 +587,8 @@ enum Message {
     UnitPatched(String, bool),
     #[cfg(windows)]
     AutostartRepaired(Option<String>), // startup shim check: a note for the log, if any
+    #[cfg(windows)]
+    AutostartRepoint,                  // start her from the folder on screen
     #[cfg(not(windows))]
     EnvLoaded(String),
     #[cfg(not(windows))]
@@ -549,7 +629,14 @@ async fn health_up(port: u16, timeout_s: u32) -> bool {
     run_cmd_full_async("curl".into(), vec![
         "-sk".into(), "--max-time".into(), timeout_s.to_string(),
         format!("{}/api/health", web_url(port)),
-    ]).await.map(|b| b.contains("ok")).unwrap_or(false)
+    ]).await.is_ok_and(|b| health_says_ok(&b))
+}
+
+/// Core answers `{"status": "ok", ...}`. Another app on the port that merely has "ok"
+/// somewhere in its reply is not her.
+fn health_says_ok(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .is_ok_and(|v| v.get("status").and_then(|s| s.as_str()) == Some("ok"))
 }
 
 /// Poll the health endpoint every 500 ms until it stops answering (true) or `tries`
@@ -567,25 +654,47 @@ async fn wait_health_down(port: u16, tries: usize) -> bool {
 
 /// Is a Sapphire running on this install? `find_instance` (core's lock + our
 /// handshake, pid identity-checked) first — it sees her during boot, when the port
-/// is blind. When the install has no lock file at all (a core from before
-/// 2026-10-16, which Stable still is) the web port is asked as before, and a yes is
-/// an instance with pid 0: shown as running, followed through core's log, stopped
-/// by the sweep. Off the UI thread.
+/// is blind. Only a real checkout of a core with no lock at all (Stable, as of this
+/// writing) asks the web port, and a yes is an instance with pid 0: shown as running,
+/// followed through core's log, stopped by the sweep after a confirmation. No lock file
+/// anywhere else means she has never run here, whoever answers on that port. Off the UI
+/// thread.
 async fn instance_lookup(install: String, port: u16) -> Option<Instance> {
     let i = install.clone();
-    let (found, has_lock) = tokio::task::spawn_blocking(move || (find_instance(&i), has_lock_file(&i)))
+    let (found, may_be_old_core) = tokio::task::spawn_blocking(move || (find_instance(&i), is_lockless_core(&i)))
         .await
-        .unwrap_or((None, true));
-    match (found, has_lock) {
+        .unwrap_or((None, false));
+    match (found, may_be_old_core) {
         (Some(inst), _) => Some(inst),
-        (None, true) => None,
-        (None, false) => health_up(port, 3).await.then(|| Instance {
+        (None, false) => None,
+        (None, true) => health_up(port, 3).await.then(|| Instance {
             pid: 0,
             since: String::new(),
             origin: Origin::Elsewhere,
             log: core_log_path(&install),
         }),
     }
+}
+
+/// `pip install -r` for this folder's requirements, as the last step of a code change:
+/// on success it clears the "unfinished" marker. Streamed: a torch bump is minutes of
+/// download, not a frozen spinner.
+async fn install_requirements(path: String, sink: Arc<Mutex<Vec<String>>>, failed: &str) -> (String, bool) {
+    let req = PathBuf::from(&path).join("requirements.txt");
+    match pip_install_streamed(vec!["-r".into(), req.to_string_lossy().to_string()], sink.clone()).await {
+        Ok(_) => {
+            let _ = std::fs::remove_file(update_marker_path());
+            ("Dependencies updated.".to_string(), true)
+        }
+        Err(e) => (pip_failure(failed, &sink, &e), false),
+    }
+}
+
+/// A Sapphire checkout whose core predates the instance lock and has none on disk.
+fn is_lockless_core(install: &str) -> bool {
+    looks_like_install(install)
+        && !PathBuf::from(install).join("core").join("single_instance.py").exists()
+        && !has_lock_file(install)
 }
 
 /// `msg`, `secs` seconds from when iced starts the Task. The sleep is built inside
@@ -623,52 +732,77 @@ impl App {
                 Task::none()
             }
             Message::PathChanged(path) => {
+                // The field is read-only while frozen; a Browse dialog opened before
+                // the job started can still land here.
+                if self.path_frozen() {
+                    self.log_lines.push(format!("Wait for the {} to finish before changing folders.", self.op.words()));
+                    return Task::none();
+                }
                 if !path.is_empty() {
                     self.install_path = path;
                     self.web_port = web_port(&self.install_path);
-                    // The picker must show the branch THIS folder is on — a Go on a
-                    // real install checks out whatever the picker says.
-                    self.selected_branch = Some(detect_git_branch(&self.install_path));
+                    // The picker must show the branch THIS folder is on.
+                    self.selected_branch = detect_git_branch(&self.install_path);
+                    self.off_branch = off_branch_name(&self.install_path, self.selected_branch);
+                    self.pending_branch = None;
+                    self.branch_note = None;
+                    self.update_unfinished = update_unfinished(&update_marker_path(), &self.install_path);
                     save_config(&self.install_path, self.selected_branch.unwrap_or(Branch::Stable));
                     // An armed "YES, delete" must never carry over to a new folder,
                     // and the scan on screen was for the old one.
                     self.disarm_confirms();
                     self.let_go_of_found();
-                    if !self.installing && !self.scanning {
-                        for (_, status) in &mut self.steps { *status = StepStatus::NotStarted; }
+                    self.follow_unit_for_this_folder();
+                    if self.op == Op::Scanning {
+                        self.op = Op::Idle;
                     }
+                    self.scan_epoch += 1;
+                    for (_, status) in &mut self.steps { *status = StepStatus::NotStarted; }
                 }
                 Task::none()
             }
             Message::PathPicked(path) => {
+                let frozen = self.path_frozen();
                 let _ = self.update(Message::PathChanged(path));
-                if self.installing || self.scanning {
+                if frozen {
                     return Task::none();
                 }
                 self.update(Message::ScanClicked)
             }
             Message::BranchSelected(branch) => {
-                if Some(branch) == self.selected_branch {
-                    return Task::none(); // re-picking the current branch is not a switch
-                }
-                if self.updating || self.installing || self.uninstalling {
-                    self.log_lines.push("Wait for the current install/update to finish before switching branches.".to_string());
+                if self.refuse_if_busy() {
                     return Task::none();
                 }
-                self.selected_branch = Some(branch);
-                save_config(&self.install_path, branch);
-                let git_dir = PathBuf::from(&self.install_path).join(".git");
-                if !git_dir.exists() {
+                self.branch_note = None;
+                // Nothing here yet: this is simply what an install would download.
+                if !looks_like_install(&self.install_path) {
+                    self.selected_branch = Some(branch);
+                    save_config(&self.install_path, branch);
                     return Task::none();
                 }
-
-                // Stop Sapphire first if she's up; the checkout runs once she is down.
-                if self.sapphire_running || self.sapphire_stopping {
+                // A real install: changing it stops her and swaps code, so the picker
+                // only proposes. The banner explains and confirms.
+                self.pending_branch = (Some(branch) != self.selected_branch).then_some(branch);
+                Task::none()
+            }
+            Message::BranchCancel => {
+                self.pending_branch = None;
+                self.branch_note = None;
+                Task::none()
+            }
+            Message::BranchConfirm => {
+                if self.pending_branch.is_none() || self.refuse_if_busy() {
+                    return Task::none();
+                }
+                if self.sapphire_running {
                     return self.begin_stop(AfterStop::SwitchBranch);
                 }
                 self.update(Message::SwitchBranch)
             }
             Message::BrowsePath => {
+                if self.path_frozen() {
+                    return Task::none();
+                }
                 Task::perform(async {
                     rfd::AsyncFileDialog::new()
                         .set_title("Choose Sapphire install folder")
@@ -687,14 +821,13 @@ impl App {
                     self.log_lines.push("Sapphire is already running.".to_string());
                     return Task::none();
                 }
-                if self.updating || self.installing {
-                    self.log_lines.push("Wait for the install/update to finish before launching.".to_string());
+                if self.refuse_if_busy() {
                     return Task::none();
                 }
 
                 // Already up? Attach instead of starting a twin, whose start would
                 // wipe the log she is writing to. A unit mid-start is handled below.
-                if !self.service.as_ref().is_some_and(|s| s.holds_her())
+                if !self.unit_here().is_some_and(|s| s.holds_her())
                     && let Some(her) = find_instance(&self.install_path)
                 {
                     self.active_tab = Tab::Running;
@@ -702,7 +835,7 @@ impl App {
                 }
 
                 // Service mode: start the systemd unit + follow journalctl instead.
-                if self.service.is_some() {
+                if self.unit_here().is_some() {
                     return self.update(Message::ServiceStart);
                 }
 
@@ -754,37 +887,88 @@ impl App {
                 Task::none()
             }
             Message::SwitchBranch => {
-                let path = self.install_path.clone();
-                let git_dir = PathBuf::from(&path).join(".git");
-                if !git_dir.exists() {
-                    self.log_lines.push("No repo found — install first.".to_string());
+                let Some(target) = self.pending_branch else { return Task::none() };
+                if self.refuse_if_busy() {
                     return Task::none();
                 }
-                let branch = match self.selected_branch {
-                    Some(Branch::Development) => "dev",
-                    _ => "main",
-                };
+                if let Some(why) = self.env_in_use() {
+                    self.branch_note = Some(why);
+                    return Task::none();
+                }
+                self.op = Op::SwitchingBranch;
+                self.branch_note = None;
+                let branch = if target == Branch::Development { "dev" } else { "main" };
                 self.log_lines.push(format!("Switching to {} branch...", branch));
+                let path = self.install_path.clone();
                 let b = branch.to_string();
                 Task::perform(
                     async move {
                         run_cmd_full_async(find_git(), vec!["-C".into(), path, "checkout".into(), b.clone()]).await
                             .map(|out| (format!("Switched to {}: {}", b, out), true))
-                            .unwrap_or_else(|e| (format!("Branch switch failed: {}", e), false))
+                            .unwrap_or_else(|e| (e, false))
                     },
-                    |(msg, ok)| Message::SwitchBranchResult(msg, ok),
+                    move |(msg, ok)| Message::SwitchBranchResult(target, msg, ok),
                 )
             }
-            Message::SwitchBranchResult(msg, ok) => {
-                self.log_lines.push(msg);
-                if ok {
-                    // The badge counted commits behind the OLD branch — count again.
-                    self.updates_available = None;
-                    return self.update(Message::CheckForUpdates);
+            Message::SwitchBranchResult(target, msg, ok) => {
+                self.log_lines.push(msg.clone());
+                self.pending_branch = None;
+                if !ok {
+                    // The picker must show the branch we are really on.
+                    self.op = Op::Idle;
+                    self.selected_branch = detect_git_branch(&self.install_path);
+                    self.off_branch = off_branch_name(&self.install_path, self.selected_branch);
+                    self.branch_note = Some(if msg.contains("would be overwritten") {
+                        "Nothing changed: you have edited files this switch would overwrite.".to_string()
+                    } else {
+                        plain_failure("Couldn't switch, so nothing changed.", &msg)
+                    });
+                    return Task::none();
                 }
-                // The checkout failed: the picker must show the branch we are really on.
-                self.selected_branch = Some(detect_git_branch(&self.install_path));
+                self.selected_branch = Some(target);
+                self.off_branch = None;
+                save_config(&self.install_path, target);
+                // New code wants its own packages. Installed in the same job, marked
+                // unfinished until they're in, like an update.
+                self.log_lines.push(format!("Installing the packages {} needs...", target));
+                self.update_unfinished = true;
+                let path = self.install_path.clone();
+                let sink = self.install_output.clone();
+                if let Ok(mut v) = sink.lock() { v.clear(); }
+                Task::perform(
+                    async move {
+                        let _ = std::fs::create_dir_all(app_config_dir());
+                        let _ = std::fs::write(update_marker_path(), &path);
+                        install_requirements(path, sink, "Switched branches, but installing its packages failed.").await
+                    },
+                    |(msg, ok)| Message::SwitchDepsDone(msg, ok),
+                )
+            }
+            Message::SwitchDepsDone(msg, ok) => {
+                self.op = Op::Idle;
+                self.drain_install_output();
+                self.log_lines.push(msg.clone());
+                if ok {
+                    self.update_unfinished = false;
+                } else {
+                    self.branch_note = Some(format!("{} Click Update to try again.", msg));
+                }
+                // The badge counted commits behind the OLD branch — count again.
+                self.updates_available = None;
+                self.update(Message::CheckForUpdates)
+            }
+            Message::ArmExpired => {
+                if self.armed.is_some_and(|(_, at)| at.elapsed().as_secs() >= ARM_SECS) {
+                    self.armed = None;
+                }
                 Task::none()
+            }
+            Message::CloseRequested(id) => {
+                if !self.op.unsafe_to_close() || self.confirm(Arm::CloseWindow) {
+                    return window::close(id);
+                }
+                self.log_lines.push(format!("The {} is still running. Closing now can leave Sapphire half-changed. Close again to close anyway.", self.op.words()));
+                after(ARM_SECS, Message::ArmExpired)
             }
 
             // ── Update flow ───────────────────────────────────────────
@@ -792,7 +976,7 @@ impl App {
                 if self.checking_updates { return Task::none(); }
                 self.checking_updates = true;
                 let path = self.install_path.clone();
-                let branch = self.selected_branch.unwrap_or(Branch::Stable);
+                let branch = self.selected_branch;
                 Task::batch(vec![
                     Task::perform(check_for_updates(path, branch), Message::UpdatesAvailable),
                     Task::perform(check_launcher_release(), Message::LauncherReleaseChecked),
@@ -824,19 +1008,22 @@ impl App {
                 Task::none()
             }
             Message::UpdateClicked => {
-                if self.updating || self.installing {
+                if self.refuse_if_busy() {
+                    return Task::none();
+                }
+                if !looks_like_install(&self.install_path) {
+                    self.log_lines.push(format!("{} doesn't hold a Sapphire install, so there's nothing to update.", self.install_path));
                     return Task::none();
                 }
                 if self.sapphire_running || self.sapphire_stopping {
                     // Stop her first; UpdateAfterStop continues once she is down.
                     return self.begin_stop(AfterStop::Update);
                 }
-                let git_dir = PathBuf::from(&self.install_path).join(".git");
-                if !git_dir.exists() {
-                    self.log_lines.push("No repo found — install first.".to_string());
+                if let Some(why) = self.env_in_use() {
+                    self.log_lines.push(why);
                     return Task::none();
                 }
-                self.updating = true;
+                self.op = Op::Updating;
                 // Reset steps
                 for (_, s) in &mut self.update_status {
                     *s = StepStatus::NotStarted;
@@ -844,8 +1031,18 @@ impl App {
                 // Step 1: git pull
                 self.update_status[0].1 = StepStatus::Installing;
                 self.log_lines.push("[update] Pulling latest changes...".to_string());
+                self.update_unfinished = true;
                 let path = self.install_path.clone();
-                Task::perform(git_stash_and_pull(path), |(msg, ok)| Message::UpdateStepDone(msg, ok))
+                let sink = self.install_output.clone();
+                if let Ok(mut v) = sink.lock() { v.clear(); }
+                Task::perform(
+                    async move {
+                        let _ = std::fs::create_dir_all(app_config_dir());
+                        let _ = std::fs::write(update_marker_path(), &path);
+                        update_code(path, sink).await
+                    },
+                    |(msg, ok)| Message::UpdateStepDone(msg, ok),
+                )
             }
             Message::UpdateAfterStop => {
                 // finish_stop already cleared the running state; the pane keeps her
@@ -864,8 +1061,8 @@ impl App {
                     if let Some(i) = current_step {
                         self.update_status[i].1 = StepStatus::Failed(msg);
                     }
-                    self.updating = false;
-                    self.log_lines.push("[update] Stopped — fix the issue and try again.".to_string());
+                    self.op = Op::Idle;
+                    self.log_lines.push("[update] Stopped. Click Update to try again.".to_string());
                     return Task::none();
                 }
 
@@ -877,23 +1074,21 @@ impl App {
                         // Step 2: pip install -r requirements.txt
                         self.update_status[1].1 = StepStatus::Installing;
                         self.log_lines.push("[update] Updating dependencies...".to_string());
-                        let req = PathBuf::from(&self.install_path).join("requirements.txt");
+                        let path = self.install_path.clone();
                         let sink = self.install_output.clone();
                         if let Ok(mut v) = sink.lock() { v.clear(); }
-                        return Task::perform(async move {
-                            // Streamed: a torch bump is minutes of download, not a frozen spinner.
-                            match pip_install_streamed(vec!["-r".into(), req.to_string_lossy().to_string()], sink).await {
-                                Ok(_) => ("Dependencies updated.".to_string(), true),
-                                Err(e) => (format!("pip install failed: {}", e), false),
-                            }
-                        }, |(msg, ok)| Message::UpdateStepDone(msg, ok));
+                        return Task::perform(
+                            async move { install_requirements(path, sink, "Installing the update's packages failed.").await },
+                            |(msg, ok)| Message::UpdateStepDone(msg, ok),
+                        );
                     }
                 }
 
                 // All done
-                self.updating = false;
+                self.op = Op::Idle;
                 self.log_lines.push("[update] Update complete!".to_string());
                 self.updates_available = Some(0);
+                self.update_unfinished = false;
                 Task::none()
             }
             Message::SapphireLines(lines) => {
@@ -1008,8 +1203,10 @@ impl App {
                 }
                 // Service mode: ask systemd — the unit is the truth there.
                 let lookup = Task::perform(instance_lookup(self.install_path.clone(), self.web_port), Message::InstanceFound);
-                let Some(unit) = &self.service else { return lookup };
-                let holds = unit.holds_her();
+                if self.service.is_none() {
+                    return lookup;
+                }
+                let holds = self.unit_here().is_some_and(|u| u.holds_her());
                 let refresh = Task::perform(
                     async { tokio::task::spawn_blocking(detect_sapphire_service).await.unwrap_or(None) },
                     Message::ServiceRefreshed,
@@ -1024,7 +1221,7 @@ impl App {
                 }
                 // With a unit: it owns her while it runs her. Otherwise only a pid is
                 // worth attaching to; the no-pid sweep is not for a box with a unit.
-                if let Some(unit) = &self.service {
+                if let Some(unit) = self.unit_here() {
                     if unit.holds_her() {
                         return Task::none();
                     }
@@ -1074,7 +1271,12 @@ impl App {
 
             // ── Install flow ───────────────────────────────────────────
             Message::ScanClicked => {
-                self.scanning = true;
+                if !matches!(self.op, Op::Idle | Op::Scanning) {
+                    return Task::none();
+                }
+                self.op = Op::Scanning;
+                self.scan_epoch += 1;
+                let epoch = self.scan_epoch;
                 self.web_port = web_port(&self.install_path); // settings.json may be new
                 self.log_lines.push("Scanning system...".to_string());
 
@@ -1092,33 +1294,37 @@ impl App {
                 // Fire off all checks in parallel
                 #[allow(unused_mut)] // Windows pushes the VC++ check below
                 let mut checks = vec![
-                    Task::perform(check_git(), |(step, status)| {
-                        Message::StepResult(step, status)
+                    Task::perform(check_git(), move |(step, status)| {
+                        Message::StepResult(epoch, step, status)
                     }),
-                    Task::perform(check_conda(), |(step, status)| {
-                        Message::StepResult(step, status)
+                    Task::perform(check_conda(), move |(step, status)| {
+                        Message::StepResult(epoch, step, status)
                     }),
-                    Task::perform(check_conda_init(), |(step, status)| {
-                        Message::StepResult(step, status)
+                    Task::perform(check_conda_init(), move |(step, status)| {
+                        Message::StepResult(epoch, step, status)
                     }),
-                    Task::perform(check_python_env(), |(step, status)| {
-                        Message::StepResult(step, status)
+                    Task::perform(check_python_env(), move |(step, status)| {
+                        Message::StepResult(epoch, step, status)
                     }),
-                    Task::perform(check_clone(path.clone()), |(step, status)| {
-                        Message::StepResult(step, status)
+                    Task::perform(check_clone(path.clone()), move |(step, status)| {
+                        Message::StepResult(epoch, step, status)
                     }),
-                    Task::perform(check_deps(path), |(step, status)| {
-                        Message::StepResult(step, status)
+                    Task::perform(check_deps(path), move |(step, status)| {
+                        Message::StepResult(epoch, step, status)
                     }),
                 ];
                 #[cfg(windows)]
-                checks.push(Task::perform(check_vcredist(), |(step, status)| {
-                    Message::StepResult(step, status)
+                checks.push(Task::perform(check_vcredist(), move |(step, status)| {
+                    Message::StepResult(epoch, step, status)
                 }));
                 Task::batch(checks)
             }
 
-            Message::StepResult(step, status) => {
+            Message::StepResult(epoch, step, status) => {
+                // From a scan of another folder, or overtaken by a newer one.
+                if epoch != self.scan_epoch {
+                    return Task::none();
+                }
                 // Log it
                 let detail = status.detail().unwrap_or("").to_string();
                 let label = step_label(step);
@@ -1136,7 +1342,9 @@ impl App {
                     .any(|(s, st)| *s != Step::Done && *st == StepStatus::Checking);
 
                 if !still_checking {
-                    self.scanning = false;
+                    if self.op == Op::Scanning {
+                        self.op = Op::Idle;
+                    }
                     self.log_lines.push("Scan complete.".to_string());
 
                     // If everything is Found, mark Done as green
@@ -1159,7 +1367,20 @@ impl App {
             }
 
             Message::GoClicked => {
-                self.installing = true;
+                // A scan in flight would overwrite the steps this is about to run.
+                if self.op == Op::Scanning || self.refuse_if_busy() {
+                    return Task::none();
+                }
+                // Before any slow step: a folder that can't take a clone stops here.
+                if let Some(why) = clone_blocker(&self.install_path) {
+                    self.log_lines.push(why);
+                    return Task::none();
+                }
+                if let Some(why) = self.env_in_use() {
+                    self.log_lines.push(why);
+                    return Task::none();
+                }
+                self.op = Op::Installing;
                 if let Ok(mut v) = self.install_output.lock() { v.clear(); }
 
                 self.log_lines.push("Starting install...".to_string());
@@ -1195,7 +1416,7 @@ impl App {
                 }
 
                 if failed {
-                    self.installing = false;
+                    self.op = Op::Idle;
                     self.log_lines.push("Install stopped — fix the issue above and try again.".to_string());
                     return Task::none();
                 }
@@ -1234,6 +1455,18 @@ impl App {
 
             // ── Resets ─────────────────────────────────────────────────
             Message::ResetPassword => {
+                // Two clicks, and only while she is down, same as the API keys.
+                if self.refuse_if_busy() {
+                    return Task::none();
+                }
+                if let Some(why) = self.uninstall_blocker(false, false) {
+                    self.disarm(Arm::ResetPassword);
+                    self.log_lines.push(why);
+                    return Task::none();
+                }
+                if !self.confirm(Arm::ResetPassword) {
+                    return after(ARM_SECS, Message::ArmExpired);
+                }
                 let key_path = app_config_dir().join("secret_key");
                 let msg = if key_path.exists() {
                     match std::fs::remove_file(&key_path) {
@@ -1249,16 +1482,17 @@ impl App {
             Message::ResetCredentials => {
                 // Two clicks, and only while she is down (a running Sapphire rewrites
                 // the file from memory). Blanks the API keys only — see clear_api_keys.
-                if let Some(why) = self.uninstall_blocker(false) {
-                    self.confirm_reset_keys = false;
+                if self.refuse_if_busy() {
+                    return Task::none();
+                }
+                if let Some(why) = self.uninstall_blocker(false, false) {
+                    self.disarm(Arm::ResetKeys);
                     self.log_lines.push(why);
                     return Task::none();
                 }
-                if !self.confirm_reset_keys {
-                    self.confirm_reset_keys = true;
-                    return Task::none();
+                if !self.confirm(Arm::ResetKeys) {
+                    return after(ARM_SECS, Message::ArmExpired);
                 }
-                self.confirm_reset_keys = false;
                 let msg = clear_api_keys_file(&app_config_dir().join("credentials.json"));
                 self.log_lines.push(msg.clone());
                 Task::done(Message::ResetResult(msg))
@@ -1269,19 +1503,18 @@ impl App {
 
             // ── Uninstall flow (two-click confirmation) ─────────────
             Message::UninstallCondaEnvClick => {
-                if let Some(why) = self.uninstall_blocker(false) {
-                    self.confirm_remove_env = false;
+                if self.refuse_if_busy() {
+                    return Task::none();
+                }
+                if let Some(why) = self.uninstall_blocker(false, true) {
+                    self.disarm(Arm::RemoveEnv);
                     self.log_lines.push(why);
                     return Task::none();
                 }
-                if !self.confirm_remove_env {
-                    // First click — arm it
-                    self.confirm_remove_env = true;
-                    return Task::none();
+                if !self.confirm(Arm::RemoveEnv) {
+                    return after(ARM_SECS, Message::ArmExpired);
                 }
-                // Second click — do it
-                self.confirm_remove_env = false;
-                self.uninstalling = true;
+                self.op = Op::Uninstalling;
 
                 self.log_lines.push("[uninstall] Removing conda environment 'sapphire'...".to_string());
                 Task::perform(uninstall_conda_env(), |(msg, ok)| {
@@ -1290,17 +1523,18 @@ impl App {
             }
 
             Message::UninstallDeleteFolderClick => {
-                if let Some(why) = self.uninstall_blocker(true) {
-                    self.confirm_delete_folder = false;
+                if self.refuse_if_busy() {
+                    return Task::none();
+                }
+                if let Some(why) = self.uninstall_blocker(true, false) {
+                    self.disarm(Arm::DeleteFolder);
                     self.log_lines.push(why);
                     return Task::none();
                 }
-                if !self.confirm_delete_folder {
-                    self.confirm_delete_folder = true;
-                    return Task::none();
+                if !self.confirm(Arm::DeleteFolder) {
+                    return after(ARM_SECS, Message::ArmExpired);
                 }
-                self.confirm_delete_folder = false;
-                self.uninstalling = true;
+                self.op = Op::Uninstalling;
 
                 let path = self.install_path.clone();
                 self.log_lines.push(format!("[uninstall] Deleting {}...", path));
@@ -1310,35 +1544,35 @@ impl App {
             }
 
             Message::UninstallDeleteUserdataClick => {
-                if let Some(why) = self.uninstall_blocker(true) {
-                    self.confirm_delete_userdata = false;
+                if self.refuse_if_busy() {
+                    return Task::none();
+                }
+                if let Some(why) = self.uninstall_blocker(true, false) {
+                    self.disarm(Arm::DeleteUserData);
                     self.log_lines.push(why);
                     return Task::none();
                 }
-                if !self.confirm_delete_userdata {
-                    self.confirm_delete_userdata = true;
-                    return Task::none();
+                if !self.confirm(Arm::DeleteUserData) {
+                    return after(ARM_SECS, Message::ArmExpired);
                 }
-                self.confirm_delete_userdata = false;
-                self.uninstalling = true;
+                self.op = Op::Uninstalling;
 
                 let path = self.install_path.clone();
-                self.log_lines.push(format!("[uninstall] Deleting {}\\user...", path));
+                self.log_lines.push(format!("[uninstall] Deleting {}...", PathBuf::from(&path).join("user").display()));
                 Task::perform(uninstall_delete_userdata(path), |(msg, ok)| {
                     Message::UninstallResult(msg, ok)
                 })
             }
 
             Message::UninstallResult(msg, success) => {
-                self.uninstalling = false;
+                self.op = Op::Idle;
                 for line in msg.lines() {
                     self.log_lines.push(format!("  {}", line));
                 }
                 if success {
                     self.log_lines.push("[uninstall] Done.".to_string());
-                    for (_, status) in &mut self.steps {
-                        *status = StepStatus::NotStarted;
-                    }
+                    // What the Install tab showed is out of date: look again.
+                    return self.update(Message::ScanClicked);
                 } else {
                     self.log_lines.push("[uninstall] Something went wrong — check the log above.".to_string());
                 }
@@ -1358,7 +1592,7 @@ impl App {
                 Task::batch(vec![
                     Task::perform(ts_check_running(port), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_webui(port), |(c, s)| Message::TroubleshootResult(c, s)),
-                    Task::perform(ts_check_deps(), |(c, s)| Message::TroubleshootResult(c, s)),
+                    Task::perform(ts_check_deps(path.clone()), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_plugins(path.clone()), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_plugin_deps(path), |(c, s)| Message::TroubleshootResult(c, s)),
                     Task::perform(ts_check_gpu(), |(c, s)| Message::TroubleshootResult(c, s)),
@@ -1376,17 +1610,17 @@ impl App {
                 Task::none()
             }
             Message::TroubleshootFix(check) => {
-                if self.ts_running || self.ts_fixing {
+                if self.ts_running || self.refuse_if_busy() {
                     return Task::none();
                 }
-                if self.sapphire_running || self.sapphire_stopping {
+                if self.env_in_use().is_some() {
                     self.log_lines.push("Stop Sapphire before installing packages — she has them open.".to_string());
                     return Task::none();
                 }
                 if let Some((_, s)) = self.ts_checks.iter_mut().find(|(c, _)| *c == check) {
                     *s = TsStatus::Fixing;
                 }
-                self.ts_fixing = true;
+                self.op = Op::Fixing;
                 if let Ok(mut v) = self.install_output.lock() { v.clear(); }
                 self.log_lines.push(format!("[troubleshoot] Fixing {}...", ts_label(check)));
                 let path = self.install_path.clone();
@@ -1402,13 +1636,13 @@ impl App {
                         Message::TroubleshootFixResult(c, msg, ok)
                     }),
                     _ => {
-                        self.ts_fixing = false;
+                        self.op = Op::Idle;
                         Task::none()
                     }
                 }
             }
             Message::TroubleshootFixResult(check, msg, success) => {
-                self.ts_fixing = false;
+                self.op = Op::Idle;
                 self.drain_install_output();
                 self.log_lines.push(format!("[troubleshoot] {}", msg));
                 if let Some((_, s)) = self.ts_checks.iter_mut().find(|(c, _)| *c == check) {
@@ -1420,7 +1654,7 @@ impl App {
                 // "Repaired" is a claim — run that one check again to prove it.
                 let path = self.install_path.clone();
                 match check {
-                    TsCheck::DepsHealth => Task::perform(ts_check_deps(), |(c, s)| Message::TroubleshootResult(c, s)),
+                    TsCheck::DepsHealth => Task::perform(ts_check_deps(path), |(c, s)| Message::TroubleshootResult(c, s)),
                     TsCheck::Plugins => Task::perform(ts_check_plugins(path), |(c, s)| Message::TroubleshootResult(c, s)),
                     TsCheck::PluginDeps => Task::perform(ts_check_plugin_deps(path), |(c, s)| Message::TroubleshootResult(c, s)),
                     _ => Task::none(),
@@ -1431,7 +1665,7 @@ impl App {
             Message::ServiceDetected(info) => {
                 let mut tasks: Vec<Task<Message>> = vec![self.env_reload(&info)];
                 self.service = info.clone();
-                if info.as_ref().is_none_or(|i| !i.holds_her()) {
+                if self.unit_here().is_none_or(|i| !i.holds_her()) {
                     // No unit running her: is she running anyway (autostart, a terminal,
                     // an earlier launcher)? Asked now, then every 5 s.
                     tasks.push(Task::done(Message::InstancePoll));
@@ -1448,14 +1682,16 @@ impl App {
                         if !have_valid && PathBuf::from(wd).join("main.py").exists() {
                             self.install_path = wd.clone();
                             self.web_port = web_port(&self.install_path);
-                            self.selected_branch = Some(detect_git_branch(wd));
+                            self.selected_branch = detect_git_branch(wd);
+                            self.off_branch = off_branch_name(wd, self.selected_branch);
                             save_config(&self.install_path, self.selected_branch.unwrap_or(Branch::Stable));
                             self.log_lines.push(format!("Using service path: {}", wd));
                             tasks.push(Task::done(Message::ScanClicked));
                         }
                     }
-                    self.sapphire_running = info.active;
-                    if info.active {
+                    let holds = self.unit_here().is_some_and(|u| u.holds_her());
+                    self.sapphire_running = holds;
+                    if holds {
                         // Attach live logs (the journalctl Subscription starts itself).
                         self.sapphire_log.clear();
                         self.streaming_journal = true;
@@ -1465,6 +1701,9 @@ impl App {
                 Task::batch(tasks)
             }
             Message::ServiceStart => {
+                if self.refuse_if_busy() {
+                    return Task::none();
+                }
                 self.sapphire_running = true;
                 self.sapphire_stopping = false;
                 self.sapphire_log.clear();
@@ -1485,6 +1724,9 @@ impl App {
             Message::ServiceStop => self.begin_stop(AfterStop::None),
             #[cfg(not(windows))]
             Message::ServiceRestart => {
+                if self.refuse_if_busy() {
+                    return Task::none();
+                }
                 self.sapphire_running = true;
                 self.sapphire_stopping = false;
                 self.streaming_journal = true;
@@ -1537,18 +1779,20 @@ impl App {
                 )
             }
             Message::ServiceRefreshed(info) => {
+                // Only a unit running THIS folder says anything about her here.
+                let here = info.as_ref().filter(|u| unit_runs(u, &self.install_path));
                 // A stop in flight owns the running state until it confirms.
-                if let Some(info) = &info
+                if let Some(unit) = here
                     && !self.sapphire_stopping
                 {
                     // The unit took over from an instance we had found.
-                    if info.holds_her() && !self.holding_child {
+                    if unit.holds_her() && !self.holding_child {
                         self.attached = None;
                     }
-                    self.sapphire_running = info.active || self.attached.is_some();
+                    self.sapphire_running = unit.holds_her() || self.attached.is_some();
                     // She came up behind our back (crash restart, a terminal start):
                     // attach the log follower.
-                    if info.active && !self.streaming_journal {
+                    if unit.holds_her() && !self.streaming_journal {
                         self.sapphire_log.clear();
                         self.streaming_journal = true;
                         self.journal_epoch += 1;
@@ -1567,6 +1811,9 @@ impl App {
                 Task::none()
             }
             Message::ServiceInstall => {
+                if self.refuse_if_busy() {
+                    return Task::none();
+                }
                 self.log_lines.push("[service] Setting up autostart...".to_string());
                 let path = self.install_path.clone();
                 Task::perform(install_service(path), |(m, ok)| Message::ServiceInstallResult(m, ok))
@@ -1592,13 +1839,14 @@ impl App {
                 )
             }
             Message::ServiceRemoveClick => {
-                if !self.confirm_remove_service {
-                    self.confirm_remove_service = true;
+                if self.refuse_if_busy() {
                     return Task::none();
                 }
-                self.confirm_remove_service = false;
+                if !self.confirm(Arm::RemoveService) {
+                    return after(ARM_SECS, Message::ArmExpired);
+                }
                 self.streaming_journal = false;
-                self.log_lines.push("[service] Removing systemd --user unit...".to_string());
+                self.log_lines.push("[service] Removing autostart...".to_string());
                 Task::perform(remove_service(), |(m, ok)| Message::ServiceRemoveResult(m, ok))
             }
             Message::ServiceRemoveResult(msg, ok) => {
@@ -1661,6 +1909,13 @@ impl App {
                 }
                 Task::none()
             }
+            #[cfg(windows)]
+            Message::AutostartRepoint => {
+                if looks_like_install(&self.install_path) {
+                    self.log_lines.push(repoint_autostart(&self.install_path));
+                }
+                Task::none()
+            }
             #[cfg(not(windows))]
             Message::EnvLoaded(s) => {
                 self.env_content = text_editor::Content::with_text(&s);
@@ -1704,13 +1959,101 @@ impl App {
         }
     }
 
-    /// Drop every armed two-click confirmation (tab change, path change).
+    /// Drop the armed two-click confirmation (tab change, path change).
     fn disarm_confirms(&mut self) {
-        self.confirm_remove_env = false;
-        self.confirm_delete_folder = false;
-        self.confirm_delete_userdata = false;
-        self.confirm_remove_service = false;
-        self.confirm_reset_keys = false;
+        self.armed = None;
+    }
+
+    fn disarm(&mut self, arm: Arm) {
+        if self.armed.is_some_and(|(a, _)| a == arm) {
+            self.armed = None;
+        }
+    }
+
+    /// Is this confirmation armed and not yet expired? (The view asks.)
+    fn is_armed(&self, arm: Arm) -> bool {
+        self.armed.is_some_and(|(a, at)| a == arm && at.elapsed().as_secs() < ARM_SECS)
+    }
+
+    /// A click on a two-click action: true = this is the confirming click, go. A click
+    /// too soon after arming is the rest of a double-click and counts for nothing.
+    fn confirm(&mut self, arm: Arm) -> bool {
+        if self.is_armed(arm) {
+            let settled = self.armed.is_some_and(|(_, at)| at.elapsed() >= ARM_MIN);
+            if settled {
+                self.armed = None;
+            }
+            return settled;
+        }
+        self.armed = Some((arm, Instant::now()));
+        false
+    }
+
+    /// Nothing long-running, and she isn't mid-stop.
+    fn idle(&self) -> bool {
+        self.op == Op::Idle && !self.sapphire_stopping
+    }
+
+    /// The gate on everything that starts work. True = refused, and the log says why.
+    /// A scan only reads, and it restarts cleanly, so it gives way.
+    fn refuse_if_busy(&mut self) -> bool {
+        if self.sapphire_stopping {
+            self.log_lines.push("Wait for Sapphire to finish stopping.".to_string());
+            return true;
+        }
+        if !matches!(self.op, Op::Idle | Op::Scanning) {
+            self.log_lines.push(format!("Wait for the {} to finish.", self.op.words()));
+            return true;
+        }
+        false
+    }
+
+    /// While a job runs, or a stop has work queued behind it, `install_path` is that
+    /// job's folder. A scan just gives way to the new folder.
+    fn path_frozen(&self) -> bool {
+        !matches!(self.op, Op::Idle | Op::Scanning) || self.sapphire_stopping
+    }
+
+    /// The unit, if it runs the folder on screen. A unit running another folder says
+    /// nothing about this one.
+    fn unit_here(&self) -> Option<&ServiceInfo> {
+        self.service.as_ref().filter(|u| unit_runs(u, &self.install_path))
+    }
+
+    /// The path changed: the unit's say over the running state and the log follows it.
+    fn follow_unit_for_this_folder(&mut self) {
+        if self.service.is_none() || self.holding_child {
+            return;
+        }
+        let holds = self.unit_here().is_some_and(|u| u.holds_her());
+        self.sapphire_running = holds || self.attached.is_some();
+        if holds != self.streaming_journal {
+            self.streaming_journal = holds;
+            self.sapphire_log.clear();
+            self.journal_epoch += 1;
+        }
+    }
+
+    /// A fresh look, not the 5-second-old flag: is she up on this folder?
+    fn up_here(&self) -> bool {
+        self.sapphire_running || self.sapphire_stopping
+            || self.unit_here().is_some_and(|u| u.holds_her())
+            || find_instance(&self.install_path).is_some()
+    }
+
+    /// Is anything running out of the one shared Python env, from any folder? Her env
+    /// must not change under her. Some = why not.
+    fn env_in_use(&self) -> Option<String> {
+        if self.up_here() {
+            return Some("Stop Sapphire first.".to_string());
+        }
+        let elsewhere = self.service.as_ref().filter(|u| u.holds_her()).map(|u| u.working_dir.clone())
+            .or_else(|| {
+                let r = read_run_state(&run_state_path())?;
+                (pid_look(r.pid) == Some(true)).then_some(r.install)
+            })?;
+        let from = elsewhere.unwrap_or_else(|| "another folder".to_string());
+        Some(format!("Sapphire is running from {}. Pick that folder and stop her first.", from))
     }
 
     /// A Sapphire we only found (not started) belongs to the folder we found her in:
@@ -1724,15 +2067,15 @@ impl App {
 
     /// Why a destructive action can't run right now (None = go ahead): she must be
     /// down, and — for the folder deletes — the path must really be a Sapphire install.
-    fn uninstall_blocker(&self, needs_install: bool) -> Option<String> {
-        if self.sapphire_running || self.sapphire_stopping {
+    fn uninstall_blocker(&self, needs_install: bool, uses_env: bool) -> Option<String> {
+        if self.up_here() {
             return Some("Stop Sapphire first.".to_string());
         }
-        if needs_install && !looks_like_install(&self.install_path) {
-            return Some(format!(
-                "{} doesn't look like a Sapphire install (no main.py and .git) — not touching it.",
-                self.install_path
-            ));
+        if uses_env && let Some(why) = self.env_in_use() {
+            return Some(why);
+        }
+        if needs_install && !can_delete(&self.install_path) {
+            return Some(format!("{} doesn't look like a Sapphire install — not touching it.", self.install_path));
         }
         None
     }
@@ -1774,6 +2117,12 @@ impl App {
             self.log_lines.push("Sapphire is still starting — try again in a moment.".to_string());
             return Task::none();
         }
+        // No pid and no unit: all we have is the sweep, which ends every python in her
+        // env. Never silently, whatever asked for this stop.
+        if pid == 0 && self.unit_here().is_none() && !self.confirm(Arm::Sweep) {
+            self.log_lines.push("Sapphire was started outside this app, so stopping her also ends anything else using her Python environment. Click again to do that.".to_string());
+            return crate::after(ARM_SECS, Message::ArmExpired);
+        }
         self.sapphire_stopping = true;
         self.after_stop = after;
         self.stop_epoch += 1;
@@ -1797,7 +2146,7 @@ impl App {
         }
 
         // Service mode: stop the unit, confirm through the health probe.
-        if self.service.is_some() {
+        if self.unit_here().is_some() {
             self.streaming_journal = false;
             return Task::perform(
                 async move {
@@ -1888,7 +2237,7 @@ impl App {
 
         let Some(step) = next else {
             // Nothing left to install — we're done!
-            self.installing = false;
+            self.op = Op::Idle;
             self.step_started = None;
             if let Some((_, s)) = self.steps.iter_mut().find(|(s, _)| *s == Step::Done) {
                 *s = StepStatus::Done("Sapphire is ready! Hit Launch.".to_string());
@@ -1941,8 +2290,7 @@ impl App {
         let mut subs: Vec<Subscription<Message>> = Vec::new();
 
         // Only tick when something is animating
-        let anything_busy = self.scanning || self.installing || self.updating
-            || self.uninstalling || self.ts_running || self.ts_fixing || self.checking_updates
+        let anything_busy = self.op != Op::Idle || self.ts_running || self.checking_updates
             || self.sapphire_stopping;
         if anything_busy {
             subs.push(iced::time::every(std::time::Duration::from_millis(200)).map(|_| Message::Tick));
@@ -1962,6 +2310,8 @@ impl App {
                 child_follower(self.install_path.clone(), launch_log_path(), run_state_path()),
             ));
         }
+
+        subs.push(window::close_requests().map(Message::CloseRequested));
 
         // Her log, from a file: ours (Launch, autostart) or core's (started elsewhere).
         // For our own Child it waits for SapphireStarted, when the file is fresh.
@@ -2110,7 +2460,7 @@ mod tests {
     #[test]
     fn git_branch_detection() {
         let d = scratch("branch");
-        assert_eq!(detect_git_branch(&d.to_string_lossy()), Branch::Stable, "no repo → Stable");
+        assert_eq!(detect_git_branch(&d.to_string_lossy()), Some(Branch::Stable), "no repo → Stable");
         for (branch, want) in [("dev", Branch::Development), ("main", Branch::Stable)] {
             let r = scratch(&format!("branch-{}", branch));
             // A real install is a clone with history; an unborn branch has no HEAD to
@@ -2123,7 +2473,7 @@ mod tests {
                 eprintln!("skipped: git init failed");
                 return;
             }
-            assert_eq!(detect_git_branch(&r.to_string_lossy()), want, "branch {}", branch);
+            assert_eq!(detect_git_branch(&r.to_string_lossy()), Some(want), "branch {}", branch);
         }
     }
 
@@ -2138,6 +2488,11 @@ mod tests {
         let mut a = App::default();
         a.log_lines.clear();
         a.service = None;
+        // Never the real folder from launcher.json: Krem's live Sapphire runs there.
+        a.install_path = "/no/such/sapphire-launcher-test-folder".to_string();
+        a.selected_branch = Some(Branch::Stable);
+        a.off_branch = None;
+        a.update_unfinished = false;
         a
     }
     /// She is OURS: started by this launcher, Child held, pid known.
@@ -2337,8 +2692,8 @@ mod tests {
         let _ = a.update(Message::UninstallDeleteUserdataClick);
         let _ = a.update(Message::UninstallCondaEnvClick);
         let _ = a.update(Message::ResetCredentials);
-        assert!(!a.confirm_delete_folder && !a.confirm_delete_userdata && !a.confirm_remove_env && !a.confirm_reset_keys);
-        assert!(!a.uninstalling);
+        assert!(a.armed.is_none());
+        assert!(!(a.op == Op::Uninstalling));
         assert_eq!(a.log_lines.iter().filter(|l| l.contains("Stop Sapphire first")).count(), 4);
     }
 
@@ -2346,17 +2701,225 @@ mod tests {
     fn delete_folder_needs_a_real_install_and_arms_before_it_fires() {
         let mut a = app();
         a.install_path = scratch("not-an-install").to_string_lossy().into_owned();
+        std::fs::write(PathBuf::from(&a.install_path).join("notes.txt"), "mine").unwrap();
         let _ = a.update(Message::UninstallDeleteFolderClick);
-        assert!(!a.confirm_delete_folder && logged(&a, "doesn't look like a Sapphire install"));
-        let d = scratch("an-install");
-        std::fs::write(d.join("main.py"), "").unwrap();
-        std::fs::create_dir_all(d.join(".git")).unwrap();
+        assert!(a.armed.is_none() && logged(&a, "doesn't look like a Sapphire install"));
+        // Somebody else's Python project: main.py and .git aren't enough.
+        let mine = scratch("my-project");
+        std::fs::write(mine.join("main.py"), "").unwrap();
+        std::fs::create_dir_all(mine.join(".git")).unwrap();
+        a.install_path = mine.to_string_lossy().into_owned();
+        let _ = a.update(Message::UninstallDeleteFolderClick);
+        assert!(a.armed.is_none());
+        let d = fake_checkout("an-install");
         a.install_path = d.to_string_lossy().into_owned();
         let _ = a.update(Message::UninstallDeleteFolderClick);
-        assert!(a.confirm_delete_folder && !a.uninstalling, "first click only arms");
+        assert!(a.is_armed(Arm::DeleteFolder) && a.op == Op::Idle, "first click only arms");
         assert!(d.exists());
         a.disarm_confirms();
-        assert!(!a.confirm_delete_folder);
+        assert!(!a.is_armed(Arm::DeleteFolder));
+    }
+
+    /// The files that make a folder Sapphire, and nothing else.
+    fn fake_checkout(name: &str) -> PathBuf {
+        let d = scratch(name);
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        std::fs::create_dir_all(d.join("core")).unwrap();
+        for f in ["main.py", "sapphire.py", "core/setup.py"] {
+            std::fs::write(d.join(f), "").unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn a_double_click_cannot_be_both_clicks() {
+        let mut a = app();
+        let d = fake_checkout("double-click");
+        a.install_path = d.to_string_lossy().into_owned();
+        let _ = a.update(Message::UninstallDeleteFolderClick);
+        let _ = a.update(Message::UninstallDeleteFolderClick);
+        assert!(a.op == Op::Idle && a.is_armed(Arm::DeleteFolder), "the second click of a double-click does nothing");
+        // A deliberate second click, a moment later: fires. (The task it returns is
+        // inert until polled, so nothing is deleted here.)
+        a.armed = Some((Arm::DeleteFolder, Instant::now() - std::time::Duration::from_secs(2)));
+        let _ = a.update(Message::UninstallDeleteFolderClick);
+        assert_eq!(a.op, Op::Uninstalling);
+        // Left armed too long: it expires, and the next click only arms again.
+        let mut b = app();
+        b.install_path = d.to_string_lossy().into_owned();
+        b.armed = Some((Arm::DeleteFolder, Instant::now() - std::time::Duration::from_secs(ARM_SECS + 1)));
+        assert!(!b.is_armed(Arm::DeleteFolder));
+        let _ = b.update(Message::UninstallDeleteFolderClick);
+        assert!(b.op == Op::Idle && b.is_armed(Arm::DeleteFolder));
+        let _ = b.update(Message::ArmExpired);
+        assert!(b.is_armed(Arm::DeleteFolder), "a timer from an older arming doesn't disarm a fresh one");
+    }
+
+    #[test]
+    fn reset_password_has_the_same_guards_as_the_keys() {
+        let mut a = app();
+        a.sapphire_running = true;
+        let _ = a.update(Message::ResetPassword);
+        assert!(a.armed.is_none() && logged(&a, "Stop Sapphire first"));
+        let mut b = app();
+        let _ = b.update(Message::ResetPassword);
+        assert!(b.is_armed(Arm::ResetPassword), "first click only arms");
+    }
+
+    #[test]
+    fn only_one_job_at_a_time_and_its_folder_is_frozen() {
+        let d = fake_checkout("one-job");
+        let path = d.to_string_lossy().into_owned();
+        for op in [Op::Installing, Op::Updating, Op::Uninstalling, Op::Fixing, Op::SwitchingBranch] {
+            let mut a = app();
+            a.install_path = path.clone();
+            a.op = op;
+            for m in [Message::GoClicked, Message::Launch, Message::UpdateClicked, Message::UninstallCondaEnvClick,
+                      Message::UninstallDeleteFolderClick, Message::ResetCredentials, Message::ResetPassword,
+                      Message::TroubleshootFix(TsCheck::DepsHealth), Message::ServiceStart, Message::ServiceRemoveClick] {
+                let _ = a.update(m);
+                assert_eq!(a.op, op, "nothing else starts during a {}", op.words());
+                assert!(a.armed.is_none() && !a.holding_child && !a.sapphire_running);
+            }
+            let _ = a.update(Message::PathChanged("/somewhere/else".into()));
+            assert_eq!(a.install_path, path, "a job's folder doesn't move under it");
+            assert!(logged(&a, "before changing folders"));
+        }
+        // A stop with work queued behind it holds the folder too.
+        let mut b = app();
+        b.install_path = path.clone();
+        b.sapphire_stopping = true;
+        let _ = b.update(Message::PathChanged("/somewhere/else".into()));
+        assert_eq!(b.install_path, path);
+    }
+
+    #[test]
+    fn results_of_a_scan_of_another_folder_are_dropped() {
+        let mut a = app();
+        let _ = a.update(Message::ScanClicked);
+        let old = a.scan_epoch;
+        let _ = a.update(Message::PathChanged(scratch("scan-new").to_string_lossy().into_owned()));
+        assert_eq!(a.op, Op::Idle, "a scan gives way to the new folder");
+        let _ = a.update(Message::StepResult(old, Step::Git, StepStatus::Found("old folder".into())));
+        assert!(a.steps.iter().all(|(_, s)| *s == StepStatus::NotStarted));
+    }
+
+    #[test]
+    fn a_folder_that_cannot_take_a_clone_stops_go_before_any_slow_step() {
+        let mut a = app();
+        let d = scratch("not-empty");
+        std::fs::write(d.join("taxes.txt"), "mine").unwrap();
+        a.install_path = d.to_string_lossy().into_owned();
+        for (s, st) in &mut a.steps {
+            if *s != Step::Done { *st = StepStatus::NotFound("needed".into()); }
+        }
+        let _ = a.update(Message::GoClicked);
+        assert_eq!(a.op, Op::Idle);
+        assert!(a.steps.iter().all(|(s, st)| *s == Step::Done || matches!(st, StepStatus::NotFound(_))), "Git wasn't started");
+        assert!(logged(&a, "already has other files"));
+    }
+
+    #[test]
+    fn no_sweep_without_a_second_click() {
+        let mut a = app();
+        let i = Instance { pid: 0, since: String::new(), origin: Origin::Elsewhere, log: PathBuf::new() };
+        let _ = a.update(Message::InstanceFound(Some(i)));
+        assert!(a.sapphire_running);
+        // Stop & Update asks the same way: nothing reaches the sweep unconfirmed.
+        a.install_path = fake_checkout("sweep").to_string_lossy().into_owned();
+        let _ = a.update(Message::UpdateClicked);
+        assert!(!a.sapphire_stopping && a.is_armed(Arm::Sweep) && logged(&a, "Click again"));
+        a.armed = Some((Arm::Sweep, Instant::now() - std::time::Duration::from_secs(2)));
+        let _ = a.update(Message::StopSapphire);
+        assert!(a.sapphire_stopping);
+    }
+
+    #[test]
+    fn only_a_real_status_ok_is_her() {
+        assert!(health_says_ok(r#"{"status": "ok", "instance_name": "x"}"#));
+        for no in ["ok", "<html>token ok</html>", r#"{"status": "error"}"#, r#"{"token": "ok"}"#, ""] {
+            assert!(!health_says_ok(no), "{}", no);
+        }
+    }
+
+    #[test]
+    fn a_folder_with_no_lock_only_asks_the_port_if_it_is_an_old_core() {
+        let d = scratch("empty-path");
+        assert!(!is_lockless_core(&d.to_string_lossy()), "an empty folder never asks");
+        assert!(!is_lockless_core("/no/such/folder/half-typed"));
+        let c = fake_checkout("stable-core");
+        assert!(is_lockless_core(&c.to_string_lossy()), "Stable: no lock in core at all");
+        std::fs::write(c.join("core/single_instance.py"), "").unwrap();
+        assert!(!is_lockless_core(&c.to_string_lossy()), "a locking core with no lock has never run here");
+    }
+
+    #[test]
+    fn a_unit_on_another_folder_says_nothing_about_this_one() {
+        let a_dir = fake_checkout("unit-a");
+        let b_dir = fake_checkout("unit-b");
+        let unit = ServiceInfo { active_state: "active".into(), enabled: true, sub_state: "running".into(),
+            working_dir: Some(a_dir.to_string_lossy().into_owned()), env_file: None };
+        let mut a = app();
+        a.install_path = b_dir.to_string_lossy().into_owned();
+        a.service = Some(unit.clone());
+        let _ = a.update(Message::ServiceRefreshed(Some(unit.clone())));
+        assert!(!a.sapphire_running && !a.streaming_journal, "she isn't running from this folder");
+        // Launch here means this folder, not the unit's.
+        let _ = a.update(Message::Launch);
+        assert!(!logged(&a, "Starting Sapphire service"));
+        // Point at the unit's folder: it's hers again.
+        let mut c = app();
+        c.install_path = b_dir.to_string_lossy().into_owned();
+        c.service = Some(unit);
+        let _ = c.update(Message::PathChanged(a_dir.to_string_lossy().into_owned()));
+        assert!(c.sapphire_running && c.streaming_journal);
+    }
+
+    #[test]
+    fn a_crash_looping_unit_offers_stop() {
+        let looping = ServiceInfo { active_state: "activating".into(), enabled: true, sub_state: "auto-restart".into(), working_dir: None, env_file: None };
+        let mut a = app();
+        a.service = Some(looping.clone());
+        let _ = a.update(Message::ServiceRefreshed(Some(looping)));
+        assert!(a.sapphire_running, "the header shows Stop, and the destructive guards hold");
+        let _ = a.update(Message::StopSapphire);
+        assert!(a.sapphire_stopping, "systemctl stop, which cancels the restart");
+    }
+
+    #[test]
+    fn a_branch_pick_on_a_real_install_only_proposes() {
+        let d = fake_checkout("branch-pick");
+        let mut a = app();
+        a.install_path = d.to_string_lossy().into_owned();
+        a.selected_branch = Some(Branch::Stable);
+        a.sapphire_running = true;
+        ours(&mut a);
+        let _ = a.update(Message::BranchSelected(Branch::Development));
+        assert_eq!(a.pending_branch, Some(Branch::Development));
+        assert_eq!(a.selected_branch, Some(Branch::Stable), "still what the folder is on");
+        assert!(!a.sapphire_stopping, "nothing stops until it's confirmed");
+        let _ = a.update(Message::BranchCancel);
+        assert_eq!(a.pending_branch, None);
+        let _ = a.update(Message::BranchSelected(Branch::Development));
+        let _ = a.update(Message::BranchConfirm);
+        assert!(a.sapphire_stopping && matches!(a.after_stop, AfterStop::SwitchBranch));
+        // The stop fails: the picker never lied, and the proposal is still on screen.
+        let _ = a.update(Message::SapphireStopConfirmed(false));
+        assert_eq!(a.selected_branch, Some(Branch::Stable));
+        assert_eq!(a.pending_branch, Some(Branch::Development));
+        // Re-picking what the folder is on just withdraws the proposal.
+        let _ = a.update(Message::BranchSelected(Branch::Stable));
+        assert_eq!(a.pending_branch, None);
+    }
+
+    #[test]
+    fn closing_mid_job_asks_first() {
+        assert!(Op::Updating.unsafe_to_close() && Op::Installing.unsafe_to_close() && Op::SwitchingBranch.unsafe_to_close());
+        assert!(!Op::Idle.unsafe_to_close() && !Op::Scanning.unsafe_to_close());
+        let mut a = app();
+        a.op = Op::Updating;
+        let _ = a.update(Message::CloseRequested(window::Id::unique()));
+        assert!(a.is_armed(Arm::CloseWindow) && logged(&a, "Close again"));
     }
 
     #[test]
@@ -2364,9 +2927,9 @@ mod tests {
         // First click only (the second would touch the real credentials file).
         let mut a = app();
         let _ = a.update(Message::ResetCredentials);
-        assert!(a.confirm_reset_keys && a.log_lines.is_empty());
+        assert!(a.is_armed(Arm::ResetKeys) && a.log_lines.is_empty());
         let _ = a.update(Message::TabSelected(Tab::Install));
-        assert!(!a.confirm_reset_keys);
+        assert!(!a.is_armed(Arm::ResetKeys));
     }
 
     #[test]
@@ -2374,7 +2937,7 @@ mod tests {
         let mut a = app();
         ours(&mut a);
         a.service = Some(ServiceInfo {
-            active: false, active_state: "inactive".into(), enabled: true,
+            active_state: "inactive".into(), enabled: true,
             sub_state: "dead".into(), working_dir: None, env_file: None,
         });
         let _ = a.update(Message::StopSapphire);
@@ -2409,6 +2972,7 @@ mod tests {
     fn stop_reason_is_logged_once_per_stop() {
         let mut a = app();
         ours(&mut a);
+        a.install_path = fake_checkout("stop-reason").to_string_lossy().into_owned();
         let _ = a.update(Message::UpdateClicked);
         assert!(a.sapphire_stopping && matches!(a.after_stop, AfterStop::Update));
         assert_eq!(a.log_lines.iter().filter(|l| l.contains("Stopping Sapphire")).count(), 1);
@@ -2418,17 +2982,17 @@ mod tests {
     #[test]
     fn launch_and_update_wait_for_each_other() {
         let mut a = app();
-        a.updating = true;
+        a.op = Op::Updating;
         let _ = a.update(Message::Launch);
-        assert!(!a.sapphire_running && logged(&a, "Wait for the install/update"));
+        assert!(!a.sapphire_running && logged(&a, "Wait for the update"));
         let before = a.selected_branch;
         let other = if before == Some(Branch::Stable) { Branch::Development } else { Branch::Stable };
         let _ = a.update(Message::BranchSelected(other));
-        assert_eq!(a.selected_branch, before, "no branch switch mid-update");
+        assert_eq!((a.selected_branch, a.pending_branch), (before, None), "no branch switch mid-update");
         let mut b = app();
-        b.installing = true;
+        b.op = Op::Installing;
         let _ = b.update(Message::UpdateClicked);
-        assert!(!b.updating);
+        assert!(!(b.op == Op::Updating));
     }
 
     #[test]
@@ -2444,8 +3008,11 @@ mod tests {
         }
         a.install_path = r.to_string_lossy().into_owned();
         a.selected_branch = Some(Branch::Development);
-        let _ = a.update(Message::SwitchBranchResult("Branch switch failed: no dev".into(), false));
+        a.op = Op::SwitchingBranch;
+        let _ = a.update(Message::SwitchBranchResult(Branch::Development, "error: pathspec 'dev' did not match".into(), false));
         assert_eq!(a.selected_branch, Some(Branch::Stable));
+        assert_eq!(a.op, Op::Idle);
+        assert!(a.branch_note.is_some(), "the failure is on screen, not only in the log");
     }
 
     #[test]
@@ -2460,7 +3027,7 @@ mod tests {
             };
         }
         let _ = a.update(Message::GoClicked);
-        assert!(a.installing);
+        assert!((a.op == Op::Installing));
         let conda = a.steps.iter().find(|(s, _)| *s == Step::Conda).unwrap();
         assert_eq!(conda.1, StepStatus::Installing, "Go retries the failed step first");
     }
@@ -2468,7 +3035,7 @@ mod tests {
     #[test]
     fn service_refresh_respects_a_stop_in_flight() {
         let mut a = app();
-        let up = ServiceInfo { active: true, active_state: "active".into(), enabled: true, sub_state: "running".into(), working_dir: None, env_file: None };
+        let up = ServiceInfo { active_state: "active".into(), enabled: true, sub_state: "running".into(), working_dir: None, env_file: None };
         a.service = Some(up.clone());
         a.sapphire_running = true;
         a.sapphire_stopping = true;
@@ -2499,7 +3066,7 @@ mod tests {
 
     #[test]
     fn a_unit_owns_her_only_while_it_runs_her() {
-        let unit = |state: &str| ServiceInfo { active: state == "active", active_state: state.into(), enabled: true, sub_state: "x".into(), working_dir: None, env_file: None };
+        let unit = |state: &str| ServiceInfo { active_state: state.into(), enabled: true, sub_state: "x".into(), working_dir: None, env_file: None };
         let her = Instance { pid: 9, since: String::new(), origin: Origin::Elsewhere, log: PathBuf::new() };
         // Unit running: a found instance is the unit's own.
         let mut a = app();
