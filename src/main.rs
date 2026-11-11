@@ -14,10 +14,13 @@ mod service;
 mod platform;
 mod install;
 mod troubleshoot;
+mod llm;
+mod llm_tab;
 use crate::platform::*;
 use crate::service::*;
 use crate::install::*;
 use crate::troubleshoot::*;
+use crate::llm_tab::{LlmMsg, LlmUi};
 
 
 // ── Config persistence ─────────────────────────────────────────────────────
@@ -106,6 +109,12 @@ fn main() -> iced::Result {
         std::env::remove_var("WAYLAND_SOCKET");
     }
 
+    // Autostart's `--start-llm`: start the local LLM with the saved settings, no window.
+    if std::env::args().any(|a| a == "--start-llm") {
+        llm::headless_start();
+        return Ok(());
+    }
+
     // Linux: register the app with the desktop (apps menu / dock icon).
     #[cfg(not(windows))]
     install_desktop_entry();
@@ -169,6 +178,9 @@ fn main() -> iced::Result {
                     Message::UpdatesAvailable,
                 ),
                 Task::perform(check_launcher_release(), Message::LauncherReleaseChecked),
+                // The local LLM: what this computer has, and whether it is running.
+                Task::done(Message::Llm(LlmMsg::Poll)),
+                Task::perform(llm::probe(app.llm.cfg.engine.clone()), |h| Message::Llm(LlmMsg::Probed(h))),
                 // Auto-scan install status
                 Task::done(Message::ScanClicked),
             ];
@@ -258,7 +270,7 @@ fn install_desktop_entry() {
 /// reserves inside quotes escaped (and `%` doubled — it introduces field codes). An
 /// AppImage under "~/Apps/My Tools/" stays one argument.
 #[cfg(not(windows))]
-fn desktop_exec(path: &str) -> String {
+pub(crate) fn desktop_exec(path: &str) -> String {
     let mut s = String::from("\"");
     for c in path.chars() {
         match c {
@@ -343,6 +355,8 @@ struct App {
     // Live install output (streamed by run_cmd_streamed, drained on Tick) + step timer.
     install_output: Arc<Mutex<Vec<String>>>,
     step_started: Option<Instant>,
+    // The local LLM (LLM tab).
+    llm: LlmUi,
 }
 
 impl Default for App {
@@ -407,6 +421,7 @@ impl Default for App {
             env_content: text_editor::Content::new(),
             install_output: Arc::new(Mutex::new(Vec::new())),
             step_started: None,
+            llm: LlmUi::new(),
         }
     }
 }
@@ -418,6 +433,7 @@ enum Tab {
     Update,
     Uninstall,
     Troubleshoot,
+    Llm,
     Running,
     Service,
 }
@@ -485,6 +501,7 @@ enum Arm {
     RemoveService,
     Sweep,
     CloseWindow,
+    LlmDelete,
 }
 
 const ARM_MIN: std::time::Duration = std::time::Duration::from_secs(1);
@@ -597,6 +614,8 @@ enum Message {
     EnvSaveRestart,
     #[cfg(not(windows))]
     EnvSaved(bool),
+    // Local LLM
+    Llm(LlmMsg),
 }
 
 // ── Sapphire's web endpoint ────────────────────────────────────────────────
@@ -1264,6 +1283,7 @@ impl App {
                 }
                 Task::none()
             }
+            Message::Llm(m) => self.llm_update(m),
             Message::ToggleLog => {
                 self.log_visible = !self.log_visible;
                 Task::none()
@@ -2011,7 +2031,7 @@ impl App {
     /// While a job runs, or a stop has work queued behind it, `install_path` is that
     /// job's folder. A scan just gives way to the new folder.
     fn path_frozen(&self) -> bool {
-        !matches!(self.op, Op::Idle | Op::Scanning) || self.sapphire_stopping
+        !matches!(self.op, Op::Idle | Op::Scanning) || self.sapphire_stopping || self.llm.job.is_some()
     }
 
     /// The unit, if it runs the folder on screen. A unit running another folder says
@@ -2073,6 +2093,13 @@ impl App {
         }
         if uses_env && let Some(why) = self.env_in_use() {
             return Some(why);
+        }
+        // Its binary and models live in this folder's user/models/llm/.
+        if self.llm.job.is_some() {
+            return Some("Wait for the LLM download to finish (or cancel it on the LLM tab).".to_string());
+        }
+        if self.llm.running().is_some_and(|r| r.exe.starts_with(llm::llm_root(&self.install_path))) {
+            return Some("Stop the LLM first (LLM tab).".to_string());
         }
         if needs_install && !can_delete(&self.install_path) {
             return Some(format!("{} doesn't look like a Sapphire install — not touching it.", self.install_path));
@@ -2291,7 +2318,7 @@ impl App {
 
         // Only tick when something is animating
         let anything_busy = self.op != Op::Idle || self.ts_running || self.checking_updates
-            || self.sapphire_stopping;
+            || self.sapphire_stopping || self.llm.busy();
         if anything_busy {
             subs.push(iced::time::every(std::time::Duration::from_millis(200)).map(|_| Message::Tick));
         }
@@ -2327,6 +2354,14 @@ impl App {
         if !self.holding_child && !self.sapphire_stopping {
             subs.push(iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::InstancePoll));
         }
+
+        // The LLM: its download/install job, and a look at the server — every 2 s
+        // while it matters (tab open, loading, stopping), else every 10 s.
+        if let Some(job) = &self.llm.job {
+            subs.push(Subscription::run_with_id(("llm-job", self.llm.job_epoch), llm::job_stream(job.clone())));
+        }
+        let llm_secs = if self.active_tab == Tab::Llm || self.llm.busy() { 2 } else { 10 };
+        subs.push(iced::time::every(std::time::Duration::from_secs(llm_secs)).map(|_| Message::Llm(LlmMsg::Poll)));
 
         Subscription::batch(subs)
     }

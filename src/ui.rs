@@ -201,6 +201,7 @@ impl App {
             self.tab_button("Update", Tab::Update),
             self.tab_button("Uninstall", Tab::Uninstall),
             self.tab_button("Troubleshoot", Tab::Troubleshoot),
+            self.tab_button("LLM", Tab::Llm),
             self.tab_button(running_label, Tab::Running),
         ]
         .spacing(0);
@@ -264,6 +265,7 @@ impl App {
             Tab::Uninstall => self.view_uninstall_tab(),
             Tab::Troubleshoot => self.view_troubleshoot_tab(),
             Tab::Service => self.view_service_tab(),
+            Tab::Llm => self.view_llm_tab(),
             Tab::Running => unreachable!(),
         };
 
@@ -357,11 +359,28 @@ impl App {
                 ..Font::DEFAULT
             }),
             steps_col,
+            self.view_llm_row(),
             buttons_row,
             text(if has_not_found && she_is_up { "Stop Sapphire before installing." } else { "" }).size(11).color(color!(0xf9e154)),
         ]
         .spacing(8)
         .padding(Padding { top: 0.0, right: 0.0, bottom: 12.0, left: 0.0 })
+        .into()
+    }
+
+    /// The optional LLM step under the install steps: status + a way to the tab.
+    fn view_llm_row(&self) -> Element<'_, Message> {
+        let (status, c) = self.llm_status();
+        let label = if self.llm.cfg.engine_ok() { "LLM tab" } else { "Set up" };
+        let mark = if self.llm.running().is_some() { "+" } else { "-" };
+        row![
+            text(mark).size(16).color(c).width(20),
+            text("Local LLM (optional)").size(15),
+            text(format!("— {}", status)).size(12).color(c),
+            button(text(label).size(12)).on_press(Message::TabSelected(Tab::Llm)).style(button::secondary).padding([2, 10]),
+        ]
+        .spacing(10)
+        .align_y(iced::Alignment::Center)
         .into()
     }
 

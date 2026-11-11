@@ -430,6 +430,43 @@ pub(crate) fn pid_look(pid: u32) -> Option<bool> {
     }
 }
 
+/// The executable `pid` runs, if it is alive and we may look. The identity check for
+/// the local LLM server (its binary is ours, under `user/models/llm/bin/`).
+#[cfg(not(windows))]
+pub(crate) fn pid_exe(pid: u32) -> Option<PathBuf> {
+    if pid <= 1 {
+        return None;
+    }
+    // A zombie or gone pid has no exe link.
+    std::fs::read_link(format!("/proc/{}/exe", pid)).ok()
+}
+
+#[cfg(windows)]
+pub(crate) fn pid_exe(pid: u32) -> Option<PathBuf> {
+    use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    if pid <= 4 {
+        return None;
+    }
+    // SAFETY: as in pid_look — the handle is closed on every path, the buffer length
+    // is passed in and out as the API requires.
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut code = 0u32;
+        let alive = GetExitCodeProcess(h, &mut code) != 0 && code == STILL_ACTIVE as u32;
+        let mut name = [0u16; 1024];
+        let mut len = name.len() as u32;
+        let named = QueryFullProcessImageNameW(h, 0, name.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(h);
+        (alive && named).then(|| PathBuf::from(String::from_utf16_lossy(&name[..len as usize])))
+    }
+}
+
 /// Base config dir, shared with Sapphire. Mirrors core/setup.py::get_config_dir():
 /// Windows %APPDATA%\Sapphire, Linux $XDG_CONFIG_HOME/sapphire or ~/.config/sapphire.
 pub(crate) fn app_config_dir() -> PathBuf {
