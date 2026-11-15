@@ -664,7 +664,7 @@ pub(crate) fn can_delete(path: &str) -> bool {
 /// Rename `p` aside, then delete the renamed copy. The rename is what a locked file
 /// refuses (on Windows), and it refuses before anything is lost. A deletion that fails
 /// halfway leaves only a `.deleting` folder, never a half-eaten install.
-fn delete_by_rename(p: &std::path::Path) -> Result<(), String> {
+pub(crate) fn delete_by_rename(p: &std::path::Path) -> Result<(), String> {
     let name = p.file_name().ok_or_else(|| format!("{} can't be deleted.", p.display()))?;
     let aside = p.with_file_name(format!("{}.deleting-{}", name.to_string_lossy(), now_secs()));
     std::fs::rename(p, &aside).map_err(|e| {

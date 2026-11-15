@@ -14,11 +14,12 @@ impl App {
     pub(crate) fn view(&self) -> Element<'_, Message> {
         column![
             self.view_header(),
-            self.view_notices(),
-            self.view_tab_bar(),
-            self.view_tab_content(),
-            self.view_log_panel(),
         ]
+        .push_maybe(self.llm_bar_shown().then(|| self.view_llm_bar()))
+        .push(self.view_notices())
+        .push(self.view_tab_bar())
+        .push(self.view_tab_content())
+        .push(self.view_log_panel())
         .spacing(0)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -368,22 +369,6 @@ impl App {
         .into()
     }
 
-    /// The optional LLM step under the install steps: status + a way to the tab.
-    fn view_llm_row(&self) -> Element<'_, Message> {
-        let (status, c) = self.llm_status();
-        let label = if self.llm.cfg.engine_ok() { "LLM tab" } else { "Set up" };
-        let mark = if self.llm.running().is_some() { "+" } else { "-" };
-        row![
-            text(mark).size(16).color(c).width(20),
-            text("Local LLM (optional)").size(15),
-            text(format!("— {}", status)).size(12).color(c),
-            button(text(label).size(12)).on_press(Message::TabSelected(Tab::Llm)).style(button::secondary).padding([2, 10]),
-        ]
-        .spacing(10)
-        .align_y(iced::Alignment::Center)
-        .into()
-    }
-
     fn view_update_tab(&self) -> Element<'_, Message> {
         let mut steps_col = Column::new().spacing(6);
 
@@ -554,6 +539,37 @@ impl App {
                 .size(11).color(color!(0x7f849c))
         };
 
+        // The local LLM lives outside her folder, so it has its own line.
+        let llm_root = crate::llm::llm_root();
+        let llm_row = llm_root.exists().then(|| {
+            let armed = self.is_armed(Arm::LlmRemove);
+            let why = if self.llm.running().is_some() {
+                Some("Stop the LLM first (LLM tab).")
+            } else if self.llm.job.is_some() {
+                Some("Wait for the LLM download to finish, or cancel it on the LLM tab.")
+            } else {
+                None
+            };
+            let desc = if armed {
+                text(format!("Click again to permanently delete {}.", llm_root.display())).size(11).color(armed_red)
+            } else if let Some(why) = why {
+                text(why).size(11).color(color!(0xf9e154))
+            } else {
+                let kept = self.llm.cfg.models_dir.as_ref().map(|d| format!(" Models in {} stay.", d.display())).unwrap_or_default();
+                let bytes = crate::llm::dir_bytes(&llm_root) as f64;
+                let size = if bytes >= 1e9 { format!("{:.1} GB", bytes / 1e9) } else { format!("{:.0} MB", bytes / 1e6) };
+                text(format!("Deletes llama.cpp and its downloaded models in {} ({}).{}", llm_root.display(), size, kept))
+                    .size(11).color(color!(0x7f849c))
+            };
+            column![
+                button(text(if armed { "YES, remove the LLM" } else { "Remove local LLM" }).size(13))
+                    .on_press_maybe((!busy && why.is_none()).then_some(Message::Llm(crate::llm_tab::LlmMsg::Remove)))
+                    .style(button::danger)
+                    .padding([4, 12]),
+                desc,
+            ].spacing(2)
+        });
+
         // What none of these touch: say so, and offer the one that would keep firing.
         let config_dir = crate::platform::app_config_dir();
         let stays = text(format!(
@@ -582,7 +598,7 @@ impl App {
             column![remove_env_btn, env_desc].spacing(2),
             column![delete_ud_btn, ud_desc].spacing(2),
             column![delete_folder_btn, folder_desc].spacing(2),
-        ].push_maybe(autostart_row).spacing(8);
+        ].push_maybe(llm_row).push_maybe(autostart_row).spacing(8);
 
         // Divider between sections
         let divider = container(text(""))

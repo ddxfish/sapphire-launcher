@@ -109,10 +109,11 @@ fn main() -> iced::Result {
         std::env::remove_var("WAYLAND_SOCKET");
     }
 
-    // Autostart's `--start-llm`: start the local LLM with the saved settings, no window.
-    if std::env::args().any(|a| a == "--start-llm") {
-        llm::headless_start();
-        return Ok(());
+    // The headless switches (`--start-llm` at sign-in, the download worker, what
+    // Sapphire calls): do the one thing and exit, no window.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(code) = llm::cli(&args, sapphire_is_up) {
+        std::process::exit(code);
     }
 
     // Linux: register the app with the desktop (apps menu / dock icon).
@@ -502,6 +503,7 @@ enum Arm {
     Sweep,
     CloseWindow,
     LlmDelete,
+    LlmRemove,
 }
 
 const ARM_MIN: std::time::Duration = std::time::Duration::from_secs(1);
@@ -710,6 +712,19 @@ async fn install_requirements(path: String, sink: Arc<Mutex<Vec<String>>>, faile
 }
 
 /// A Sapphire checkout whose core predates the instance lock and has none on disk.
+/// Is Sapphire running on the saved install? What the LLM's watcher asks every few
+/// seconds, so it spawns nothing: her lock and handshake files and a pid check. Only
+/// a core with no lock at all (Stable, as of this writing) is asked at her port, and
+/// that is a bare connect.
+fn sapphire_is_up() -> bool {
+    let install = read_install_path(&config_path()).unwrap_or_else(default_install_path);
+    if find_instance(&install).is_some() {
+        return true;
+    }
+    is_lockless_core(&install)
+        && std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], web_port(&install))), std::time::Duration::from_millis(300)).is_ok()
+}
+
 fn is_lockless_core(install: &str) -> bool {
     looks_like_install(install)
         && !PathBuf::from(install).join("core").join("single_instance.py").exists()
@@ -855,7 +870,8 @@ impl App {
 
                 // Service mode: start the systemd unit + follow journalctl instead.
                 if self.unit_here().is_some() {
-                    return self.update(Message::ServiceStart);
+                    let llm = self.llm_start_with_her();
+                    return Task::batch([llm, self.update(Message::ServiceStart)]);
                 }
 
                 let main_py = PathBuf::from(&self.install_path).join("main.py");
@@ -880,7 +896,7 @@ impl App {
                 self.holding_child = true;
                 self.child_epoch += 1;
                 self.launched_at = Some(Instant::now());
-                Task::none()
+                self.llm_start_with_her()
             }
             Message::SapphireStarted(pid) => {
                 // Our detached runner is up and her log file is fresh: follow it.
@@ -2031,7 +2047,7 @@ impl App {
     /// While a job runs, or a stop has work queued behind it, `install_path` is that
     /// job's folder. A scan just gives way to the new folder.
     fn path_frozen(&self) -> bool {
-        !matches!(self.op, Op::Idle | Op::Scanning) || self.sapphire_stopping || self.llm.job.is_some()
+        !matches!(self.op, Op::Idle | Op::Scanning) || self.sapphire_stopping
     }
 
     /// The unit, if it runs the folder on screen. A unit running another folder says
@@ -2082,6 +2098,8 @@ impl App {
         if !self.holding_child && !self.sapphire_stopping && self.attached.is_some() {
             self.attached = None;
             self.sapphire_running = false;
+            // She didn't stop, we only looked away: her LLM stays up.
+            self.llm.for_her = false;
         }
     }
 
@@ -2093,13 +2111,6 @@ impl App {
         }
         if uses_env && let Some(why) = self.env_in_use() {
             return Some(why);
-        }
-        // Its binary and models live in this folder's user/models/llm/.
-        if self.llm.job.is_some() {
-            return Some("Wait for the LLM download to finish (or cancel it on the LLM tab).".to_string());
-        }
-        if self.llm.running().is_some_and(|r| r.exe.starts_with(llm::llm_root(&self.install_path))) {
-            return Some("Stop the LLM first (LLM tab).".to_string());
         }
         if needs_install && !can_delete(&self.install_path) {
             return Some(format!("{} doesn't look like a Sapphire install — not touching it.", self.install_path));
@@ -2355,10 +2366,11 @@ impl App {
             subs.push(iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::InstancePoll));
         }
 
-        // The LLM: its download/install job, and a look at the server — every 2 s
+        // The LLM: its download worker's report (twice a second while one runs), and
+        // a look at the server and at jobs others started — every 2 s
         // while it matters (tab open, loading, stopping), else every 10 s.
-        if let Some(job) = &self.llm.job {
-            subs.push(Subscription::run_with_id(("llm-job", self.llm.job_epoch), llm::job_stream(job.clone())));
+        if self.llm.job.is_some() {
+            subs.push(iced::time::every(std::time::Duration::from_millis(500)).map(|_| Message::Llm(LlmMsg::JobPoll)));
         }
         let llm_secs = if self.active_tab == Tab::Llm || self.llm.busy() { 2 } else { 10 };
         subs.push(iced::time::every(std::time::Duration::from_secs(llm_secs)).map(|_| Message::Llm(LlmMsg::Poll)));
@@ -2528,6 +2540,10 @@ mod tests {
         a.selected_branch = Some(Branch::Stable);
         a.off_branch = None;
         a.update_unfinished = false;
+        // Nor the real LLM settings, nor the real sign-in entry.
+        a.llm.cfg = llm::LlmConfig::default();
+        a.llm.selected = None;
+        a.llm.autostart = false;
         a
     }
     /// She is OURS: started by this launcher, Child held, pid known.
@@ -2955,6 +2971,289 @@ mod tests {
         a.op = Op::Updating;
         let _ = a.update(Message::CloseRequested(window::Id::unique()));
         assert!(a.is_armed(Arm::CloseWindow) && logged(&a, "Close again"));
+    }
+
+    fn llm_spec() -> llm::JobSpec {
+        llm::JobSpec { engine: None, model: Some(llm::ModelSpec { repo: "r/m".into(), file: "m.gguf".into(), quant: None, name: "M".into() }), start: false }
+    }
+    /// A job report as a live worker writes it: this test process stands in for the worker.
+    fn llm_job() -> llm::JobInfo {
+        let pid = std::process::id();
+        llm::JobInfo { exe: pid_exe(pid).unwrap(), label: "M".into(), dest: Some("/x/m.gguf".into()), done: 10, total: 100, ..llm::JobInfo::waiting(pid, llm_spec()) }
+    }
+
+    fn pick(i: usize) -> Message {
+        Message::Llm(LlmMsg::Pick(llm_tab::Pick(Some(i), String::new())))
+    }
+
+    #[test]
+    fn a_pick_downloads_at_once_and_locks_until_it_ends() {
+        let mut a = app();
+        // "None" is the default and does nothing: the feature is off.
+        let _ = a.update(Message::Llm(LlmMsg::Pick(llm_tab::Pick(None, "None".into()))));
+        assert!(a.llm.job.is_none());
+        let _ = a.update(pick(0));
+        let job = a.llm.job.clone().expect("a pick starts the download");
+        assert_eq!(job.spec.model, Some(llm::ModelSpec::curated(&llm::MODELS[0])));
+        assert_eq!(job.spec.engine.as_deref(), Some(llm::LLAMA_PIN), "and brings the engine with it");
+        assert!(!job.spec.start, "the worker only fetches; this window switches it on when it lands");
+        assert!(a.llm.busy() && logged(&a, "Downloading Qwen3.5 4B"));
+        // Locked: another pick, or a second download button, changes nothing.
+        let _ = a.update(pick(2));
+        let _ = a.update(Message::Llm(LlmMsg::Download));
+        assert_eq!(a.llm.job, Some(job));
+        // Nothing here pins her folder or blocks an install.
+        assert!(!a.path_frozen() && a.idle());
+    }
+
+    #[test]
+    fn a_job_is_followed_through_its_report() {
+        let mut a = app();
+        let _ = a.update(pick(0));
+        // No report yet: the worker is still coming up.
+        let _ = a.update(Message::Llm(LlmMsg::JobSeen(None)));
+        assert!(a.llm.job.is_some() && a.llm.launched.is_some());
+        // Cancel clicked that early waits for the worker, then reaches it.
+        let _ = a.update(Message::Llm(LlmMsg::Cancel));
+        assert!(a.llm.cancel_wanted);
+        let live = llm_job();
+        let _ = a.update(Message::Llm(LlmMsg::JobSeen(Some(live.clone()))));
+        assert!(a.llm.launched.is_none() && !a.llm.cancel_wanted);
+        assert_eq!(a.llm.job.as_ref().and_then(|j| j.pct()), Some(10));
+        assert!(a.llm_status().0.contains("Downloading M 10%"), "{}", a.llm_status().0);
+        // It ends: the model is the pick, the lock is off, the bar stays.
+        let done = llm::JobInfo { state: llm::JobState::Done, done: 100, ..live.clone() };
+        let _ = a.update(Message::Llm(LlmMsg::JobSeen(Some(done.clone()))));
+        assert!(a.llm.job.is_none() && !a.llm.busy());
+        assert_eq!(a.llm.selected, done.dest);
+        assert!(logged(&a, "downloaded"));
+        // The same report seen again (the next poll) is old news.
+        let lines = a.log_lines.len();
+        let _ = a.update(Message::Llm(LlmMsg::JobSeen(Some(done))));
+        assert_eq!(a.log_lines.len(), lines);
+        // A failure says why, where every tab can see it.
+        let _ = a.update(pick(0));
+        let _ = a.update(Message::Llm(LlmMsg::JobSeen(Some(llm::JobInfo { state: llm::JobState::Failed, error: "The disk is full.".into(), ..live }))));
+        assert!(a.llm.job.is_none());
+        assert_eq!(a.llm.note, Some(("The disk is full.".to_string(), true)));
+    }
+
+    #[test]
+    fn a_job_started_elsewhere_is_adopted_and_a_dead_one_offers_resume() {
+        let mut a = app();
+        // Another window, the CLI or Sapphire started it: this window just sees it.
+        let live = llm_job();
+        let _ = a.update(Message::Llm(LlmMsg::JobSeen(Some(live.clone()))));
+        assert_eq!(a.llm.job, Some(live.clone()));
+        assert!(a.llm_bar_shown());
+        // Cancel goes to the worker through its flag: nothing is killed from here.
+        let _ = a.update(Message::Llm(LlmMsg::Cancel));
+        assert!(a.llm.job.is_some() && logged(&a, "Cancelling"));
+        let _ = a.update(Message::Llm(LlmMsg::JobSeen(Some(llm::JobInfo { state: llm::JobState::Cancelled, ..live.clone() }))));
+        assert!(a.llm.job.is_none() && logged(&a, "Download cancelled"));
+        // A report that says "running" from a worker that is gone: interrupted.
+        let dead = llm::JobInfo { pid: 0, ..live };
+        let _ = a.update(Message::Llm(LlmMsg::JobSeen(Some(dead.clone()))));
+        assert!(a.llm.job.is_none() && a.llm.stalled == Some(dead.clone()));
+        assert!(a.llm_status().0.contains("interrupted"));
+        // Resume asks a new worker for the same job; Discard forgets it.
+        let _ = a.update(Message::Llm(LlmMsg::Resume));
+        assert!(a.llm.stalled.is_none() && a.llm.job.as_ref().is_some_and(|j| j.spec == dead.spec));
+        a.llm.job = None;
+        a.llm.launched = None;
+        a.llm.stalled = Some(dead);
+        let _ = a.update(Message::Llm(LlmMsg::Cancel));
+        assert!(a.llm.stalled.is_none() && a.llm.job.is_none() && logged(&a, "Deleted the unfinished download"));
+    }
+
+    #[test]
+    fn the_install_dropdown_chooses_the_model_and_none_turns_it_off() {
+        let d = scratch("dropdown");
+        let (four, nine) = (&llm::MODELS[0], &llm::MODELS[2]);
+        std::fs::write(d.join("llama-server"), b"").unwrap();
+        std::fs::write(d.join(four.file), b"").unwrap();
+        let mut a = app();
+        a.llm.cfg.models_dir = Some(d.clone());
+        a.llm.cfg.engine = Some(d.join("llama-server"));
+        // A model already here: the pick switches the LLM on with it, nothing downloads.
+        // It only runs with Sapphire and she is down, so it waits for her.
+        let _ = a.update(pick(0));
+        assert!(a.llm.job.is_none() && a.llm.ready());
+        assert_eq!(a.llm.cfg.model, Some(d.join(four.file)));
+        assert!(logged(&a, "starts when Sapphire does") && !logged(&a, "Starting Qwen3.5 4B"));
+        assert_eq!(a.llm_status().0, "Waiting for Sapphire");
+        assert_eq!(a.llm_sign_in_wanted(), llm::SignIn::Watch, "and the watcher is what runs at sign-in");
+        // She is up: the same pick starts it now.
+        ours(&mut a);
+        let _ = a.update(pick(0));
+        assert!(logged(&a, "Starting Qwen3.5 4B"));
+        // One that isn't here downloads; the engine is not fetched again.
+        let _ = a.update(pick(2));
+        let job = a.llm.job.clone().expect("download");
+        assert!(job.spec.engine.is_none() && !job.spec.start);
+        // It lands while the first one is running: the LLM moves over to it.
+        llm_up(&mut a);
+        std::fs::write(d.join(nine.file), b"").unwrap();
+        let done = llm::JobInfo { state: llm::JobState::Done, dest: Some(d.join(nine.file)), ..llm_job() };
+        let _ = a.update(Message::Llm(LlmMsg::JobSeen(Some(done))));
+        assert_eq!(a.llm.cfg.model, Some(d.join(nine.file)));
+        assert!(a.llm.stopping && a.llm.restart_after_stop, "restarting with the picked model");
+        // None: off. It stops and stays stopped, the files stay, Launch starts nothing.
+        let _ = a.update(Message::Llm(LlmMsg::Pick(llm_tab::Pick(None, "None".into()))));
+        assert!(a.llm.cfg.model.is_none() && a.llm.stopping && !a.llm.ready());
+        assert!(d.join(four.file).exists() && d.join(nine.file).exists());
+        assert_eq!(a.llm_status().0, "Stopping...");
+        let _ = a.update(Message::Llm(LlmMsg::Stopped(true)));
+        assert!(a.llm.starting.is_none() && !logged(&a, "Starting Qwen3.5 9B"), "None cancels the restart");
+        assert_eq!(a.llm_status().0, "Off");
+        assert_eq!(a.llm_sign_in_wanted(), llm::SignIn::Off, "nothing at sign-in while it is off");
+        // A download that is cancelled switches nothing on.
+        std::fs::remove_file(d.join(nine.file)).unwrap();
+        let _ = a.update(pick(2));
+        assert!(a.llm.picked.is_some());
+        let _ = a.update(Message::Llm(LlmMsg::JobSeen(Some(llm::JobInfo { state: llm::JobState::Cancelled, ..llm_job() }))));
+        assert!(a.llm.picked.is_none() && a.llm.job.is_none());
+        a.llm.cfg.model = None;
+        let _ = a.llm_start_with_her();
+        assert!(!logged(&a, "Starting the LLM with Sapphire"));
+    }
+
+    #[test]
+    fn what_runs_at_sign_in_follows_the_two_ticks() {
+        let mut a = app();
+        assert_eq!(a.llm_sign_in_wanted(), llm::SignIn::Off, "no model, nothing");
+        a.llm.cfg.engine = Some("/x/llama-server".into());
+        a.llm.cfg.model = Some("/x/m.gguf".into());
+        assert_eq!(a.llm_sign_in_wanted(), llm::SignIn::Watch, "only with Sapphire: the watcher");
+        // On its own: nothing, unless "Start the LLM when I sign in" is ticked.
+        let _ = a.update(Message::Llm(LlmMsg::WithSapphire(false)));
+        assert_eq!(a.llm_sign_in_wanted(), llm::SignIn::Off);
+        let _ = a.update(Message::Llm(LlmMsg::Autostart(true)));
+        assert_eq!(a.llm_sign_in_wanted(), llm::SignIn::Start);
+        // Back to "only with Sapphire": the watcher again, whatever the other tick says.
+        let _ = a.update(Message::Llm(LlmMsg::WithSapphire(true)));
+        assert_eq!(a.llm_sign_in_wanted(), llm::SignIn::Watch);
+        // On its own and not waiting for anyone: a pick starts it at once.
+        let d = scratch("on-its-own");
+        std::fs::write(d.join("llama-server"), b"").unwrap();
+        std::fs::write(d.join(llm::MODELS[0].file), b"").unwrap();
+        let mut b = app();
+        b.llm.cfg.models_dir = Some(d.clone());
+        b.llm.cfg.engine = Some(d.join("llama-server"));
+        b.llm.cfg.with_sapphire = false;
+        let _ = b.update(pick(0));
+        assert!(logged(&b, "Starting Qwen3.5 4B"));
+    }
+
+    fn llm_up(a: &mut App) {
+        let run = llm::LlmRun { pid: 1, port: 8642, exe: "/x/llama-server".into(), model: "/m/m.gguf".into(), alias: "m".into(), ctx: 16384, gpu: true, lan: false, private: false };
+        let _ = a.update(Message::Llm(LlmMsg::Polled(llm::Seen::Up(run, llm::Health::Ready))));
+    }
+
+    #[test]
+    fn only_run_with_sapphire_takes_the_llm_down_with_her() {
+        // Up alone (she was never seen with it): it stays, however long she is down.
+        let mut a = app();
+        llm_up(&mut a);
+        assert!(!a.llm.for_her && !a.llm.stopping);
+        // Seen up together, then she goes down: her LLM stops too.
+        ours(&mut a);
+        llm_up(&mut a);
+        assert!(a.llm.for_her);
+        a.sapphire_running = false;
+        llm_up(&mut a);
+        assert!(a.llm.stopping && logged(&a, "her LLM stops too"));
+
+        // Looking at another folder is not her going down.
+        let mut b = app();
+        b.sapphire_running = true;
+        b.attached = Some(Instance { pid: 5, since: String::new(), origin: Origin::Launcher, log: PathBuf::new() });
+        llm_up(&mut b);
+        assert!(b.llm.for_her);
+        b.let_go_of_found();
+        llm_up(&mut b);
+        assert!(!b.sapphire_running && !b.llm.stopping);
+
+        // Unticked: Start and Stop are the user's alone.
+        let mut c = app();
+        let _ = c.update(Message::Llm(LlmMsg::WithSapphire(false)));
+        ours(&mut c);
+        llm_up(&mut c);
+        c.sapphire_running = false;
+        llm_up(&mut c);
+        assert!(!c.llm.stopping);
+    }
+
+    #[test]
+    fn launch_brings_her_llm_up_first_when_it_is_set_up() {
+        let d = scratch("with-her");
+        std::fs::write(d.join("llama-server"), b"").unwrap();
+        std::fs::write(d.join("m.gguf"), b"").unwrap();
+        let mut a = app();
+        // Not set up: Launch has nothing to start.
+        let _ = a.llm_start_with_her();
+        assert!(!logged(&a, "Starting the LLM with Sapphire"));
+        a.llm.cfg.engine = Some(d.join("llama-server"));
+        a.llm.cfg.model = Some(d.join("m.gguf"));
+        assert!(a.llm.ready());
+        let _ = a.llm_start_with_her();
+        assert!(logged(&a, "Starting the LLM with Sapphire") && logged(&a, "Starting m.gguf"));
+        // Already up, or unticked: left alone.
+        let mut b = app();
+        b.llm.cfg.engine = Some(d.join("llama-server"));
+        b.llm.cfg.model = Some(d.join("m.gguf"));
+        b.llm.cfg.with_sapphire = false;
+        let _ = b.llm_start_with_her();
+        b.llm.cfg.with_sapphire = true;
+        llm_up(&mut b);
+        let _ = b.llm_start_with_her();
+        assert!(!logged(&b, "Starting the LLM with Sapphire"));
+    }
+
+    #[test]
+    fn the_llm_no_longer_pins_her_folder() {
+        // Its engine and models live in the per-user folder, not in an install.
+        let mut a = app();
+        a.llm.job = Some(llm_job());
+        assert!(!a.path_frozen());
+        assert_eq!(a.uninstall_blocker(false, false), None);
+    }
+
+    #[test]
+    fn remove_llm_arms_refuses_mid_download_and_forgets_the_engine() {
+        let mut a = app();
+        a.llm.autostart = false; // never touch the real sign-in entry
+        let _ = a.update(Message::Llm(LlmMsg::Remove));
+        assert!(a.is_armed(Arm::LlmRemove), "first click only arms");
+        a.llm.job = Some(llm_job());
+        let _ = a.update(Message::Llm(LlmMsg::Remove));
+        assert!(!a.is_armed(Arm::LlmRemove) && logged(&a, "download"));
+        a.llm.job = None;
+        a.llm.cfg.engine = Some("/gone/llama-server".into());
+        a.llm.cfg.tag = "b1".into();
+        a.llm.cfg.model = Some("/gone/m.gguf".into());
+        let _ = a.update(Message::Llm(LlmMsg::Removed(Ok(()))));
+        assert!(a.llm.cfg.engine.is_none() && a.llm.cfg.tag.is_empty() && a.llm.cfg.model.is_none());
+        let _ = a.update(Message::Llm(LlmMsg::Removed(Err("locked".into()))));
+        assert!(logged(&a, "locked"));
+    }
+
+    #[test]
+    fn models_folder_change_drops_a_pick_that_was_never_downloaded() {
+        let mut a = app();
+        let d = scratch("models-dir");
+        a.llm.selected = Some(PathBuf::from("/old/folder/x.gguf"));
+        let _ = a.update(Message::Llm(LlmMsg::ModelsDir(Some(d.clone()))));
+        assert_eq!(llm::gguf_dir(&a.llm.cfg), d);
+        assert!(a.llm.selected.is_none());
+        // Not while a download is writing into the old one.
+        a.llm.job = Some(llm_job());
+        let _ = a.update(Message::Llm(LlmMsg::ModelsDir(None)));
+        assert_eq!(a.llm.cfg.models_dir, Some(d));
+        a.llm.job = None;
+        // The default folder is stored as "no choice".
+        let _ = a.update(Message::Llm(LlmMsg::ModelsDir(Some(llm::llm_root().join("gguf")))));
+        assert_eq!(a.llm.cfg.models_dir, None);
     }
 
     #[test]

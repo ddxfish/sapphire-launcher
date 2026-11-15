@@ -431,7 +431,7 @@ pub(crate) fn pid_look(pid: u32) -> Option<bool> {
 }
 
 /// The executable `pid` runs, if it is alive and we may look. The identity check for
-/// the local LLM server (its binary is ours, under `user/models/llm/bin/`).
+/// the local LLM server (its binary is ours, under the per-user `llm/bin/`).
 #[cfg(not(windows))]
 pub(crate) fn pid_exe(pid: u32) -> Option<PathBuf> {
     if pid <= 1 {
@@ -490,6 +490,54 @@ pub(crate) fn app_config_dir() -> PathBuf {
         PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
             .join(".config").join("sapphire")
     }
+}
+
+/// Per-user data dir, for big files that belong to no one install (the local LLM's
+/// engine and models): Windows %LOCALAPPDATA%\Sapphire (never roaming), Linux
+/// $XDG_DATA_HOME/sapphire or ~/.local/share/sapphire.
+pub(crate) fn app_data_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Ok(local) = std::env::var("LOCALAPPDATA")
+            && !local.is_empty()
+        {
+            return PathBuf::from(local).join("Sapphire");
+        }
+        PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| ".".into()))
+            .join("AppData").join("Local").join("Sapphire")
+    }
+    #[cfg(not(windows))]
+    {
+        if let Ok(xdg) = std::env::var("XDG_DATA_HOME")
+            && !xdg.is_empty()
+        {
+            return PathBuf::from(xdg).join("sapphire");
+        }
+        PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+            .join(".local").join("share").join("sapphire")
+    }
+}
+
+/// Bytes free for this user on the drive holding `dir` (None = couldn't tell).
+#[cfg(unix)]
+pub(crate) fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    // SAFETY: `c` is a valid NUL-terminated path and `st` is a zeroed out-parameter.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // The field widths differ between unixes; on x86-64 Linux both are already u64.
+    #[allow(clippy::unnecessary_cast)]
+    (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
+}
+
+#[cfg(windows)]
+pub(crate) fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut free = 0u64;
+    // SAFETY: `wide` is NUL-terminated; the two unused out-parameters may be null.
+    let ok = unsafe { windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, std::ptr::null_mut(), std::ptr::null_mut()) };
+    (ok != 0).then_some(free)
 }
 
 /// Default Sapphire install location: ~/sapphire (home folder, not root).
@@ -668,6 +716,27 @@ pub(crate) fn kill_process_tree(pid: u32) {
         }
         // Sweep any stray python running the sapphire env (started outside us, no pid known).
         let _ = hidden_cmd("pkill").args(["-TERM", "-f", "envs/sapphire/bin/python"]).output();
+    }
+}
+
+/// Hard-stop one process, but only if its pid still runs a program called `name`
+/// (the curl a dead download worker left behind). Never a group, never pid 0 or 1:
+/// a direct syscall on a positive pid whose program was just checked.
+pub(crate) fn kill_if_named(pid: u32, name: &str) -> bool {
+    let Some(target) = i32::try_from(pid).ok().filter(|p| *p > 1) else { return false };
+    let named = pid_exe(pid).is_some_and(|e| e.file_stem().is_some_and(|s| s.to_string_lossy().eq_ignore_ascii_case(name)));
+    if !named {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let _ = target;
+        hidden_cmd("taskkill").args(["/F", "/PID", &pid.to_string()]).output().is_ok_and(|o| o.status.success())
+    }
+    #[cfg(not(windows))]
+    // SAFETY: plain syscall; `target` is > 1 and was just verified to run `name`.
+    unsafe {
+        libc::kill(target, libc::SIGKILL) == 0
     }
 }
 
@@ -853,6 +922,20 @@ pub(crate) fn find_conda_pip() -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kill_if_named_only_ever_touches_the_named_program() {
+        // This test process is not curl; pid 0 and 1 are never anyone's to end.
+        assert!(!kill_if_named(std::process::id(), "curl"));
+        assert!(!kill_if_named(0, "curl") && !kill_if_named(1, "systemd") && !kill_if_named(u32::MAX, "curl"));
+    }
+
+    #[test]
+    fn data_dir_is_per_user_and_not_the_config_dir() {
+        let d = app_data_dir();
+        assert!(d.ends_with(if cfg!(windows) { "Sapphire" } else { "sapphire" }), "{}", d.display());
+        assert_ne!(d, app_config_dir());
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("sapphire-launcher-test-{}-{}", std::process::id(), name));
