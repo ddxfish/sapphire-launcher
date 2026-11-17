@@ -518,6 +518,42 @@ impl App {
         self.llm_start(true)
     }
 
+    /// One poll during a start that has waited `secs` since the server was spawned.
+    /// The wait is passed in, not read from a clock, so a test can name any wait:
+    /// an `Instant` cannot be set to before boot on Windows.
+    pub(crate) fn llm_start_polled(&mut self, seen: &Seen, secs: u64) {
+        match seen {
+            Seen::Up(run, Health::Ready) => {
+                self.llm.intent = Intent::None;
+                self.llm.note = None; // the status line says it
+                self.llm_log(format!("{} is ready ({} context, {}).", model_label(&run.model), ctx_words(run.ctx), if run.gpu { "graphics card" } else { "processor" }));
+            }
+            Seen::Off if secs >= 3 => {
+                self.llm.intent = Intent::None;
+                let tail = log_tail(4);
+                for l in &tail {
+                    self.llm_log(format!("  {}", l));
+                }
+                match tail.last() {
+                    Some(last) => self.llm_note(format!("The LLM stopped while starting. Last words: {}", last), true),
+                    None if self.llm.cfg.private => self.llm_note("The LLM stopped while starting. Private mode keeps no log: untick it and start again to see why.", true),
+                    None => self.llm_note("The LLM stopped while starting and left no words.", true),
+                }
+            }
+            // Neither may keep "starting" (its spinner, its fast poll) for
+            // the life of the window. Loading answers; only silence counts.
+            Seen::Foreign if secs >= 3 => {
+                self.llm.intent = Intent::None;
+                self.llm_note(format!("The LLM didn't come up: something else is answering on port {}. Pick another port under Advanced.", self.llm.cfg.port), true);
+            }
+            Seen::Up(_, Health::Down) if secs >= 90 => {
+                self.llm.intent = Intent::None;
+                self.llm_note("The LLM is running but hasn't answered in a minute and a half. Stop it and start it again.", true);
+            }
+            _ => {}
+        }
+    }
+
     /// Start the saved model. `for_her`: Launch asked, so it is noted as Sapphire's
     /// and the watcher takes it down if she never comes up.
     fn llm_start(&mut self, for_her: bool) -> Task<Message> {
@@ -638,36 +674,7 @@ impl App {
                     return Task::none();
                 }
                 if let Intent::Starting { since: Some(t) } = self.llm.intent {
-                    match &seen {
-                        Seen::Up(run, Health::Ready) => {
-                            self.llm.intent = Intent::None;
-                            self.llm.note = None; // the status line says it
-                            self.llm_log(format!("{} is ready ({} context, {}).", model_label(&run.model), ctx_words(run.ctx), if run.gpu { "graphics card" } else { "processor" }));
-                        }
-                        Seen::Off if t.elapsed().as_secs() >= 3 => {
-                            self.llm.intent = Intent::None;
-                            let tail = log_tail(4);
-                            for l in &tail {
-                                self.llm_log(format!("  {}", l));
-                            }
-                            match tail.last() {
-                                Some(last) => self.llm_note(format!("The LLM stopped while starting. Last words: {}", last), true),
-                                None if self.llm.cfg.private => self.llm_note("The LLM stopped while starting. Private mode keeps no log: untick it and start again to see why.", true),
-                                None => self.llm_note("The LLM stopped while starting and left no words.", true),
-                            }
-                        }
-                        // Neither may keep "starting" (its spinner, its fast poll) for
-                        // the life of the window. Loading answers; only silence counts.
-                        Seen::Foreign if t.elapsed().as_secs() >= 3 => {
-                            self.llm.intent = Intent::None;
-                            self.llm_note(format!("The LLM didn't come up: something else is answering on port {}. Pick another port under Advanced.", self.llm.cfg.port), true);
-                        }
-                        Seen::Up(_, Health::Down) if t.elapsed().as_secs() >= 90 => {
-                            self.llm.intent = Intent::None;
-                            self.llm_note("The LLM is running but hasn't answered in a minute and a half. Stop it and start it again.", true);
-                        }
-                        _ => {}
-                    }
+                    self.llm_start_polled(&seen, t.elapsed().as_secs());
                 }
                 // "Only run with Sapphire" is the watcher's rule alone (llm::watch_main):
                 // this window only shows what it does.

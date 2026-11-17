@@ -3810,29 +3810,30 @@ mod tests {
 
     #[test]
     fn a_start_that_never_comes_up_stops_being_a_start() {
-        use std::time::{Duration, Instant};
         use llm_tab::Intent;
-        let ago = |secs| Intent::Starting { since: Instant::now().checked_sub(Duration::from_secs(secs)) };
+        // The wait is handed in as a number. Setting a clock back instead fails on a
+        // Windows machine that booted more recently than the wait (a fresh CI runner).
+        let starting = Intent::Starting { since: Some(std::time::Instant::now()) };
         let run = llm::LlmRun { pid: 1, port: 8642, exe: "llama-server".into(), model: "m.gguf".into(), alias: "m".into(), ctx: 16384, gpu: true, lan: false, private: false };
         // Something else answers on the port: say so, and stop spinning.
         let mut a = app();
-        a.llm.intent = ago(1);
+        a.llm.intent = starting;
+        // Through the window's own poll, which reads the clock: nothing has waited yet.
         let _ = a.update(Message::Llm(LlmMsg::Polled(llm::Seen::Foreign)));
+        a.llm_start_polled(&llm::Seen::Foreign, 1);
         assert!(a.llm.intent != Intent::None, "the first seconds are the server's to bind in");
-        a.llm.intent = ago(4);
-        let _ = a.update(Message::Llm(LlmMsg::Polled(llm::Seen::Foreign)));
+        a.llm_start_polled(&llm::Seen::Foreign, 4);
         assert!(a.llm.intent == Intent::None && !a.llm.busy());
         assert!(a.llm.note.as_ref().is_some_and(|(n, problem)| *problem && n.contains("port 8642")));
         // Ours is alive but silent: a model that is loading answers, so this is stuck.
         let mut b = app();
-        b.llm.intent = ago(30);
-        let _ = b.update(Message::Llm(LlmMsg::Polled(llm::Seen::Up(run.clone(), llm::Health::Loading))));
-        let _ = b.update(Message::Llm(LlmMsg::Polled(llm::Seen::Up(run.clone(), llm::Health::Down))));
+        b.llm.intent = starting;
+        b.llm_start_polled(&llm::Seen::Up(run.clone(), llm::Health::Loading), 30);
+        b.llm_start_polled(&llm::Seen::Up(run.clone(), llm::Health::Down), 30);
         assert!(b.llm.intent != Intent::None, "half a minute of silence is still a start");
-        b.llm.intent = ago(600);
-        let _ = b.update(Message::Llm(LlmMsg::Polled(llm::Seen::Up(run.clone(), llm::Health::Loading))));
+        b.llm_start_polled(&llm::Seen::Up(run.clone(), llm::Health::Loading), 600);
         assert!(b.llm.intent != Intent::None, "loading may take as long as it takes");
-        let _ = b.update(Message::Llm(LlmMsg::Polled(llm::Seen::Up(run, llm::Health::Down))));
+        b.llm_start_polled(&llm::Seen::Up(run, llm::Health::Down), 600);
         assert!(b.llm.intent == Intent::None && b.llm.note.as_ref().is_some_and(|(_, problem)| *problem));
     }
 
