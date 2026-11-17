@@ -18,7 +18,6 @@ pub(crate) enum Step {
     #[cfg(windows)]
     VcRedist,
     Deps,
-    Done,
 }
 
 pub(crate) const ALL_STEPS: &[Step] = &[
@@ -30,7 +29,6 @@ pub(crate) const ALL_STEPS: &[Step] = &[
     #[cfg(windows)]
     Step::VcRedist,
     Step::Deps,
-    Step::Done,
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1277,7 +1275,6 @@ pub(crate) fn step_label(step: Step) -> &'static str {
         #[cfg(windows)]
         Step::VcRedist => "Check Visual C++ runtime",
         Step::Deps => "Install dependencies",
-        Step::Done => "Done!",
     }
 }
 

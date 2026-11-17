@@ -32,10 +32,14 @@ impl App {
         let placeholder = if cfg!(windows) { "C:\\Users\\You\\Sapphire" } else { "/home/you/sapphire" };
         // Read-only while a job is working on this folder.
         let frozen = self.path_frozen();
-        let mut path_input = text_input(placeholder, &self.install_path).width(Length::FillPortion(3));
+        // A size under the buttons' so an everyday path (C:\Users\a-long-name\Sapphire)
+        // shows whole, and every pixel the header has spare goes to it.
+        let mut path_input = text_input(placeholder, &self.install_path).size(14).width(Length::Fill);
         if !frozen {
             path_input = path_input.on_input(Message::PathChanged);
         }
+        // A path longer than the field stops at its edge (see clip.rs).
+        let path_input = crate::clip::clip(path_input);
 
         let browse_btn = button("Browse").on_press_maybe((!frozen).then_some(Message::BrowsePath));
 
@@ -56,7 +60,6 @@ impl App {
             path_input,
             browse_btn,
             path_hint,
-            horizontal_space(),
             branch_picker,
         ]
         .spacing(8)
@@ -320,10 +323,7 @@ impl App {
         }
 
         // Action buttons. A failed step counts as work to do: Go retries it.
-        let has_not_found = self
-            .steps
-            .iter()
-            .any(|(s, st)| *s != Step::Done && matches!(st, StepStatus::NotFound(_) | StepStatus::Failed(_)));
+        let has_not_found = self.steps.iter().any(|(_, st)| matches!(st, StepStatus::NotFound(_) | StepStatus::Failed(_)));
         let any_failed = self.steps.iter().any(|(_, st)| matches!(st, StepStatus::Failed(_)));
 
         let all_not_started = self.steps.iter().all(|(_, st)| *st == StepStatus::NotStarted);
@@ -355,6 +355,35 @@ impl App {
             buttons_row = buttons_row.push(go_btn);
         }
 
+        // Every step in place: the button is the "done" mark. The header's Launch
+        // gives way to Open Browser and Stop while she runs, so this one steps aside.
+        let ready = self.install_ready();
+        if ready && !she_is_up {
+            let launch_btn = button(text("Ready — Launch").font(Font {
+                weight: iced::font::Weight::Bold,
+                ..Font::DEFAULT
+            }))
+            .on_press_maybe(self.idle().then_some(Message::Launch))
+            .style(button::success);
+            buttons_row = buttons_row.push(launch_btn);
+        }
+
+        // One line under the buttons, only when there is something to say: an
+        // empty one still costs its height, and this tab has none to spare.
+        let green = color!(0x4caf50);
+        let installed_now = self.steps.iter().any(|(_, st)| matches!(st, StepStatus::Done(_)));
+        let (words, words_color) = if has_not_found && she_is_up {
+            ("Stop Sapphire before installing.", color!(0xf9e154))
+        } else if ready && she_is_up {
+            ("Sapphire is installed and running.", green)
+        } else if ready && installed_now && cfg!(windows) {
+            ("Sapphire is installed. This app is in your Start menu now, and the Autostart tab can start her with Windows.", green)
+        } else if ready && installed_now {
+            ("Sapphire is installed. The Autostart tab can start her when you sign in.", green)
+        } else {
+            ("", green)
+        };
+
         column![
             text("Install Sapphire").size(18).font(Font {
                 weight: iced::font::Weight::Bold,
@@ -363,10 +392,10 @@ impl App {
             steps_col,
             self.view_llm_row(),
             buttons_row,
-            text(if has_not_found && she_is_up { "Stop Sapphire before installing." } else { "" }).size(11).color(color!(0xf9e154)),
         ]
+        .push_maybe((!words.is_empty()).then(|| text(words).size(11).color(words_color)))
         .spacing(8)
-        .padding(Padding { top: 0.0, right: 0.0, bottom: 12.0, left: 0.0 })
+        .padding(Padding { top: 0.0, right: 0.0, bottom: 4.0, left: 0.0 })
         .into()
     }
 

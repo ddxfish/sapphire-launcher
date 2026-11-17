@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 mod ui;
+mod clip;
 mod service;
 mod platform;
 mod install;
@@ -165,7 +166,10 @@ fn main() -> iced::Result {
     let icon = load_window_icon();
 
     let win_settings = window::Settings {
-        size: iced::Size::new(800.0, 550.0),
+        // Tall enough for the Install tab on Windows (one step more than Linux) with
+        // the LLM bar and the log open, and no scroll bar. With its title bar it still
+        // fits a 1080p screen at 150% scaling (about 670 usable) and a 768p one at 100%.
+        size: iced::Size::new(800.0, 620.0),
         icon,
         exit_on_close_request: false,
         // Linux only: app_id must match the .desktop StartupWMClass so the
@@ -1540,11 +1544,6 @@ impl App {
                 for (_, status) in &mut self.steps {
                     *status = StepStatus::Checking;
                 }
-                // Done step stays NotStarted during scan
-                if let Some((_, status)) = self.steps.iter_mut().find(|(s, _)| *s == Step::Done) {
-                    *status = StepStatus::NotStarted;
-                }
-
                 let path = self.install_path.clone();
 
                 // Fire off all checks in parallel
@@ -1592,11 +1591,8 @@ impl App {
                     *s = status;
                 }
 
-                // Check if scan is complete (no more Checking steps, ignoring Done)
-                let still_checking = self
-                    .steps
-                    .iter()
-                    .any(|(s, st)| *s != Step::Done && *st == StepStatus::Checking);
+                // The scan is complete once no step is still being checked.
+                let still_checking = self.steps.iter().any(|(_, st)| *st == StepStatus::Checking);
 
                 if !still_checking {
                     if self.op == Op::Scanning {
@@ -1604,17 +1600,7 @@ impl App {
                     }
                     self.log_lines.push("Scan complete.".to_string());
 
-                    // If everything is Found, mark Done as green
-                    let all_found = self
-                        .steps
-                        .iter()
-                        .filter(|(s, _)| *s != Step::Done)
-                        .all(|(_, st)| matches!(st, StepStatus::Found(_)));
-
-                    if all_found {
-                        if let Some((_, s)) = self.steps.iter_mut().find(|(s, _)| *s == Step::Done) {
-                            *s = StepStatus::Done("Sapphire looks ready! Hit Launch.".to_string());
-                        }
+                    if self.install_ready() {
                         self.log_lines
                             .push("Everything looks good! Sapphire is ready to launch.".to_string());
                     }
@@ -2557,26 +2543,25 @@ impl App {
         }
     }
 
+    /// Every install step is in place: found by a scan, or put there by Go. Nothing
+    /// stores this; the Install tab's Launch button and its line are read from it.
+    pub(crate) fn install_ready(&self) -> bool {
+        self.steps.iter().all(|(_, st)| matches!(st, StepStatus::Found(_) | StepStatus::Done(_)))
+    }
+
     fn kick_next_install(&mut self) -> Task<Message> {
         // The first step still needing work — a failed one is retried, not skipped
         // (the steps after it depend on it).
         let next = self
             .steps
             .iter()
-            .find(|(s, st)| *s != Step::Done && matches!(st, StepStatus::NotFound(_) | StepStatus::Failed(_)))
+            .find(|(_, st)| matches!(st, StepStatus::NotFound(_) | StepStatus::Failed(_)))
             .map(|(s, _)| *s);
 
         let Some(step) = next else {
             // Nothing left to install — we're done!
             self.op = Op::Idle;
             self.step_started = None;
-            if let Some((_, s)) = self.steps.iter_mut().find(|(s, _)| *s == Step::Done) {
-                *s = StepStatus::Done(if cfg!(windows) {
-                    "Sapphire is ready! Hit Launch. This app is in your Start menu now, and the Autostart tab can start her with Windows."
-                } else {
-                    "Sapphire is ready! Hit Launch. The Autostart tab can start her when you sign in."
-                }.to_string());
-            }
             self.log_lines.push("All done! Sapphire is installed and ready.".to_string());
             return Task::none();
         };
@@ -2617,7 +2602,6 @@ impl App {
             Step::Deps => Task::perform(install_deps(path, self.install_output.clone()), |(s, st, log)| {
                 Message::InstallStepResult(s, st, log)
             }),
-            Step::Done => unreachable!(),
         }
     }
 
@@ -3359,12 +3343,12 @@ mod tests {
         let d = scratch("not-empty");
         std::fs::write(d.join("taxes.txt"), "mine").unwrap();
         a.install_path = d.to_string_lossy().into_owned();
-        for (s, st) in &mut a.steps {
-            if *s != Step::Done { *st = StepStatus::NotFound("needed".into()); }
+        for (_, st) in &mut a.steps {
+            *st = StepStatus::NotFound("needed".into());
         }
         let _ = a.update(Message::GoClicked);
         assert_eq!(a.op, Op::Idle);
-        assert!(a.steps.iter().all(|(s, st)| *s == Step::Done || matches!(st, StepStatus::NotFound(_))), "Git wasn't started");
+        assert!(a.steps.iter().all(|(_, st)| matches!(st, StepStatus::NotFound(_))), "Git wasn't started");
         assert!(logged(&a, "already has other files"));
     }
 
@@ -4015,13 +3999,28 @@ mod tests {
     }
 
     #[test]
+    fn ready_is_read_from_the_steps_and_never_stored() {
+        let mut a = app();
+        assert!(!a.install_ready(), "nothing has been scanned yet");
+        for (_, st) in &mut a.steps {
+            *st = StepStatus::Found("ok".into());
+        }
+        assert!(a.install_ready());
+        a.steps[1].1 = StepStatus::Done("installed".into());
+        assert!(a.install_ready(), "a step Go just installed counts too");
+        a.steps[2].1 = StepStatus::Failed("no".into());
+        assert!(!a.install_ready());
+        a.steps[2].1 = StepStatus::Checking;
+        assert!(!a.install_ready(), "a re-scan in flight is not ready");
+    }
+
+    #[test]
     fn a_failed_step_is_retried_not_skipped() {
         let mut a = app();
         for (step, st) in &mut a.steps {
             *st = match step {
                 Step::Git => StepStatus::Found("ok".into()),
                 Step::Conda => StepStatus::Failed("winget died".into()),
-                Step::Done => StepStatus::NotStarted,
                 _ => StepStatus::NotFound("todo".into()),
             };
         }

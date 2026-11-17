@@ -14,6 +14,10 @@ What it never does
 The second part is optional and asks first: it starts the local LLM, checks it, and
 stops it again. It is skipped by itself when Sapphire or the LLM is already running.
 
+The report is saved as soon as those automatic checks end. The last part is optional
+too: a short walk through the launcher where you do one thing at a time and say what
+you saw. Closing the window during it loses nothing that was already saved.
+
 How to run
   Double-click test-on-windows.bat (next to this file), or in PowerShell:
       powershell -ExecutionPolicy Bypass -File .\test-on-windows.ps1
@@ -21,7 +25,7 @@ How to run
       -Exe <path>     the launcher to test (default: sapphire-launcher.exe next to this file)
       -Active         run the LLM start/stop part without asking
       -ReadOnly       never run the LLM start/stop part
-      -NoQuestions    skip the questions at the end
+      -NoQuestions    skip the hands-on walk at the end
 #>
 param(
     [string]$Exe = "",
@@ -31,7 +35,7 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
-$ScriptVersion = '1'
+$ScriptVersion = '2'
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Lines = New-Object System.Collections.Generic.List[string]
 $Counts = @{ PASS = 0; FAIL = 0; INFO = 0; SKIP = 0 }
@@ -172,6 +176,21 @@ function Health-Code([int]$port) {
 function Ask-YesNo([string]$question) {
     $answer = Read-Host ($question + ' [y/N]')
     return ($answer -match '^(y|yes)$')
+}
+
+# Writes what there is so far, next to this script or on the Desktop, and puts it on
+# the clipboard. Called more than once: a window closed half way keeps the last save.
+function Save-Report {
+    $text = $Lines.ToArray()
+    $path = Join-Path $Here 'sapphire-launcher-test-report.txt'
+    try {
+        Set-Content -Path $path -Value $text -Encoding UTF8 -ErrorAction Stop
+    } catch {
+        $path = Join-Path ([Environment]::GetFolderPath('Desktop')) 'sapphire-launcher-test-report.txt'
+        try { Set-Content -Path $path -Value $text -Encoding UTF8 -ErrorAction Stop } catch { $path = '' }
+    }
+    try { Set-Clipboard -Value ($text -join "`r`n") } catch { }
+    return $path
 }
 
 # ---- find the launcher ----------------------------------------------------------
@@ -518,45 +537,79 @@ if ($reason) {
     }
 }
 
-# ---- 4. what only a person can see ----------------------------------------------
-
-if (-not $NoQuestions) {
-    Section 'What you saw yourself'
-    Write-Host 'Answer y if it worked, n if it did not, or just press Enter if you did not try it.'
-    $questions = @(
-        'Picking a model on the Install tab downloaded it and showed a percent bar',
-        'Closing the launcher during a download and opening it again showed the download still going or finished',
-        'Launch started Sapphire, and Open Browser said "Starting..." until she was ready',
-        'Stop in the launcher stopped Sapphire, and the launcher itself stayed open',
-        'With "Only run with Sapphire" ticked, the LLM came up with her and went away with her',
-        'Sapphire started by hand in a terminal, then Stop in the launcher: she stopped and the launcher stayed open',
-        '"Sapphire Launcher" is in the Start menu and opens the launcher',
-        'Every Windows permission prompt was announced by the launcher before it appeared',
-        'No black console window flashed up at any point'
-    )
-    foreach ($q in $questions) {
-        $answer = Read-Host ('  ' + $q + ' [y/n/Enter]')
-        $mark = 'not tried'
-        if ($answer -match '^(y|yes)$') { $mark = 'yes' } elseif ($answer -match '^(n|no)$') { $mark = 'NO' }
-        $Lines.Add('[' + $mark + '] ' + $q)
-    }
-    $note = Read-Host '  Anything odd? One line, or Enter to skip'
-    if ($note) { $Lines.Add('Note: ' + (Redact $note)) }
-}
-
-# ---- the report -----------------------------------------------------------------
+# ---- the automatic part ends here: save it before asking a person anything -------
 
 Say ''
 Say ('Summary: ' + $Counts.PASS + ' passed, ' + $Counts.FAIL + ' failed, ' + $Counts.SKIP + ' skipped, ' + $Counts.INFO + ' notes.')
+$reportPath = Save-Report
+Write-Host ''
+Write-Host 'The automatic checks are done and the report is already saved:'
+Write-Host ('  ' + $reportPath)
 
-$reportPath = Join-Path $Here 'sapphire-launcher-test-report.txt'
-try {
-    Set-Content -Path $reportPath -Value $Lines -Encoding UTF8 -ErrorAction Stop
-} catch {
-    $reportPath = Join-Path ([Environment]::GetFolderPath('Desktop')) 'sapphire-launcher-test-report.txt'
-    Set-Content -Path $reportPath -Value $Lines -Encoding UTF8
+# ---- 4. what only a person can see ----------------------------------------------
+
+# One thing to do, then one question about it. Nothing here was watched by the
+# checks above, so nobody is asked to remember what they could not have seen.
+# Each entry: what to do, the question, and the answer that means it worked.
+if (-not $NoQuestions) {
+    Write-Host ''
+    Write-Host 'One optional part is left: a short walk through the launcher, about five minutes.'
+    Write-Host 'This window tells you one thing to do, you do it, then you say what you saw.'
+    if (Ask-YesNo 'Do the hands-on walk now?') {
+        Section 'Hands-on walk'
+        Write-Host 'Keep this window where you can see it, next to the launcher.'
+        Write-Host 'Take your time: nothing here is timed. Do the step first, then answer.'
+        Write-Host 'y = yes, n = no, Enter = skip (it does not apply to you, or you did not try it).'
+        $steps = @(
+            @('Close the launcher if it is open. Press the Windows key, type "Sapphire Launcher" and open it from the Start menu.',
+              'Did the launcher open from the Start menu?', 'y'),
+            @('In the launcher, click the green Launch button. Wait until the button next to Stop reads "Open Browser".',
+              'Did Sapphire start, with that button reading "Starting..." until she was ready?', 'y'),
+            @('Only if you use the local LLM with "Only run with Sapphire" ticked: look at the LLM line under the top bar.',
+              'Did the LLM come up together with Sapphire?', 'y'),
+            @('Click Stop in the launcher and wait until the button is Launch again.',
+              'Did Sapphire stop, with the launcher window still open?', 'y'),
+            @('Only if you use the local LLM with "Only run with Sapphire" ticked: wait half a minute and look at the LLM line again.',
+              'Did the LLM stop by itself after Sapphire stopped?', 'y'),
+            @('Think back over the steps you just did.',
+              'Did a black console window flash up at any point?', 'n'),
+            @('Think back to when you installed Sapphire with this launcher. Skip this if you do not remember.',
+              'Did the launcher tell you about each Windows permission prompt before it appeared?', 'y'),
+            @('Only if you have the time and disk space (this downloads a few GB): on the Install tab pick a model you do not have yet. While it downloads, close the launcher and open it again.',
+              'Did it show a percent while downloading, and was the download still going or finished when you came back?', 'y')
+        )
+        $hands = @{ ok = 0; PROBLEM = 0; skipped = 0 }
+        $number = 0
+        foreach ($step in $steps) {
+            $number = $number + 1
+            Write-Host ''
+            Write-Host ('Step ' + $number + ' of ' + $steps.Count)
+            Write-Host ('  Do this:  ' + $step[0])
+            $answer = ([string](Read-Host ('  ' + $step[1] + ' [y/n/Enter]'))).Trim().ToLower()
+            if ($answer -eq 'yes') { $answer = 'y' }
+            if ($answer -eq 'no') { $answer = 'n' }
+            $mark = 'skipped'
+            if ($answer -eq 'y' -or $answer -eq 'n') {
+                if ($answer -eq $step[2]) { $mark = 'ok' } else { $mark = 'PROBLEM' }
+            }
+            $hands[$mark] = $hands[$mark] + 1
+            $line = '[' + $mark + '] ' + $step[1]
+            if ($mark -ne 'skipped') { $line = $line + ' - answered ' + $answer }
+            $Lines.Add($line)
+            # Saved after every answer: closing the window keeps what was said so far.
+            $null = Save-Report
+        }
+        Write-Host ''
+        $note = Read-Host 'Anything odd you want to add? One line, or Enter to skip'
+        if ($note) { $Lines.Add('Note: ' + (Redact $note)) }
+        Say ('Hands-on: ' + $hands.ok + ' ok, ' + $hands.PROBLEM + ' problems, ' + $hands.skipped + ' skipped.')
+    } else {
+        $Lines.Add('')
+        $Lines.Add('Hands-on walk: not done.')
+    }
+    $reportPath = Save-Report
 }
-try { Set-Clipboard -Value ($Lines -join "`r`n") } catch { }
+
 Write-Host ''
 Write-Host ('The report is saved here: ' + $reportPath)
 Write-Host 'It is also on your clipboard. Read it over, then paste it where the testers report.'

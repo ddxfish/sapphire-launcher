@@ -9,7 +9,8 @@ license = "AGPL-3.0-only"
 # no GPU-driver dependency. Plenty for a static launcher UI, and it makes the Linux
 # AppImage portable (no Vulkan/GL libs to bundle/match). Re-add the non-wgpu defaults
 # (tiny-skia, fira-sans bundled font, auto-detect-theme) since default-features=false.
-iced = { version = "0.13", default-features = false, features = ["tiny-skia", "fira-sans", "auto-detect-theme", "image", "tokio"] }
+# "advanced" pulls in no crate: it only opens the Widget trait, for src/clip.rs.
+iced = { version = "0.13", default-features = false, features = ["tiny-skia", "fira-sans", "auto-detect-theme", "image", "tokio", "advanced"] }
 image = "0.24"
 tokio = { version = "1", features = ["rt", "process", "sync", "io-util", "macros", "fs"] }
 tokio-stream = "0.1"

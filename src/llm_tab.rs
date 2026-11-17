@@ -1282,9 +1282,11 @@ impl App {
             } else {
                 let hint = match &l.hw {
                     None => "Looking at this computer...",
-                    Some(_) if !self.llm_picks().iter().any(|p| p.0.is_some()) => "This computer doesn't have the memory for a local LLM.",
-                    Some(hw) if hw.vram_mib == 0 => "Picking one downloads it and switches it on. No NVIDIA card seen: replies may be slow.",
-                    Some(_) => "Picking one downloads it and switches it on. Runs on this computer, no key needed.",
+                    Some(_) if !self.llm_picks().iter().any(|p| p.0.is_some()) => "Not enough memory here for one.",
+                    // Short on purpose: these share the row with the dropdown, and a
+                    // second or third line of words makes the whole tab taller.
+                    Some(hw) if hw.vram_mib == 0 => "Pick one to install it. No NVIDIA card: slow.",
+                    Some(_) => "Pick one to install and start it.",
                 };
                 text(hint).size(11).color(MUTED).width(Length::Fill)
             });
@@ -1466,11 +1468,19 @@ impl App {
         col = col.push(
             row![
                 text("Your own model").size(13).width(110),
-                text_input("user/model-GGUF  or  user/model-GGUF:Q5_K_M  or  a .gguf file path", &l.byo_text)
-                    .on_input(|s| Message::Llm(LlmMsg::ByoText(s)))
-                    .on_submit(Message::Llm(LlmMsg::ByoFind))
-                    .size(13),
+                // Clipped: a pasted file path is often longer than the field.
+                crate::clip::clip(
+                    text_input("Hugging Face: user/model-GGUF  (or user/model-GGUF:Q5_K_M, or a .gguf file path)", &l.byo_text)
+                        .on_input(|s| Message::Llm(LlmMsg::ByoText(s)))
+                        .on_submit(Message::Llm(LlmMsg::ByoFind))
+                        .size(13),
+                ),
                 button(text("Find").size(12)).on_press(Message::Llm(LlmMsg::ByoFind)).style(button::secondary).padding([3, 12]),
+                help(
+                    "Paste a model's Hugging Face page or its user/name and press Enter. Find picks the Q4_K_M \
+                     file (add :Q5_K_M to the name for another size) and Download fetches it. It then shows in \
+                     the list below as Your model. A .gguf file already on this computer works too: paste its path.",
+                ),
             ]
             .spacing(8)
             .align_y(iced::Alignment::Center),

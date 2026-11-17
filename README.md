@@ -82,7 +82,7 @@ gh release create v0.9.9 dist/* --title "Sapphire Launcher v0.9.9" --generate-no
 
 Add a file built elsewhere later with `gh release upload <tag> <file>`. A build that changed after its alpha gets a new number: the check only announces a version newer than the one running.
 
-Testing a build on Windows: put `test-on-windows.bat` and `test-on-windows.ps1` next to `sapphire-launcher.exe` and double-click the `.bat`. It checks the PC and the launcher's headless switches, offers (and asks first) to start and stop the local LLM, and writes `sapphire-launcher-test-report.txt` with no user name, PC name, key or chat in it, ready to paste where testers report. It sends nothing anywhere and changes no setting. Attach both files to an alpha release.
+Testing a build on Windows: put `test-on-windows.bat` and `test-on-windows.ps1` next to `sapphire-launcher.exe` and double-click the `.bat`. It checks the PC and the launcher's headless switches, offers (and asks first) to start and stop the local LLM, then offers a short hands-on walk through the launcher, and writes `sapphire-launcher-test-report.txt` with no user name, PC name, key or chat in it, ready to paste where testers report. It sends nothing anywhere and changes no setting. Attach both files to an alpha release.
 
 CI (`.github/workflows/ci.yml`) runs clippy with warnings-as-errors and the tests on Linux and Windows for every push, and keeps the Windows release exe as a build artifact. The launcher checks the GitHub releases of this repo on start and shows a badge when a newer full release exists (pre-releases and drafts are never announced).
 
