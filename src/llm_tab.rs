@@ -914,6 +914,10 @@ impl App {
                         self.llm_note("That's a vision add-on, not a model. Pick the main .gguf file next to it.", true);
                         return Task::none();
                     }
+                    if !is_gguf(&local) {
+                        self.llm_note("That file doesn't start the way a GGUF model does: it may be damaged or only partly copied.", true);
+                        return Task::none();
+                    }
                     // Remembered; a name from the list (LM Studio's copy, say) takes that row.
                     if !self.llm.cfg.files.contains(&local) {
                         self.llm_set_cfg(|c| c.files.push(local.clone()));
@@ -1134,6 +1138,12 @@ impl App {
             "Starting the download...".into()
         } else if j.label.starts_with("Unpacking") || j.label == "Starting" {
             format!("{}...", j.label)
+        } else if j.label.starts_with("Checking") {
+            // The download is in; it is being read back against its checksum.
+            match j.pct() {
+                Some(pct) => format!("{} {}%", j.label, pct),
+                None => format!("{}...", j.label),
+            }
         } else {
             match j.pct() {
                 Some(pct) => format!("{} {} {}%{}", verb, j.label, pct, speed),
@@ -1407,7 +1417,8 @@ impl App {
                 r = r.push(text("default").size(11).color(color!(0xcba6f7)));
             }
             if let Some(pct) = self.llm_row_pct(&path) {
-                r = r.push(text(format!("downloading {}%", pct)).size(11).color(BLUE));
+                let doing = if l.job().is_some_and(|j| j.label.starts_with("Checking")) { "checking" } else { "downloading" };
+                r = r.push(text(format!("{} {}%", doing, pct)).size(11).color(BLUE));
             } else if on_disk {
                 r = r.push(text("downloaded").size(11).color(GREEN));
             }

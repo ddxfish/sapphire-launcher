@@ -809,12 +809,33 @@ pub(crate) fn pick_gguf(files: &[(String, u64)], quant: Option<&str>) -> Result<
 
 /// A repo's files with sizes.
 pub(crate) async fn hf_files(repo: String) -> Result<Vec<(String, u64)>, String> {
-    hf_repo(repo).await.map(|(files, _)| files)
+    hf_repo(repo).await.map(|l| l.files)
 }
 
-/// A repo's files with sizes, and the revision that listing is of ("main" when the
-/// site doesn't say).
-async fn hf_repo(repo: String) -> Result<(Vec<(String, u64)>, String), String> {
+/// One look at a repo: its files with sizes, the revision that look is of ("main"
+/// when the site doesn't say), and the SHA-256 the site gives for its big files
+/// (not every file has one, and a mirror may give none).
+struct Listing {
+    files: Vec<(String, u64)>,
+    rev: String,
+    sha256: Vec<(String, String)>,
+}
+
+/// The checksums in a repo listing: (file, 64 lowercase hex digits). Anything that
+/// isn't exactly that is left out, so a listing without them checks nothing.
+fn listing_sha256(v: &serde_json::Value) -> Vec<(String, String)> {
+    let Some(files) = v.get("siblings").and_then(|s| s.as_array()) else { return Vec::new() };
+    files
+        .iter()
+        .filter_map(|x| {
+            let name = x.get("rfilename")?.as_str()?;
+            let sum = x.get("lfs")?.get("sha256")?.as_str()?.to_lowercase();
+            (sum.len() == 64 && sum.chars().all(|c| c.is_ascii_hexdigit())).then(|| (name.to_string(), sum))
+        })
+        .collect()
+}
+
+async fn hf_repo(repo: String) -> Result<Listing, String> {
     let url = match fixtures() {
         Some(f) => format!("{}/hf/{}/api.json", f, repo),
         None => format!("https://huggingface.co/api/models/{}?blobs=true", repo),
@@ -832,7 +853,7 @@ async fn hf_repo(repo: String) -> Result<(Vec<(String, u64)>, String), String> {
         })
         .unwrap_or_default();
     let rev = v.get("sha").and_then(|s| s.as_str()).filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric())).unwrap_or("main").to_string();
-    Ok((files, rev))
+    Ok(Listing { files, rev, sha256: listing_sha256(&v) })
 }
 
 /// Where a file is fetched from, at one fixed revision of its repo. "main" moves:
@@ -1286,7 +1307,7 @@ pub(crate) fn part_of(dest: &Path) -> PathBuf {
 
 /// Fetch the model into `dir`, returning its path. A file already there is kept.
 async fn download_model(m: &ModelSpec, dir: &Path, rep: &mut Reporter) -> Result<PathBuf, String> {
-    let (files, rev) = hf_repo(m.repo.clone()).await?;
+    let Listing { files, rev, sha256 } = hf_repo(m.repo.clone()).await?;
     let (file, size) = if m.file.is_empty() {
         pick_gguf(&files, m.quant.as_deref())?
     } else {
@@ -1297,11 +1318,48 @@ async fn download_model(m: &ModelSpec, dir: &Path, rep: &mut Reporter) -> Result
     let name = if m.name.is_empty() { file.clone() } else { m.name.clone() };
     rep.info.dest = Some(dest.clone());
     if !dest.exists() {
-        download(&hf_url(&m.repo, &rev, &file), &dest, size, &name, rep).await.map_err(|e| {
+        let sum = sha256.iter().find(|(n, _)| *n == file).map(|(_, sum)| sum.as_str());
+        download(&hf_url(&m.repo, &rev, &file), &dest, size, sum, &name, rep).await.map_err(|e| {
             if e.starts_with("Not enough room") { format!("{} Models can live on another drive: LLM tab, Advanced, Models folder.", e) } else { e }
         })?;
+        // The site gave no checksum (or this is a mirror): at least it is a model.
+        if !is_gguf(&dest) {
+            let _ = std::fs::remove_file(&dest);
+            return Err(format!("What came down for {} isn't a model file, so it was thrown away. Try again.", name));
+        }
     }
     Ok(dest)
+}
+
+/// A model file starts with the four letters GGUF. One that doesn't is damaged, cut
+/// short at nothing, or some other kind of file under a model's name.
+pub(crate) fn is_gguf(path: &Path) -> bool {
+    use std::io::Read;
+    let mut head = [0u8; 4];
+    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok() && &head == b"GGUF"
+}
+
+/// SHA-256 of a file, as lowercase hex. `tick` is told how far it is after every
+/// piece and may end it early (None) by answering false.
+fn sha256_file(path: &Path, mut tick: impl FnMut(u64) -> bool) -> std::io::Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut hash = Sha256::new();
+    let mut buf = vec![0u8; 4 << 20];
+    let mut done = 0u64;
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+        done += n as u64;
+        if !tick(done) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(hash.finalize().iter().map(|b| format!("{:02x}", b)).collect()))
 }
 
 /// Room kept free beyond the download itself.
@@ -1325,7 +1383,12 @@ fn part_source(dest: &Path) -> PathBuf {
 /// part file's size, polled, so curl's own output never needs parsing. A network
 /// that goes away is waited out (ten minutes without a byte) and the download
 /// resumed where it stopped; Cancel deletes the part.
-async fn download(url: &str, dest: &Path, size: u64, label: &str, rep: &mut Reporter) -> Result<(), String> {
+///
+/// `sha256`: the checksum its source gives, when it gives one. The right size is not
+/// yet the right bytes: a power cut can leave a blank stretch in a part that is then
+/// resumed to exactly the promised length. With a checksum the file only gets its
+/// name once it matches; without one, size is all there is to go by.
+async fn download(url: &str, dest: &Path, size: u64, sha256: Option<&str>, label: &str, rep: &mut Reporter) -> Result<(), String> {
     let part = part_of(dest);
     let source = part_source(dest);
     let dir = dest.parent().unwrap_or(Path::new("."));
@@ -1409,6 +1472,32 @@ async fn download(url: &str, dest: &Path, size: u64, label: &str, rep: &mut Repo
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         wait = (wait * 2).min(30);
+    }
+    if let Some(want) = sha256 {
+        let checking = format!("Checking {}", label);
+        rep.progress(&checking, 0, size);
+        // Read here, on the worker's one thread: it has nothing else to do meanwhile.
+        let (mut said, mut stopped) = (0u64, false);
+        let got = sha256_file(&part, |done| {
+            if done - said >= 64 << 20 {
+                said = done;
+                rep.progress(&checking, done, size);
+                stopped = rep.stop_asked();
+            }
+            !stopped
+        });
+        match got {
+            Ok(Some(got)) if got == want => {}
+            Ok(None) => {
+                drop_part();
+                return Err("Cancelled.".into());
+            }
+            Ok(Some(_)) => {
+                drop_part();
+                return Err(format!("Download of {} doesn't match its checksum (it was damaged on the way or on the disk), so it was thrown away. Try again.", label));
+            }
+            Err(e) => return Err(format!("Couldn't read {} back to check it: {}", part.display(), e)),
+        }
     }
     rename_retry(&part, dest).map_err(|e| format!("Couldn't save {}: {}", dest.display(), e))?;
     let _ = std::fs::remove_file(&source);
@@ -1522,7 +1611,7 @@ async fn install_engine(root: &Path, tag: &str, build: Build, rep: &mut Reporter
             // CUDA comes as two files; say which, so the bar restarting isn't a surprise.
             let part = if assets.len() > 1 { format!(", part {} of {}", i + 1, assets.len()) } else { String::new() };
             let label = format!("llama.cpp ({}{})", build.words(), part);
-            download(&url, &archive, *size, &label, rep).await?;
+            download(&url, &archive, *size, None, &label, rep).await?;
             rep.progress(&format!("Unpacking {}", label), 0, 0);
             run_cmd_full_async(tar_program(), vec!["-xf".into(), archive.display().to_string(), "-C".into(), staging.display().to_string()])
                 .await
@@ -1653,6 +1742,9 @@ pub(crate) fn spawn_server(cfg: &LlmConfig) -> Result<LlmRun, String> {
     let model = cfg.model.clone().ok_or("Pick a model first.")?;
     if !model.exists() {
         return Err(format!("{} isn't downloaded.", model_label(&model)));
+    }
+    if !is_gguf(&model) {
+        return Err(format!("{} isn't a model file llama.cpp can read: it is damaged or incomplete. Delete it on the LLM tab and get it again.", model_label(&model)));
     }
     // Windows' canonical form (`\\?\C:\...`) is not a safe thing to hand a program as
     // its own path and folder; the plain spelling names the same file.
@@ -1995,7 +2087,7 @@ pub(crate) fn cli(args: &[String], her_up: impl Fn() -> bool) -> Option<i32> {
     // A switch nobody here knows is an error said in the caller's own terms, never a
     // window: a caller (Sapphire, a script) built for a newer launcher, or a typo,
     // must get a "no" it can read, not a GUI opening on a headless machine.
-    let internal = ["--llm-job", "--llm-watch", "--keep-hold"];
+    let internal = ["--llm-job", "--llm-watch", "--keep-hold", "--as"];
     if let Some(unknown) = args.iter().skip(1).find(|a| a.starts_with("--") && !flags.contains(&a.as_str()) && !internal.contains(&a.as_str())) {
         println!("{}", serde_json::json!({"ok": false, "error": format!("This launcher ({}) doesn't know the switch {}.", env!("CARGO_PKG_VERSION"), unknown)}));
         return Some(1);
@@ -2010,7 +2102,7 @@ pub(crate) fn cli(args: &[String], her_up: impl Fn() -> bool) -> Option<i32> {
         return Some(worker_main(&json));
     }
     if has("--llm-watch") {
-        return Some(watch_main(her_up, has("--keep-hold")));
+        return Some(watch_main(her_up, has("--keep-hold"), value("--as").filter(|p| !p.is_empty()).map(PathBuf::from)));
     }
     let fail = |e: String| {
         println!("{}", serde_json::json!({"ok": false, "error": e}));
@@ -2306,13 +2398,61 @@ fn watch_backoff(fails: u32) -> std::time::Duration {
     std::time::Duration::from_secs(test_secs("SAPPHIRE_LLM_WATCH_SECS", WATCH_SECS) << fails.min(6))
 }
 
+// A watcher lives for a whole session, so it can outlive the launcher it came from:
+// a newer launcher is downloaded and opened from another folder, or (Linux) the
+// file is swapped for a newer one in place. Left alone it would keep running old
+// code, and on Windows it keeps the old file locked: it can't be deleted or
+// replaced while its watcher runs. So each round the watcher asks whether it is
+// still the right one, and if not hands its job to the right launcher and ends.
+
+/// What a launcher file looks like now: a different size or time is a different
+/// program under the same name.
+type ExeStamp = (u64, std::time::SystemTime);
+fn exe_stamp(path: &Path) -> Option<ExeStamp> {
+    let m = std::fs::metadata(path).ok()?;
+    Some((m.len(), m.modified().ok()?))
+}
+
+/// Two spellings of one file (case, links, short names) are not two launchers. An
+/// own file that is gone is not the wanted one; anything else unreadable is left
+/// as "the same": a doubt hands nothing over.
+fn other_launcher(me: &Path, wanted: &Path) -> bool {
+    if me == wanted {
+        return false;
+    }
+    match (std::fs::canonicalize(me), std::fs::canonicalize(wanted)) {
+        (Ok(a), Ok(b)) => a != b,
+        (Err(_), Ok(_)) => true,
+        _ => false,
+    }
+}
+
+/// The launcher this watcher should hand over to, if it is no longer the right one:
+/// the launcher whose window opened last (`wanted`, llm.json's `launcher`) when that
+/// is another file and is there; else its own path when the file there was replaced.
+fn watch_successor(me: &Path, wanted: Option<&Path>, replaced: bool) -> Option<PathBuf> {
+    if let Some(w) = wanted.filter(|w| w.is_file() && other_launcher(me, w)) {
+        return Some(w.to_path_buf());
+    }
+    replaced.then(|| me.to_path_buf())
+}
+
 /// `--llm-watch`. `her_up` says whether Sapphire is running; it must be cheap.
 /// `keep_hold`: a window started this one mid-session (the last one died), so a
 /// Stop the user asked for stands; only a sign-in's watcher starts with a clean slate.
-pub(crate) fn watch_main(her_up: impl Fn() -> bool, keep_hold: bool) -> i32 {
+/// `named`: the path a handover started this one by (`--as`). It is used as given:
+/// the successor is then the wanted launcher by the very same spelling, so two
+/// watchers can never keep handing the job back and forth over how a path is written.
+pub(crate) fn watch_main(her_up: impl Fn() -> bool, keep_hold: bool, named: Option<PathBuf>) -> i32 {
     // One watcher: the OS frees the lock when it ends, so it is never stale.
-    let Some(_lock) = take_lock("llm-watch.lock") else { return 0 };
+    let Some(mut lock) = take_lock("llm-watch.lock") else { return 0 };
     let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else { return 1 };
+    // Who this is, settled now: later the file may be gone or be another program.
+    let me = named.or_else(|| launcher_path().map(PathBuf::from));
+    let born = me.as_deref().and_then(exe_stamp);
+    // A changed file is believed once it looks the same two rounds running (a copy
+    // still being written is not yet a launcher), and a handover is tried once.
+    let (mut changed, mut handed) = (None, false);
     // A "stay stopped" from an earlier session is over: it outlives a sign-out or a
     // shutdown with her still running, and would keep her LLM off ever after.
     if !keep_hold {
@@ -2325,6 +2465,29 @@ pub(crate) fn watch_main(her_up: impl Fn() -> bool, keep_hold: bool) -> i32 {
             std::thread::sleep(std::time::Duration::from_secs(test_secs("SAPPHIRE_LLM_WATCH_SECS", WATCH_SECS)));
             continue;
         };
+        if let Some(me) = me.as_deref().filter(|_| !handed) {
+            let now = exe_stamp(me).filter(|now| Some(*now) != born);
+            let replaced = now.is_some() && changed == now;
+            changed = now;
+            if let Some(next) = watch_successor(me, cfg.launcher.as_deref(), replaced) {
+                handed = true;
+                // Let go first: the successor leaves at once if the lock is taken.
+                let _ = lock.unlock();
+                drop(lock);
+                let took_over = spawn_watcher_from(&next) && (0..30).any(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                    watcher_running()
+                });
+                if took_over {
+                    return 0;
+                }
+                // It didn't start (a broken file): better this watcher than none.
+                match take_lock("llm-watch.lock") {
+                    Some(l) => lock = l,
+                    None => return 0,
+                }
+            }
+        }
         let up = her_up();
         let run = find_running();
         if !up {
@@ -2372,14 +2535,33 @@ pub(crate) fn spawn_watcher() {
     if cfg!(test) {
         return;
     }
-    let Some(exe) = launcher_path() else { return };
+    if let Some(exe) = launcher_path() {
+        spawn_watcher_from(Path::new(&exe));
+    }
+}
+
+/// Start `exe` as the watcher, told the path it was started by. False = it didn't start.
+fn spawn_watcher_from(exe: &Path) -> bool {
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["--llm-watch", "--keep-hold"]).current_dir(app_config_dir()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    cmd.args(["--llm-watch", "--keep-hold", "--as"])
+        .arg(exe)
+        .current_dir(app_config_dir())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        // An AppImage says where it is through these; one handed on from another
+        // launcher's watcher would describe that launcher, not this one.
+        .env_remove("APPIMAGE")
+        .env_remove("APPDIR");
     detach(&mut cmd);
-    if let Ok(mut child) = cmd.spawn() {
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
+    match cmd.spawn() {
+        Ok(mut child) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            true
+        }
+        Err(_) => false,
     }
 }
 
@@ -2975,7 +3157,7 @@ mod tests {
         std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
         std::fs::write(part_of(&dest), vec![0u8; 50_000]).unwrap();
         std::fs::write(part_source(&dest), &url).unwrap();
-        download(&url, &dest, body.len() as u64, "M", &mut rep).await.expect("download");
+        download(&url, &dest, body.len() as u64, None, "M", &mut rep).await.expect("download");
         let got = std::fs::read(&dest).unwrap();
         assert_eq!(got.len(), body.len());
         assert!(got[..50_000].iter().all(|b| *b == 0) && got[50_000..] == body[50_000..], "resumed, not restarted");
@@ -2987,19 +3169,34 @@ mod tests {
         let dest_b = d.join("models").join("b.gguf");
         std::fs::write(part_of(&dest_b), vec![0u8; 50_000]).unwrap();
         std::fs::write(part_source(&dest_b), "https://example.invalid/other-repo/b.gguf").unwrap();
-        download(&url, &dest_b, body.len() as u64, "B", &mut rep).await.expect("download");
+        download(&url, &dest_b, body.len() as u64, None, "B", &mut rep).await.expect("download");
         assert_eq!(std::fs::read(&dest_b).unwrap(), body);
 
         // curl content, size not the one promised: thrown away, not kept as a model.
         let dest_w = d.join("models").join("w.gguf");
-        let err = download(&url, &dest_w, body.len() as u64 + 7, "W", &mut rep).await.unwrap_err();
+        let err = download(&url, &dest_w, body.len() as u64 + 7, None, "W", &mut rep).await.unwrap_err();
         assert!(err.contains("wrong size"), "{}", err);
         assert!(!dest_w.exists() && !part_of(&dest_w).exists());
+
+        // The site's checksum: the right bytes get their name...
+        let sum = sha256_file(&src, |_| true).unwrap().unwrap();
+        let dest_s = d.join("models").join("s.gguf");
+        download(&url, &dest_s, body.len() as u64, Some(&sum), "S", &mut rep).await.expect("download");
+        assert_eq!(std::fs::read(&dest_s).unwrap(), body);
+        assert_eq!(rep.info.label, "Checking S");
+        // ...and a part with a blank stretch in it, resumed to exactly the promised
+        // size (the first case above: what a power cut leaves), does not.
+        let dest_c = d.join("models").join("c.gguf");
+        std::fs::write(part_of(&dest_c), vec![0u8; 50_000]).unwrap();
+        std::fs::write(part_source(&dest_c), &url).unwrap();
+        let err = download(&url, &dest_c, body.len() as u64, Some(&sum), "C", &mut rep).await.unwrap_err();
+        assert!(err.contains("checksum"), "{}", err);
+        assert!(!dest_c.exists() && !part_of(&dest_c).exists() && !part_source(&dest_c).exists());
 
         // Cancel: curl is ended and the unfinished file is deleted.
         let dest2 = d.join("models").join("n.gguf");
         std::fs::write(d.join("job.cancel"), b"").unwrap();
-        let err = download(&url, &dest2, body.len() as u64, "N", &mut rep).await.unwrap_err();
+        let err = download(&url, &dest2, body.len() as u64, None, "N", &mut rep).await.unwrap_err();
         assert!(err.contains("Cancelled") && rep.cancelled);
         assert!(!dest2.exists() && !part_of(&dest2).exists() && !part_source(&dest2).exists());
         assert_eq!(rep.finish(Err(err)), 4);
@@ -3008,12 +3205,70 @@ mod tests {
 
         // A source that isn't there fails in plain words and keeps nothing half-made.
         let mut rep = Reporter::new(d.join("job.json"), d.join("job.cancel"), JobSpec { model: Some(model_spec()), ..Default::default() });
-        let err = download(&format!("file://{}", d.join("missing.bin").display()), &d.join("models").join("o.gguf"), 10, "O", &mut rep).await.unwrap_err();
+        let err = download(&format!("file://{}", d.join("missing.bin").display()), &d.join("models").join("o.gguf"), 10, None, "O", &mut rep).await.unwrap_err();
         assert!(err.contains("Download of O stopped"), "{}", err);
         // No room: refused before a byte moves.
-        let err = download(&url, &d.join("models").join("p.gguf"), u64::MAX / 4, "P", &mut rep).await.unwrap_err();
+        let err = download(&url, &d.join("models").join("p.gguf"), u64::MAX / 4, None, "P", &mut rep).await.unwrap_err();
         assert!(err.contains("Not enough room"), "{}", err);
         assert!(free_bytes(&d).is_some_and(|f| f > 0));
+    }
+
+    #[test]
+    fn a_watcher_knows_when_it_is_no_longer_the_right_one() {
+        let d = scratch("successor");
+        let (a, b) = (d.join("a").join("launcher"), d.join("b").join("launcher"));
+        for f in [&a, &b] {
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, b"exe").unwrap();
+        }
+        // Nobody named another launcher, or the one named is this one, however spelled.
+        assert_eq!(watch_successor(&a, None, false), None);
+        assert_eq!(watch_successor(&a, Some(&a), false), None);
+        assert_eq!(watch_successor(&a, Some(&d.join("a").join("..").join("a").join("launcher")), false), None);
+        // Another launcher's window opened last: the job goes to it.
+        assert_eq!(watch_successor(&a, Some(&b), false), Some(b.clone()));
+        // One that is named but gone (a download since deleted) gets nothing.
+        assert_eq!(watch_successor(&a, Some(&d.join("gone").join("launcher")), false), None);
+        // This one's own file replaced by a newer one: the same path, started afresh.
+        assert_eq!(watch_successor(&a, Some(&a), true), Some(a.clone()));
+        assert_eq!(watch_successor(&a, None, true), Some(a.clone()));
+        // Its own file deleted and the other still there: hand over.
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(watch_successor(&a, Some(&b), false), Some(b.clone()));
+        // A file's stamp moves when the file does.
+        let before = exe_stamp(&b).unwrap();
+        std::fs::write(&b, b"a longer exe").unwrap();
+        assert_ne!(exe_stamp(&b).unwrap(), before);
+        assert_eq!(exe_stamp(&a), None);
+    }
+
+    #[test]
+    fn a_model_is_checked_by_checksum_when_the_site_gives_one_and_by_its_first_bytes() {
+        let d = scratch("sums");
+        std::fs::write(d.join("abc"), b"abc").unwrap();
+        assert_eq!(sha256_file(&d.join("abc"), |_| true).unwrap().unwrap(), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+        assert_eq!(sha256_file(&d.join("abc"), |_| false).unwrap(), None, "it stops when told to");
+        assert!(sha256_file(&d.join("missing"), |_| true).is_err());
+        // What Hugging Face lists: only a real checksum is taken, in lowercase.
+        let v = serde_json::json!({"siblings": [
+            {"rfilename": "m.gguf", "size": 3, "lfs": {"sha256": "AB".repeat(32), "size": 3}},
+            {"rfilename": "README.md", "size": 3},
+            {"rfilename": "odd.gguf", "lfs": {"sha256": "not-a-checksum"}},
+            {"rfilename": "short.gguf", "lfs": {"sha256": "abc123"}},
+            {"rfilename": "none.gguf", "lfs": {}},
+        ]});
+        assert_eq!(listing_sha256(&v), vec![("m.gguf".to_string(), "ab".repeat(32))]);
+        assert!(listing_sha256(&serde_json::json!({})).is_empty(), "no listing: nothing to check against, and no error");
+        // The first four bytes.
+        std::fs::write(d.join("ok.gguf"), b"GGUF\x03\0\0\0 and the rest").unwrap();
+        std::fs::write(d.join("zip.gguf"), b"PK\x03\x04 an archive under a model's name").unwrap();
+        std::fs::write(d.join("cut.gguf"), b"GG").unwrap();
+        assert!(is_gguf(&d.join("ok.gguf")));
+        assert!(!is_gguf(&d.join("zip.gguf")) && !is_gguf(&d.join("cut.gguf")) && !is_gguf(&d.join("missing.gguf")));
+        // A start says so itself, before llama.cpp gets a file it can only choke on.
+        std::fs::write(d.join("llama-server"), b"").unwrap();
+        let cfg = LlmConfig { engine: Some(d.join("llama-server")), model: Some(d.join("zip.gguf")), ..LlmConfig::default() };
+        assert!(spawn_server(&cfg).unwrap_err().contains("damaged"));
     }
 
     #[test]

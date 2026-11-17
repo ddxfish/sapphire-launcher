@@ -67,9 +67,22 @@ impl Scratch {
         // The model: 2 MB with a pattern, so a resumed download can be checked byte for byte.
         let hf = root.join("fixtures/hf/test/tiny-GGUF");
         std::fs::create_dir_all(&hf).unwrap();
-        let model: Vec<u8> = (0..2_000_000u32).map(|i| (i % 251) as u8).collect();
+        // It starts the way a real one does, and is listed with its checksum the way
+        // Hugging Face lists one.
+        let mut model: Vec<u8> = (0..2_000_000u32).map(|i| (i % 251) as u8).collect();
+        model[..4].copy_from_slice(b"GGUF");
         std::fs::write(hf.join(MODEL), &model).unwrap();
-        std::fs::write(hf.join("api.json"), serde_json::json!({"siblings": [{"rfilename": MODEL, "size": model.len()}, {"rfilename": "README.md", "size": 3}]}).to_string()).unwrap();
+        let sum: String = {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&model).iter().map(|b| format!("{:02x}", b)).collect()
+        };
+        let listing = |sum: &str| serde_json::json!({"siblings": [{"rfilename": MODEL, "size": model.len(), "lfs": {"sha256": sum, "size": model.len()}}, {"rfilename": "README.md", "size": 3}]}).to_string();
+        std::fs::write(hf.join("api.json"), listing(&sum)).unwrap();
+        // The same file under a repo whose listing promises other bytes.
+        let bad = root.join("fixtures/hf/test/damaged-GGUF");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join(MODEL), &model).unwrap();
+        std::fs::write(bad.join("api.json"), listing(&"0".repeat(64))).unwrap();
 
         // A Sapphire install as the watcher sees one: a core with no lock, asked at her port.
         let her = root.join("home/sapphire");
@@ -328,6 +341,17 @@ fn install_download_start_restart_stop() {
 }
 
 #[test]
+fn a_download_that_does_not_match_its_checksum_is_never_kept() {
+    let s = Scratch::new("checksum");
+    assert_eq!(s.cli(&["--llm-download", "test/damaged-GGUF"])["ok"], true);
+    let st = s.wait("the download to end", 60, |st| st["job"].is_null() && !st["last_job"].is_null() && st["last_job"]["state"] != "interrupted");
+    assert_eq!(st["last_job"]["state"], "failed", "{}", st);
+    assert!(st["last_job"]["error"].as_str().unwrap().contains("checksum"), "{}", st);
+    assert_eq!(s.files_in_models(), Vec::<String>::new(), "no model, no part, no note");
+    assert_eq!(st["phase"], "none", "{}", st);
+}
+
+#[test]
 fn cancel_deletes_the_part_and_a_killed_download_resumes_byte_for_byte() {
     let mut s = Scratch::new("cancel-resume");
     // Over HTTP, the model at about 270 KB/s: time enough to cancel, and to kill.
@@ -447,4 +471,103 @@ fn the_watcher_starts_it_with_her_and_stops_it_with_her() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(watcher.0.try_wait().unwrap().unwrap().code(), Some(0));
+}
+
+/// Pids of processes running the file at `exe` (by /proc, so a renamed or copied
+/// launcher is told apart from this test's own).
+fn running_from(exe: &Path) -> Vec<i32> {
+    let want = std::fs::canonicalize(exe).unwrap();
+    std::fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok())
+        .filter(|pid| std::fs::read_link(format!("/proc/{}/exe", pid)).is_ok_and(|p| p == want))
+        .collect()
+}
+
+/// Whatever still runs from a scratch copy of the launcher when a test ends: the
+/// file at that path, or one that was there and has since been replaced (its link
+/// then reads "<path> (deleted)").
+struct EndAllFrom(PathBuf);
+impl Drop for EndAllFrom {
+    fn drop(&mut self) {
+        let path = self.0.display().to_string();
+        let pids = std::fs::read_dir("/proc").unwrap().flatten().filter_map(|e| e.file_name().to_string_lossy().parse::<i32>().ok());
+        for pid in pids.filter(|pid| std::fs::read_link(format!("/proc/{}/exe", pid)).is_ok_and(|p| p.to_string_lossy().starts_with(&path))) {
+            // SAFETY: a plain syscall on a positive pid just seen running this test's own copy.
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+    }
+}
+
+#[test]
+fn a_watcher_hands_its_job_to_the_launcher_opened_last() {
+    let s = Scratch::new("handover");
+    s.set_up();
+    // A second copy of the launcher: a newer one, downloaded to another folder.
+    let newer = s.root.join("newer/sapphire-launcher");
+    std::fs::create_dir_all(newer.parent().unwrap()).unwrap();
+    std::fs::copy(EXE, &newer).unwrap();
+    let _cleanup = EndAllFrom(newer.clone());
+    let mut c = s.cmd(&["--llm-watch"]);
+    c.env("SAPPHIRE_LLM_WATCH_SECS", "1").stdout(Stdio::null()).stderr(Stdio::null());
+    let mut old = Reaped(c.spawn().unwrap());
+    // Nothing names another launcher: it stays.
+    std::thread::sleep(Duration::from_millis(2500));
+    assert!(old.0.try_wait().unwrap().is_none(), "the watcher left with nobody to hand over to");
+    assert!(running_from(&newer).is_empty());
+
+    // The newer launcher's window opens: that is what writes `launcher`.
+    let cfg = s.config("llm.json");
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+    v["launcher"] = newer.display().to_string().into();
+    std::fs::write(&cfg, v.to_string()).unwrap();
+    let until = Instant::now() + Duration::from_secs(15);
+    while old.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < until, "the old watcher kept running");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(old.0.try_wait().unwrap().unwrap().code(), Some(0));
+    // One watcher again, and it is the newer launcher. It stays: it does not hand
+    // the job back, or on to itself.
+    std::thread::sleep(Duration::from_millis(3500));
+    let now = running_from(&newer);
+    assert_eq!(now.len(), 1, "one watcher from the newer launcher: {:?}", now);
+    let line = std::fs::read(format!("/proc/{}/cmdline", now[0])).unwrap();
+    assert!(String::from_utf8_lossy(&line).contains("--llm-watch"));
+
+    // That file swapped for a newer one in place (what updating an AppImage is): the
+    // watcher from the old bytes ends and one from the new bytes carries on.
+    let first = now[0];
+    let fresh = s.root.join("newer/fresh");
+    std::fs::copy(EXE, &fresh).unwrap();
+    std::thread::sleep(Duration::from_millis(1100)); // a later time on any filesystem
+    std::fs::File::options().append(true).open(&fresh).unwrap().write_all(b"\n").unwrap();
+    std::fs::rename(&fresh, &newer).unwrap();
+    let until = Instant::now() + Duration::from_secs(15);
+    loop {
+        let from_new = running_from(&newer);
+        if from_new.len() == 1 && from_new[0] != first && !Path::new(&format!("/proc/{}", first)).exists() {
+            break;
+        }
+        assert!(Instant::now() < until, "the watcher kept running the replaced file: {:?} (was {})", from_new, first);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // And it does the job: she comes up, so does her LLM; she goes, so does it.
+    let her = Her::up(s.web_port);
+    s.wait("the new watcher to start it", 15, |st| st["phase"] == "running");
+    std::thread::sleep(Duration::from_millis(2500));
+    drop(her);
+    s.wait("the new watcher to stop it", 15, |st| st["phase"] == "stopped");
+
+    // Switched off: it ends by itself, like any watcher.
+    let mut v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+    v["off"] = true.into();
+    std::fs::write(&cfg, v.to_string()).unwrap();
+    let until = Instant::now() + Duration::from_secs(10);
+    while !running_from(&newer).is_empty() {
+        assert!(Instant::now() < until, "the new watcher did not end by itself");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
