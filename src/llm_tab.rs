@@ -13,6 +13,7 @@ pub(crate) enum LlmMsg {
     Polled(Seen),
     JobPoll,
     JobSeen(Option<JobInfo>),
+    Spawned(Result<(), String>),
     Select(PathBuf),
     Pick(Pick),
     Ctx(CtxChoice),
@@ -76,22 +77,14 @@ pub(crate) struct LlmUi {
     /// llm.json as this window last read or wrote it (see `llm_sync_cfg`).
     pub cfg_stamp: Option<(std::time::SystemTime, u64)>,
     pub hw: Option<Hw>,
+    /// What the last poll saw of the server.
     pub seen: Option<Seen>,
-    pub starting: Option<Instant>,
-    pub stopping: bool,
-    pub restart_after_stop: bool,
-    /// The download under way: the worker's report, whoever started it.
-    pub job: Option<JobInfo>,
-    /// A worker this window started and has not heard from yet.
-    pub launched: Option<Instant>,
-    /// Cancel was clicked before that worker reported.
-    pub cancel_wanted: bool,
-    /// A download whose worker died (crash, power loss): Resume or Discard.
-    pub stalled: Option<JobInfo>,
+    /// What this window is doing to it, on top of that.
+    pub intent: Intent,
+    /// The download: none, asked for, running, or interrupted.
+    pub dl: Download,
     /// Download speed: (when, bytes then, bytes per second).
     pub rate: Option<(Instant, u64, f64)>,
-    /// The LLM and Sapphire were seen up together, so it goes down with her.
-    pub for_her: bool,
     /// A model picked in the Install dropdown whose download (or engine) is still
     /// coming: when it lands it becomes the default and is switched on.
     pub picked: Option<PathBuf>,
@@ -104,23 +97,65 @@ pub(crate) struct LlmUi {
     pub advanced: bool,
     pub newer: Option<String>,
     /// "Start the LLM when I sign in" (only offered when it runs on its own).
-    pub autostart: bool,
     /// What the sign-in entry runs now, and whether this window has checked it.
     pub sign_in: SignIn,
     pub sign_in_checked: bool,
+    pub sign_in_failed: Option<SignIn>,
+    /// The settings in `cfg` really are what is on disk (false = they couldn't be
+    /// read yet, and these are placeholders that must not be saved or acted on).
+    pub cfg_ok: bool,
+}
+
+/// Where a download stands, as this window knows it. One value: an interrupted
+/// download beside a live one, or a Cancel waiting on a job that is gone, can't be
+/// written down.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) enum Download {
+    #[default]
+    Idle,
+    /// Asked of a worker that has not reported yet. `cancel` = Cancel was clicked
+    /// in the meantime, and is passed on the moment it reports.
+    /// `resume` = the interrupted job this is a second try at.
+    Waiting { job: JobInfo, since: Instant, cancel: bool, resume: Option<Box<JobInfo>> },
+    /// A worker is on it (whoever started it): its latest report.
+    Running(JobInfo),
+    /// Its worker died (a crash, a power cut): Resume or Discard.
+    Interrupted(JobInfo),
+}
+
+/// The one thing this window can be in the middle of doing to the server. One value,
+/// so "stopping and starting", or "restart afterwards" with no stop under way, can't
+/// be written down.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub(crate) enum Intent {
+    #[default]
+    None,
+    /// Start was asked for. `since` is set once the server was spawned: from then
+    /// it is loading its model, and the polls watch it come up (or die).
+    Starting { since: Option<Instant> },
+    /// A stop is in flight; `restart` = start again when it lands.
+    Stopping { restart: bool },
 }
 
 impl LlmUi {
     pub(crate) fn new() -> Self {
-        let mut cfg = LlmConfig::load();
+        let read = LlmConfig::read();
+        let cfg_ok = read.is_some();
+        let mut cfg = read.unwrap_or_default();
         // Sapphire calls the launcher by this path; it moves when the file does.
+        // (`update` re-reads first: settings that couldn't be read are never saved over.)
         let me = launcher_path().map(PathBuf::from);
-        if !cfg!(test) && me.is_some() && cfg.launcher != me {
+        if !cfg!(test) && cfg_ok && me.is_some() && cfg.launcher != me && LlmConfig::update(|c| c.launcher = me.clone()) {
             cfg.launcher = me;
-            cfg.save();
         }
         let sign_in = llm::sign_in();
-        LlmUi { port_text: cfg.port.to_string(), selected: cfg.model.clone(), autostart: sign_in == SignIn::Start, sign_in, cfg_stamp: config_stamp(), cfg, ..Default::default() }
+        // From before the choice was saved: the entry was its only record.
+        if !cfg!(test) && cfg_ok && sign_in == SignIn::Start && !cfg.at_sign_in && LlmConfig::update(|c| c.at_sign_in = true) {
+            cfg.at_sign_in = true;
+        }
+        // An unread file keeps no stamp, so the first poll reads it again.
+        let cfg_stamp = if cfg_ok { config_stamp() } else { None };
+        LlmUi { port_text: cfg.port.to_string(), selected: cfg.model.clone(), sign_in, cfg_stamp, cfg_ok, cfg, ..Default::default() }
     }
 
     pub(crate) fn running(&self) -> Option<&LlmRun> {
@@ -132,15 +167,40 @@ impl LlmUi {
 
     /// Anything animating: a job, a start waiting for the model to load, a stop.
     pub(crate) fn busy(&self) -> bool {
-        self.job.is_some() || self.starting.is_some() || self.stopping
+        self.job().is_some() || self.intent != Intent::None
+    }
+
+    /// The download under way, asked for or running.
+    pub(crate) fn job(&self) -> Option<&JobInfo> {
+        match &self.dl {
+            Download::Waiting { job, .. } | Download::Running(job) => Some(job),
+            _ => None,
+        }
+    }
+
+    /// The download whose worker died.
+    pub(crate) fn stalled(&self) -> Option<&JobInfo> {
+        match &self.dl {
+            Download::Interrupted(job) => Some(job),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn cancel_asked(&self) -> bool {
+        matches!(self.dl, Download::Waiting { cancel: true, .. })
+    }
+
+    pub(crate) fn stopping(&self) -> bool {
+        matches!(self.intent, Intent::Stopping { .. })
     }
 
     /// Engine and a default model are both on disk.
     pub(crate) fn ready(&self) -> bool {
-        self.cfg.engine_ok() && self.cfg.model.as_ref().is_some_and(|m| m.exists())
+        self.cfg.engine_ok() && self.cfg.is_on() && self.cfg.model.as_ref().is_some_and(|m| m.exists())
     }
 }
 
+const DIDNT_START: &str = "The download didn't start. Try again.";
 const GREEN: Color = color!(0x4caf50);
 const YELLOW: Color = color!(0xf9e154);
 const RED: Color = color!(0xe74c3c);
@@ -223,76 +283,108 @@ impl App {
     /// Sapphire through the CLI. Every controller reads before it writes.
     fn llm_sync_cfg(&mut self) {
         let stamp = config_stamp();
-        if stamp != self.llm.cfg_stamp {
-            self.llm.cfg = LlmConfig::load();
-            self.llm.cfg_stamp = stamp;
-            if self.llm.port_text.trim().parse::<u16>().ok() != Some(self.llm.cfg.port) {
-                self.llm.port_text = self.llm.cfg.port.to_string();
-            }
+        if stamp == self.llm.cfg_stamp && self.llm.cfg_ok {
+            return;
         }
+        // Unreadable right now (mid-write): keep what is in memory and look again
+        // next time, rather than take "unreadable" for "empty".
+        let Some(cfg) = LlmConfig::read() else { return };
+        let model_changed = cfg.model != self.llm.cfg.model;
+        self.llm.cfg = cfg;
+        self.llm.cfg_stamp = stamp;
+        self.llm.cfg_ok = true;
+        if self.llm.port_text.trim().parse::<u16>().ok() != Some(self.llm.cfg.port) {
+            self.llm.port_text = self.llm.cfg.port.to_string();
+        }
+        // Someone else chose a model (Sapphire's tool, another window): this window's
+        // idea of the selection must not be written back over it at the next Start.
+        if model_changed {
+            self.llm.selected = self.llm.cfg.model.clone();
+        }
+        self.llm_sync_sign_in(false);
     }
 
     fn llm_set_cfg(&mut self, f: impl FnOnce(&mut LlmConfig)) {
         self.llm_sync_cfg();
+        if !self.llm.cfg_ok {
+            self.llm_note("The LLM's settings can't be read right now, so nothing was changed. Try again in a moment.", true);
+            return;
+        }
         f(&mut self.llm.cfg);
-        self.llm.cfg.save();
-        self.llm.cfg_stamp = config_stamp();
+        if self.llm.cfg.save() {
+            self.llm.cfg_stamp = config_stamp();
+        } else {
+            // What is in memory is not what is on disk: read it back at the next look
+            // rather than act on a change that never landed.
+            self.llm.cfg_stamp = None;
+            self.llm.cfg_ok = false;
+            self.llm_note("Couldn't save the LLM's settings. Try again.", true);
+        }
+        // Whatever turned the LLM on or off (any button, not only the dropdown), what
+        // runs at sign-in follows.
+        self.llm_sync_sign_in(false);
     }
 
-    /// What should run at sign-in: nothing while the LLM is off; the watcher when it
-    /// only runs with Sapphire; the LLM itself when it runs on its own and was asked to.
+    /// What should run at sign-in (the settings decide: `LlmConfig::sign_in_wanted`).
     pub(crate) fn llm_sign_in_wanted(&self) -> SignIn {
-        let c = &self.llm.cfg;
-        if c.model.is_none() || c.engine.is_none() {
-            SignIn::Off
-        } else if c.with_sapphire {
-            SignIn::Watch
-        } else if self.llm.autostart {
-            SignIn::Start
-        } else {
-            SignIn::Off
-        }
+        self.llm.cfg.sign_in_wanted()
     }
 
     /// Bring the sign-in entry in line with the settings, and make sure a watcher
     /// is running now if one is wanted (it works before the next sign-in too).
-    fn llm_sync_sign_in(&mut self) {
+    /// `check_path` also rewrites an entry that names a launcher that has since moved
+    /// (asked once per window: on Windows it costs a `reg query`).
+    fn llm_sync_sign_in(&mut self, check_path: bool) {
         let want = self.llm_sign_in_wanted();
-        if want != self.llm.sign_in {
+        if !self.llm.cfg_ok {
+            return; // settings that couldn't be read decide nothing
+        }
+        let moved = check_path && want != SignIn::Off && want == self.llm.sign_in && !sign_in_points_here();
+        // A write that failed (security software guarding the Run key, say) is said
+        // once, not on every poll: it is tried again when what is wanted changes.
+        if (want != self.llm.sign_in || moved) && self.llm.sign_in_failed != Some(want) {
             match set_sign_in(want) {
                 Ok(()) => {
                     self.llm.sign_in = want;
+                    self.llm.sign_in_failed = None;
                     self.llm_log(match want {
                         SignIn::Watch => "A small watcher now starts the LLM when Sapphire runs and stops it when she doesn't.",
                         SignIn::Start => "The LLM will start when you sign in.",
                         SignIn::Off => "Nothing of the LLM's starts at sign-in.",
                     });
                 }
-                Err(e) => self.llm_note(format!("Couldn't change what starts at sign-in: {}", e), true),
+                Err(e) => {
+                    self.llm.sign_in_failed = Some(want);
+                    self.llm_note(format!("Couldn't change what starts at sign-in: {}", e), true);
+                }
             }
         }
-        if want == SignIn::Watch {
+        if want == SignIn::Watch && !watcher_running() {
             spawn_watcher();
         }
     }
 
-    /// Hand a job to a worker. The worker reports to the job file; `JobSeen` follows it.
-    fn llm_launch(&mut self, spec: JobSpec) -> Task<Message> {
-        if self.llm.job.is_some() {
+    /// Hand a job to a worker. The worker reports to the job file; `JobSeen` follows
+    /// it. Starting one can take a second or three (it waits until the worker is in
+    /// place), so that happens off the window's thread; `Spawned` says how it went.
+    fn llm_launch(&mut self, spec: JobSpec, resume: Option<JobInfo>) -> Task<Message> {
+        if self.llm.job().is_some() {
             return Task::none();
         }
-        match spawn_worker(&spec) {
-            Ok(pid) => {
-                self.llm.note = None;
-                self.llm.stalled = None;
-                self.llm.rate = None;
-                self.llm.cancel_wanted = false;
-                self.llm.launched = Some(Instant::now());
-                self.llm.job = Some(JobInfo::waiting(pid, spec));
-            }
-            Err(e) => self.llm_note(e, true),
-        }
-        Task::none()
+        self.llm.note = None;
+        self.llm.rate = None;
+        self.llm.dl = Download::Waiting { job: JobInfo::waiting(0, spec.clone()), since: Instant::now(), cancel: false, resume: resume.map(Box::new) };
+        Task::perform(
+            async move { tokio::task::spawn_blocking(move || spawn_worker(&spec)).await.unwrap_or_else(|e| Err(e.to_string())) },
+            |r| Message::Llm(LlmMsg::Spawned(r.map(|_| ()))),
+        )
+    }
+
+    /// No download any more, and nothing waiting on one.
+    fn llm_dl_idle(&mut self) {
+        self.llm.dl = Download::Idle;
+        self.llm.picked = None;
+        self.llm.rate = None;
     }
 
     /// The selected model as a download, if it is one from the list.
@@ -350,7 +442,8 @@ impl App {
                     tasks.push(self.llm_use(p));
                 }
                 if j.spec.start {
-                    self.llm.starting = Some(Instant::now());
+                    // The worker started it: from here it is loading, as after Start.
+                    self.llm.intent = Intent::Starting { since: Some(Instant::now()) };
                     tasks.push(self.llm_poll());
                 }
                 Task::batch(tasks)
@@ -373,13 +466,23 @@ impl App {
     /// running one moves over to it; a stopped one starts, unless it only runs with
     /// Sapphire and she isn't running (then it starts when she does).
     fn llm_use(&mut self, path: PathBuf) -> Task<Message> {
+        self.llm_sync_cfg();
         self.llm.selected = Some(path.clone());
-        self.llm_set_cfg(|c| c.model = Some(path.clone()));
-        self.llm_sync_sign_in();
+        self.llm_set_cfg(|c| {
+            c.model = Some(path.clone());
+            c.off = false;
+        });
+        let waits_for_her = self.llm.cfg.with_sapphire && !self.run.up();
+        // A stop is in flight (a moment ago this was None, or Stop): when it lands,
+        // start again with this model.
+        if self.llm.stopping() {
+            self.llm.intent = Intent::Stopping { restart: !waits_for_her };
+            return Task::none();
+        }
         match self.llm.running() {
             Some(run) if run.model == path => Task::none(),
             Some(_) => self.llm_update(LlmMsg::Restart),
-            None if self.llm.cfg.with_sapphire && !self.sapphire_running => {
+            None if waits_for_her => {
                 self.llm_log(format!("{} is on. It starts when Sapphire does.", model_label(&path)));
                 Task::none()
             }
@@ -388,14 +491,13 @@ impl App {
     }
 
     fn llm_begin_stop(&mut self, restart: bool) -> Task<Message> {
-        let Some(run) = self.llm.running().cloned() else { return Task::none() };
-        if self.llm.stopping {
+        // The last poll can be seconds old: a server the watcher started since then
+        // is found by asking afresh, so "None" and Stop never leave one running.
+        let Some(run) = find_running().or_else(|| self.llm.running().cloned()) else { return Task::none() };
+        if self.llm.stopping() {
             return Task::none();
         }
-        self.llm.restart_after_stop = restart;
-        self.llm.stopping = true;
-        self.llm.starting = None;
-        self.llm.for_her = false;
+        self.llm.intent = Intent::Stopping { restart };
         self.llm_log("Stopping the LLM.");
         Task::perform(llm::stop(run), |ok| Message::Llm(LlmMsg::Stopped(ok)))
     }
@@ -403,11 +505,43 @@ impl App {
     /// "Only run with Sapphire": Launch brings her LLM up first.
     pub(crate) fn llm_start_with_her(&mut self) -> Task<Message> {
         let l = &self.llm;
-        if !l.cfg.with_sapphire || !l.ready() || l.running().is_some() || l.busy() || matches!(l.seen, Some(Seen::Foreign)) {
+        // A download beside it is no reason to leave her without a brain.
+        if !l.cfg.with_sapphire || !l.ready() || l.intent != Intent::None || matches!(l.seen, Some(Seen::Foreign)) {
+            return Task::none();
+        }
+        // Already up: from this Launch on it is hers, and goes down with her.
+        if let Some(run) = l.running() {
+            llm::mark_for_her(run.pid);
             return Task::none();
         }
         self.llm_log("Starting the LLM with Sapphire.");
-        self.llm_update(LlmMsg::Start)
+        self.llm_start(true)
+    }
+
+    /// Start the saved model. `for_her`: Launch asked, so it is noted as Sapphire's
+    /// and the watcher takes it down if she never comes up.
+    fn llm_start(&mut self, for_her: bool) -> Task<Message> {
+        if self.llm.running().is_some() || self.llm.intent != Intent::None {
+            return Task::none();
+        }
+        // The saved model is what starts. Only when there is none on disk does
+        // the row picked in this window become it.
+        if !self.llm.cfg.model.as_ref().is_some_and(|m| m.exists())
+            && let Some(sel) = self.llm_selected().filter(|p| p.exists())
+        {
+            self.llm_set_cfg(|c| c.model = Some(sel));
+        }
+        let cfg = self.llm.cfg.resolved(self.llm.hw.as_ref());
+        self.llm.note = None;
+        self.llm.intent = Intent::Starting { since: None };
+        self.llm_log(format!(
+            "Starting {} ({} context, {}).",
+            cfg.model.as_deref().map(model_label).unwrap_or_default(),
+            ctx_words(cfg.ctx),
+            if cfg.gpu { "graphics card" } else { "processor" }
+        ));
+        let started = |r| Message::Llm(LlmMsg::Started(r));
+        if for_her { Task::perform(llm::start_for_her(), started) } else { Task::perform(llm::start_saved(), started) }
     }
 
     pub(crate) fn llm_update(&mut self, msg: LlmMsg) -> Task<Message> {
@@ -425,70 +559,93 @@ impl App {
             LlmMsg::Poll => {
                 self.llm_sync_cfg();
                 // Once per window: an entry from an older launcher, or none at all.
-                if !std::mem::replace(&mut self.llm.sign_in_checked, true) {
-                    self.llm_sync_sign_in();
-                }
+                // The path check once per window (an entry from a launcher that has
+                // moved); every poll, that the watcher is still there to do its job.
+                let first = !std::mem::replace(&mut self.llm.sign_in_checked, true);
+                self.llm_sync_sign_in(first);
                 let job = self.llm_update(LlmMsg::JobSeen(read_job()));
                 Task::batch([job, self.llm_poll()])
             }
             LlmMsg::JobPoll => self.llm_update(LlmMsg::JobSeen(read_job())),
+            LlmMsg::Spawned(Ok(())) => Task::none(),
+            LlmMsg::Spawned(Err(e)) => {
+                // No worker came of it. A Resume goes back to being resumable (its
+                // part is still there); anything else is simply not happening.
+                match std::mem::take(&mut self.llm.dl) {
+                    Download::Waiting { resume: Some(j), .. } => self.llm.dl = Download::Interrupted(*j),
+                    Download::Waiting { .. } => self.llm_dl_idle(),
+                    other => self.llm.dl = other,
+                }
+                self.llm_note(e, true);
+                Task::none()
+            }
             LlmMsg::JobSeen(seen) => {
                 let alive = seen.as_ref().is_some_and(|j| j.alive());
-                if let Some(at) = self.llm.launched {
-                    // The last report was removed when our worker was started: no
-                    // file yet means it hasn't written its first one.
-                    if seen.is_none() {
-                        if at.elapsed().as_secs() >= 10 {
-                            self.llm.launched = None;
-                            self.llm.job = None;
-                            self.llm_note("The download didn't start. Try again.", true);
-                        }
-                        return Task::none();
+                // The last report was removed when our worker was started: no file
+                // yet means it hasn't written its first one.
+                if let Download::Waiting { since, .. } = &self.llm.dl
+                    && seen.is_none()
+                {
+                    if since.elapsed().as_secs() >= 10 {
+                        self.llm_dl_idle();
+                        self.llm_note(DIDNT_START, true);
                     }
-                    self.llm.launched = None;
+                    return Task::none();
                 }
+                let was = std::mem::take(&mut self.llm.dl);
                 match seen {
                     Some(j) if alive => {
                         self.llm_rate(&j);
-                        self.llm.stalled = None;
-                        self.llm.job = Some(j);
-                        if std::mem::take(&mut self.llm.cancel_wanted) {
+                        // It was only slow to report (a scanner on first run).
+                        if self.llm.note.as_ref().is_some_and(|n| n.0 == DIDNT_START) {
+                            self.llm.note = None;
+                        }
+                        // A Cancel clicked before our worker reported reaches it now.
+                        if matches!(was, Download::Waiting { cancel: true, .. }) {
                             request_cancel();
                         }
+                        self.llm.dl = Download::Running(j);
                         Task::none()
                     }
                     // Its worker is gone mid-download: a crash, a power cut.
                     Some(j) if j.state == JobState::Running => {
-                        self.llm.job = None;
-                        self.llm.stalled = Some(j);
+                        self.llm.dl = Download::Interrupted(j);
                         Task::none()
                     }
-                    Some(j) => {
-                        self.llm.stalled = None;
-                        match self.llm.job.take() {
-                            Some(_) => self.llm_job_finished(j),
-                            None => Task::none(), // news from before this window opened
+                    // It ended. News only if this window was following it.
+                    Some(j) => match was {
+                        Download::Waiting { .. } | Download::Running(_) => self.llm_job_finished(j),
+                        _ => {
+                            self.llm.picked = None;
+                            Task::none()
                         }
-                    }
+                    },
+                    // No report at all. With a worker still holding its lock that is one
+                    // missed read (the file being replaced, a scanner): look again next
+                    // time. Otherwise it is gone: another window discarded it.
                     None => {
-                        self.llm.job = None;
+                        if matches!(was, Download::Running(_)) && worker_running() {
+                            self.llm.dl = was;
+                        } else {
+                            self.llm_dl_idle();
+                        }
                         Task::none()
                     }
                 }
             }
             LlmMsg::Polled(seen) => {
-                if self.llm.stopping {
+                if self.llm.stopping() {
                     return Task::none();
                 }
-                if let Some(t) = self.llm.starting {
+                if let Intent::Starting { since: Some(t) } = self.llm.intent {
                     match &seen {
                         Seen::Up(run, Health::Ready) => {
-                            self.llm.starting = None;
+                            self.llm.intent = Intent::None;
                             self.llm.note = None; // the status line says it
                             self.llm_log(format!("{} is ready ({} context, {}).", model_label(&run.model), ctx_words(run.ctx), if run.gpu { "graphics card" } else { "processor" }));
                         }
                         Seen::Off if t.elapsed().as_secs() >= 3 => {
-                            self.llm.starting = None;
+                            self.llm.intent = Intent::None;
                             let tail = log_tail(4);
                             for l in &tail {
                                 self.llm_log(format!("  {}", l));
@@ -499,25 +656,30 @@ impl App {
                                 None => self.llm_note("The LLM stopped while starting and left no words.", true),
                             }
                         }
+                        // Neither may keep "starting" (its spinner, its fast poll) for
+                        // the life of the window. Loading answers; only silence counts.
+                        Seen::Foreign if t.elapsed().as_secs() >= 3 => {
+                            self.llm.intent = Intent::None;
+                            self.llm_note(format!("The LLM didn't come up: something else is answering on port {}. Pick another port under Advanced.", self.llm.cfg.port), true);
+                        }
+                        Seen::Up(_, Health::Down) if t.elapsed().as_secs() >= 90 => {
+                            self.llm.intent = Intent::None;
+                            self.llm_note("The LLM is running but hasn't answered in a minute and a half. Stop it and start it again.", true);
+                        }
                         _ => {}
                     }
                 }
+                // "Only run with Sapphire" is the watcher's rule alone (llm::watch_main):
+                // this window only shows what it does.
                 self.llm.seen = Some(seen);
-                // "Only run with Sapphire": once the two were up together, the LLM
-                // goes down when she does, however she went (Stop, a crash, systemd).
-                if self.llm.cfg.with_sapphire && self.llm.running().is_some() && !self.sapphire_stopping {
-                    if self.sapphire_running {
-                        self.llm.for_her = true;
-                    } else if std::mem::take(&mut self.llm.for_her) {
-                        self.llm_log("Sapphire is down, so her LLM stops too.");
-                        return self.llm_begin_stop(false);
-                    }
-                }
                 Task::none()
             }
             LlmMsg::Select(p) => {
                 // A downloaded pick becomes the default (what Start and sign-in load);
                 // while one runs, "Restart to apply" offers the switch.
+                // (It does not switch an LLM that is off back on: only the dropdown,
+                // Set up and Start do that.)
+                self.llm_sync_cfg();
                 self.llm.selected = Some(p.clone());
                 if p.exists() {
                     self.llm_set_cfg(|c| c.model = Some(p));
@@ -527,20 +689,20 @@ impl App {
             LlmMsg::Pick(Pick(i, _)) => {
                 // The Install tab's dropdown is the LLM's switch. A model = on, with
                 // that model, now (downloaded first if it isn't here). None = off.
-                if self.llm.job.is_some() {
+                if self.llm.job().is_some() {
                     return Task::none(); // locked while one downloads
                 }
                 let Some(m) = i.and_then(|i| MODELS.get(i)) else {
                     // Off: nothing runs, nothing starts by itself. Its files stay.
-                    let was_on = self.llm.cfg.model.is_some() || self.llm.running().is_some() || self.llm.autostart;
-                    self.llm.selected = None;
+                    self.llm_sync_cfg();
+                    let was_on = self.llm.cfg.is_on() || self.llm.running().is_some();
                     self.llm.picked = None;
-                    self.llm.restart_after_stop = false;
-                    if self.llm.cfg.model.is_some() {
-                        self.llm_set_cfg(|c| c.model = None);
+                    if self.llm.stopping() {
+                        self.llm.intent = Intent::Stopping { restart: false };
                     }
-                    self.llm.autostart = false;
-                    self.llm_sync_sign_in(); // nothing at sign-in; the watcher ends by itself
+                    // Off is its own setting: the model and everything else stay.
+                    self.llm_set_cfg(|c| c.off = true);
+                    self.llm_sync_sign_in(false); // nothing at sign-in; the watcher ends by itself
                     if was_on {
                         self.llm_log("Local LLM off: it won't start by itself. Its files stay; pick a model to turn it back on.");
                     }
@@ -557,7 +719,7 @@ impl App {
                 if path.exists() {
                     spec.model = None; // only the engine is missing
                 }
-                self.llm_launch(spec)
+                self.llm_launch(spec, None)
             }
             LlmMsg::Ctx(c) => {
                 self.llm.ctx_text.clear();
@@ -592,9 +754,10 @@ impl App {
                 Task::none()
             }
             LlmMsg::SetUp => {
-                // Whatever is missing (engine, the model announced under the button),
-                // then start: one worker does all three.
-                if self.llm.job.is_some() {
+                // Whatever is missing (engine, the model announced under the button).
+                // The worker only fetches; this window switches it on when it lands,
+                // the way a pick in the dropdown does: at once, or when Sapphire runs.
+                if self.llm.job().is_some() {
                     return Task::none();
                 }
                 let Some(sel) = self.llm_selected() else { return Task::none() };
@@ -609,101 +772,120 @@ impl App {
                 };
                 let engine = (!self.llm.cfg.engine_ok()).then(|| LLAMA_PIN.to_string());
                 if engine.is_none() && model.is_none() {
-                    return self.llm_update(if self.llm.running().is_some() { LlmMsg::Restart } else { LlmMsg::Start });
-                }
-                if sel.exists() {
-                    self.llm_set_cfg(|c| c.model = Some(sel));
+                    return self.llm_use(sel);
                 }
                 self.llm_log("Setting up the LLM.");
-                self.llm_launch(JobSpec { engine, model, start: true })
+                self.llm.picked = Some(sel);
+                self.llm_launch(JobSpec { engine, model, start: false }, None)
             }
             LlmMsg::Download => {
                 let Some(p) = self.llm_selected() else { return Task::none() };
                 self.llm.selected = Some(p.clone());
                 let Some(m) = self.llm_selected_spec(&p) else { return Task::none() };
                 self.llm_log(format!("Downloading {}.", m.name));
-                self.llm_launch(JobSpec::for_model(&self.llm.cfg, m, false))
+                self.llm_launch(JobSpec::for_model(&self.llm.cfg, m, false), None)
             }
             LlmMsg::Cancel => {
-                if let Some(j) = self.llm.stalled.take() {
-                    discard(&j);
-                    self.llm_note("Deleted the unfinished download.", false);
-                } else if self.llm.launched.is_some() {
-                    self.llm.cancel_wanted = true; // its worker hasn't reported yet
-                } else if self.llm.job.is_some() {
-                    self.llm_log("Cancelling the download...");
-                    request_cancel();
+                self.llm.picked = None; // cancelled: nothing is switched on when it lands
+                match std::mem::take(&mut self.llm.dl) {
+                    // Asked afresh: someone (Sapphire's tool, another window) may have
+                    // resumed it since this window last looked.
+                    Download::Interrupted(j) => match read_job().filter(|now| now.alive()) {
+                        Some(live) => {
+                            self.llm.dl = Download::Running(live);
+                            self.llm_note("It is downloading again, so nothing was deleted.", false);
+                        }
+                        None => {
+                            discard(&j);
+                            self.llm_dl_idle();
+                            self.llm_note("Deleted the unfinished download.", false);
+                        }
+                    },
+                    // Its worker hasn't reported yet: the cancel goes when it does.
+                    Download::Waiting { job, since, resume, .. } => self.llm.dl = Download::Waiting { job, since, cancel: true, resume },
+                    Download::Running(j) => {
+                        self.llm_log("Cancelling the download...");
+                        request_cancel();
+                        self.llm.dl = Download::Running(j);
+                    }
+                    Download::Idle => {}
                 }
                 Task::none()
             }
-            LlmMsg::Resume => match self.llm.stalled.take() {
-                Some(j) => {
+            LlmMsg::Resume => match std::mem::take(&mut self.llm.dl) {
+                Download::Interrupted(j) => {
                     self.llm_log("Resuming the download.");
-                    self.llm_launch(j.spec)
+                    self.llm_launch(j.spec.clone(), Some(j))
                 }
-                None => Task::none(),
+                other => {
+                    self.llm.dl = other;
+                    Task::none()
+                }
             },
-            LlmMsg::Start => {
-                if self.llm.running().is_some() || self.llm.starting.is_some() || self.llm.stopping {
-                    return Task::none();
+            LlmMsg::Start => self.llm_start(false),
+            LlmMsg::Started(r) => {
+                match r {
+                    // A stop got in first (Stop clicked the moment it appeared): it
+                    // is on its way down, not starting.
+                    Ok(_) if self.llm.stopping() => Task::none(),
+                    Ok(run) => {
+                        // What was asked for can have changed while it started (here,
+                        // or by another writer: read what is saved before judging).
+                        self.llm_sync_cfg();
+                        let wanted = self.llm.cfg.model.clone().filter(|_| self.llm.cfg.is_on());
+                        let other = wanted.as_ref() != Some(&run.model);
+                        self.llm.intent = Intent::Starting { since: Some(Instant::now()) };
+                        self.llm.seen = Some(Seen::Up(run, Health::Loading));
+                        match wanted {
+                            None => self.llm_begin_stop(false), // switched off meanwhile
+                            Some(_) if other => self.llm_begin_stop(true),
+                            Some(_) => Task::none(),
+                        }
+                    }
+                    Err(e) => {
+                        if !self.llm.stopping() {
+                            self.llm.intent = Intent::None;
+                        }
+                        self.llm_note(e, true);
+                        Task::none()
+                    }
                 }
-                if let Some(sel) = self.llm_selected().filter(|p| p.exists()) {
-                    self.llm_set_cfg(|c| c.model = Some(sel));
-                }
-                let cfg = self.llm.cfg.resolved(self.llm.hw.as_ref());
-                self.llm.note = None;
-                self.llm_log(format!(
-                    "Starting {} ({} context, {}).",
-                    cfg.model.as_deref().map(model_label).unwrap_or_default(),
-                    ctx_words(cfg.ctx),
-                    if cfg.gpu { "graphics card" } else { "processor" }
-                ));
-                Task::perform(llm::start_saved(), |r| Message::Llm(LlmMsg::Started(r)))
             }
-            LlmMsg::Started(r) => match r {
-                Ok(run) => {
-                    self.llm.starting = Some(Instant::now());
-                    self.llm.seen = Some(Seen::Up(run, Health::Loading));
-                    Task::none()
-                }
-                Err(e) => {
-                    self.llm_note(e, true);
-                    Task::none()
-                }
-            },
             LlmMsg::Stop => {
                 // The Stop button: it stays stopped. The watcher won't bring it back
                 // until Start, or until Sapphire's next run.
-                if self.llm.running().is_some() && !self.llm.stopping {
+                if self.llm.running().is_some() && !self.llm.stopping() {
                     set_hold(true);
                 }
                 self.llm_begin_stop(false)
             }
             LlmMsg::Restart => self.llm_begin_stop(true),
             LlmMsg::Stopped(ok) => {
-                self.llm.stopping = false;
+                // Whatever it was in the middle of is over, restart included when the
+                // stop didn't take.
+                let restart = self.llm.intent == Intent::Stopping { restart: true };
+                self.llm.intent = Intent::None;
                 if !ok {
                     self.llm_note("The LLM didn't stop. Try again, or end llama-server in your task manager.", true);
                     return self.llm_poll();
                 }
                 self.llm.seen = Some(Seen::Off);
                 self.llm_log("LLM stopped.");
-                if std::mem::take(&mut self.llm.restart_after_stop) {
+                if restart {
                     return self.llm_update(LlmMsg::Start);
                 }
                 Task::none()
             }
             LlmMsg::Autostart(on) => {
-                self.llm.autostart = on;
-                self.llm_sync_sign_in();
+                self.llm_set_cfg(|c| c.at_sign_in = on);
+                self.llm_sync_sign_in(false);
                 Task::none()
             }
             LlmMsg::WithSapphire(on) => {
                 self.llm_set_cfg(|c| c.with_sapphire = on);
-                if !on {
-                    self.llm.for_her = false;
+                if on {
+                    set_hold(false); // a "stay stopped" from running it on its own is over
                 }
-                self.llm_sync_sign_in();
                 self.llm_log(if on { "The LLM starts with Sapphire and stops when she does." } else { "The LLM runs on its own: Start and Stop are yours." });
                 Task::none()
             }
@@ -762,7 +944,7 @@ impl App {
             LlmMsg::ByoDownload => {
                 let Some((repo, file, _)) = self.llm.byo.clone() else { return Task::none() };
                 self.llm_log(format!("Downloading {} from {}.", file, repo));
-                self.llm_launch(JobSpec::for_model(&self.llm.cfg, ModelSpec { repo, name: file.clone(), file, quant: None }, false))
+                self.llm_launch(JobSpec::for_model(&self.llm.cfg, ModelSpec { repo, name: file.clone(), file, quant: None }, false), None)
             }
             LlmMsg::CheckEngine => {
                 let Some(build) = self.llm.cfg.build else { return Task::none() };
@@ -779,11 +961,11 @@ impl App {
             LlmMsg::UpdateEngine => {
                 let Some(tag) = self.llm.newer.clone() else { return Task::none() };
                 self.llm_log(format!("Installing llama.cpp {}.", tag));
-                self.llm_launch(JobSpec { engine: Some(tag), model: None, start: false })
+                self.llm_launch(JobSpec { engine: Some(tag), model: None, start: false }, None)
             }
             LlmMsg::Delete => {
                 let Some(sel) = self.llm.selected.clone().filter(|p| p.exists()) else { return Task::none() };
-                if self.llm.running().is_some_and(|r| r.model == sel) {
+                if find_running().or_else(|| self.llm.running().cloned()).is_some_and(|r| r.model == sel) {
                     self.llm_note("Stop the LLM before deleting the model it runs.", true);
                     return Task::none();
                 }
@@ -837,7 +1019,7 @@ impl App {
                 },
             ),
             LlmMsg::ModelsDir(dir) => {
-                if self.llm.job.is_some() {
+                if self.llm.job().is_some() {
                     return Task::none();
                 }
                 // Nothing moves: new downloads go there, and the list looks there.
@@ -851,9 +1033,11 @@ impl App {
                 Task::none()
             }
             LlmMsg::Remove => {
-                let why = if self.llm.running().is_some() {
+                // Asked afresh at each click: the watcher or Sapphire's own tools may
+                // have started something since the last poll.
+                let why = if self.llm.running().is_some() || find_running().is_some() {
                     Some("Stop the LLM before removing it.")
-                } else if self.llm.job.is_some() {
+                } else if self.llm.job().is_some() || read_job().is_some_and(|j| j.alive()) {
                     Some("Wait for the LLM download to finish, or cancel it on the LLM tab.")
                 } else {
                     None
@@ -871,7 +1055,6 @@ impl App {
             }
             LlmMsg::Removed(r) => match r {
                 Ok(()) => {
-                    self.llm.autostart = false;
                     self.llm.selected = None;
                     self.llm.newer = None;
                     self.llm_set_cfg(|c| {
@@ -882,7 +1065,10 @@ impl App {
                             c.model = None;
                         }
                     });
-                    self.llm_sync_sign_in(); // nothing left to start at sign-in
+                    self.llm.picked = None;
+                    if self.llm.stalled().is_some() {
+                        self.llm.dl = Download::Idle; // its files went with the rest
+                    }
                     self.llm_log("Removed the local LLM.");
                     // Without the engine, only NVIDIA cards can be seen again.
                     self.llm.hw = None;
@@ -905,14 +1091,14 @@ impl App {
 
     pub(crate) fn llm_status(&self) -> (String, Color) {
         let l = &self.llm;
-        if l.stopping {
+        if l.stopping() {
             return ("Stopping...".into(), YELLOW);
         }
         if l.running().is_none() {
-            if let Some(j) = &l.job {
+            if let Some(j) = l.job() {
                 return (self.llm_job_words(j), BLUE);
             }
-            if let Some(j) = &l.stalled {
+            if let Some(j) = l.stalled() {
                 let what = j.dest.as_deref().map(model_label).unwrap_or_else(|| "llama.cpp".into());
                 return (format!("Download interrupted: {}", what), YELLOW);
             }
@@ -928,7 +1114,7 @@ impl App {
             Some(Seen::Foreign) => (format!("Port {} is used by another program", l.cfg.port), YELLOW),
             _ if !l.cfg.engine_ok() => ("Not set up".into(), MUTED),
             _ if !l.ready() => ("Off".into(), MUTED),
-            _ if l.cfg.with_sapphire && !self.sapphire_running => ("Waiting for Sapphire".into(), MUTED),
+            _ if l.cfg.with_sapphire && !self.run.up() => ("Waiting for Sapphire".into(), MUTED),
             _ => ("Stopped".into(), MUTED),
         }
     }
@@ -951,7 +1137,7 @@ impl App {
 
     /// Percent of the model being downloaded right now, if `path` is it.
     fn llm_row_pct(&self, path: &std::path::Path) -> Option<u64> {
-        let j = self.llm.job.as_ref()?;
+        let j = self.llm.job()?;
         (j.dest.as_deref() == Some(path)).then(|| j.pct().unwrap_or(0))
     }
 
@@ -960,7 +1146,7 @@ impl App {
     /// Hidden until the LLM is something: set up, downloading, running, or being looked at.
     pub(crate) fn llm_bar_shown(&self) -> bool {
         let l = &self.llm;
-        self.active_tab == Tab::Llm || l.cfg.engine_ok() || l.job.is_some() || l.stalled.is_some() || l.running().is_some()
+        self.active_tab == Tab::Llm || l.cfg.engine_ok() || l.job().is_some() || l.stalled().is_some() || l.running().is_some()
     }
 
     pub(crate) fn view_llm_bar(&self) -> Element<'_, Message> {
@@ -972,7 +1158,7 @@ impl App {
         };
         let mut line = row![dot(color), text("LLM").size(13).font(bold()), text(words).size(12).color(color)].spacing(8).align_y(iced::Alignment::Center);
         // A download while it runs (an engine update, a second model).
-        if let (Some(_), Some(j)) = (running, &l.job) {
+        if let (Some(_), Some(j)) = (running, l.job()) {
             line = line.push(text(self.llm_job_words(j)).size(12).color(BLUE));
         }
         // A failure has to be seen from any tab.
@@ -980,30 +1166,40 @@ impl App {
             Some((note, true)) => line.push(text(note.clone()).size(11).color(RED).width(Length::Fill)),
             _ => line.push(horizontal_space()),
         };
-        if l.job.is_some() {
-            line = line.push(btn("Cancel", LlmMsg::Cancel, button::secondary, !l.cancel_wanted));
-        } else if l.stalled.is_some() {
+        if l.job().is_some() {
+            line = line.push(btn("Cancel", LlmMsg::Cancel, button::secondary, !l.cancel_asked()));
+        } else if l.stalled().is_some() {
             line = line.push(btn("Resume", LlmMsg::Resume, button::primary, true)).push(btn("Discard", LlmMsg::Cancel, button::secondary, true));
         }
         if let Some(run) = running {
             if !run.matches(&l.cfg.resolved(l.hw.as_ref())) {
                 line = line.push(btn("Restart to apply", LlmMsg::Restart, button::primary, !l.busy()));
             }
-            line = line.push(btn("Stop", LlmMsg::Stop, button::danger, !l.stopping));
-        } else if l.job.is_none() {
-            let sel = self.llm_selected();
-            if l.cfg.engine_ok() && sel.as_ref().is_some_and(|p| p.exists()) {
-                line = line.push(btn("Start", LlmMsg::Start, button::success, !l.busy() && !matches!(l.seen, Some(Seen::Foreign))));
-            } else if l.stalled.is_none() && self.active_tab == Tab::Llm {
-                // Only on the LLM tab, where the list shows which model it means and
-                // how big it is. (An interrupted download has Resume and Discard.)
-                line = line.push(btn(if l.cfg.engine_ok() { "Download and start" } else { "Set up LLM" }, LlmMsg::SetUp, button::success, sel.is_some()));
+            line = line.push(btn("Stop", LlmMsg::Stop, button::danger, !l.stopping()));
+        } else if l.job().is_none() {
+            let in_motion = l.intent != Intent::None;
+            if l.ready() {
+                // The switch is on: Start starts the saved model, on any tab.
+                line = line.push(btn("Start", LlmMsg::Start, button::success, !in_motion && !matches!(l.seen, Some(Seen::Foreign))));
+            } else if l.stalled().is_none() && self.active_tab == Tab::Llm {
+                // Off or not set up: only on the LLM tab, where the list shows which
+                // model it means and how big it is. (An interrupted download has
+                // Resume and Discard.)
+                let sel = self.llm_selected();
+                let label = if !l.cfg.engine_ok() {
+                    "Set up LLM"
+                } else if sel.as_ref().is_some_and(|p| p.exists()) {
+                    "Start"
+                } else {
+                    "Download and start"
+                };
+                line = line.push(btn(label, LlmMsg::SetUp, button::success, sel.is_some() && !in_motion));
             }
         }
         line = line.push(checkbox("Only run with Sapphire", l.cfg.with_sapphire).on_toggle(|b| Message::Llm(LlmMsg::WithSapphire(b))).size(14).text_size(12));
 
         // The row's bottom edge is the download's progress.
-        let edge: Element<'_, Message> = match l.job.as_ref().and_then(|j| j.pct()) {
+        let edge: Element<'_, Message> = match l.job().and_then(|j| j.pct()) {
             Some(pct) => progress_bar(0.0..=100.0, pct as f32)
                 .height(3)
                 .style(|_t| progress_bar::Style { background: color!(0x313244).into(), bar: BLUE.into(), border: iced::Border::default() })
@@ -1041,7 +1237,7 @@ impl App {
         const SPINNER: &[&str] = &["/", "-", "\\", "|"];
         let l = &self.llm;
         let (status, c) = self.llm_status();
-        let mark = if l.job.is_some() {
+        let mark = if l.job().is_some() {
             SPINNER[self.spinner_tick % SPINNER.len()]
         } else if l.ready() {
             "+"
@@ -1050,11 +1246,11 @@ impl App {
         };
         let small = |label: &str, m: Message| button(text(label.to_string()).size(12)).on_press(m).style(button::secondary).padding([2, 10]);
         let mut r = row![text(mark).size(16).color(c).width(20), text("Local LLM (optional)").size(15)].spacing(10).align_y(iced::Alignment::Center);
-        let picking = l.job.is_none() && l.stalled.is_none();
-        if l.job.is_some() {
+        let picking = l.job().is_none() && l.stalled().is_none();
+        if l.job().is_some() {
             // Locked while it downloads: Cancel is the only way out.
             r = r.push(text(format!("— {}", status)).size(12).color(c)).push(small("Cancel", Message::Llm(LlmMsg::Cancel)));
-        } else if l.stalled.is_some() {
+        } else if l.stalled().is_some() {
             r = r
                 .push(text(format!("— {}", status)).size(12).color(c))
                 .push(small("Resume", Message::Llm(LlmMsg::Resume)))
@@ -1063,7 +1259,7 @@ impl App {
             let picks = self.llm_picks();
             // What is chosen: the default model's entry, None when there is none, or
             // (a model of your own, not on the list) its name as the placeholder.
-            let default = l.cfg.model.as_ref().filter(|m| m.exists());
+            let default = l.cfg.model.as_ref().filter(|m| m.exists() && l.cfg.is_on());
             let chosen = match default {
                 None => picks.first().cloned(),
                 Some(m) => picks.iter().find(|p| p.0.is_some_and(|i| &model_path(&l.cfg, &MODELS[i]) == m)).cloned(),
@@ -1079,6 +1275,7 @@ impl App {
             } else {
                 let hint = match &l.hw {
                     None => "Looking at this computer...",
+                    Some(_) if !self.llm_picks().iter().any(|p| p.0.is_some()) => "This computer doesn't have the memory for a local LLM.",
                     Some(hw) if hw.vram_mib == 0 => "Picking one downloads it and switches it on. No NVIDIA card seen: replies may be slow.",
                     Some(_) => "Picking one downloads it and switches it on. Runs on this computer, no key needed.",
                 };
@@ -1118,7 +1315,7 @@ impl App {
         let sel = self.llm_selected();
 
         // What a fresh setup is about to do: no surprises on a metered line.
-        if !l.cfg.engine_ok() && l.job.is_none() {
+        if !l.cfg.engine_ok() && l.job().is_none() {
             if let (Some(hw), Some(sel)) = (&l.hw, &sel) {
                 let build = pick_build(hw);
                 let engine_mb = match build {
@@ -1134,7 +1331,8 @@ impl App {
         }
         // The same for a model that isn't here yet.
         if l.cfg.engine_ok()
-            && l.job.is_none()
+            && !l.ready()
+            && l.job().is_none()
             && let Some(m) = sel.as_ref().filter(|p| !p.exists()).and_then(|p| p.file_name()).and_then(|f| curated(&f.to_string_lossy()))
         {
             col = col.push(text(format!("Download and start gets {} ({}), then starts it.", m.name, gb(m.bytes))).size(11).color(MUTED));
@@ -1239,7 +1437,7 @@ impl App {
         // Actions on the selected model, and the colour key, on one line.
         let mut foot = row![].spacing(8).align_y(iced::Alignment::Center);
         if let Some(p) = sel {
-            if !p.exists() && l.job.is_none() && l.cfg.engine_ok() {
+            if !p.exists() && l.job().is_none() && l.cfg.engine_ok() {
                 foot = foot.push(button(text("Download").size(12)).on_press(Message::Llm(LlmMsg::Download)).style(button::primary).padding([3, 12]));
             }
             if p.exists() {
@@ -1274,7 +1472,7 @@ impl App {
             col = col.push(
                 row![
                     text(format!("{} from {} ({})", file, repo, gb(*size))).size(12).width(Length::Fill),
-                    button(text("Download").size(12)).on_press_maybe((l.job.is_none()).then_some(Message::Llm(LlmMsg::ByoDownload))).style(button::primary).padding([3, 12]),
+                    button(text("Download").size(12)).on_press_maybe((l.job().is_none()).then_some(Message::Llm(LlmMsg::ByoDownload))).style(button::primary).padding([3, 12]),
                 ]
                 .spacing(8)
                 .align_y(iced::Alignment::Center),
@@ -1289,7 +1487,7 @@ impl App {
         let mut erow = row![text("llama.cpp").size(13).width(110), text(engine).size(12).color(MUTED)].spacing(8).align_y(iced::Alignment::Center);
         if l.cfg.engine_ok() {
             erow = erow.push(match &l.newer {
-                Some(tag) => button(text(format!("Update to {}", tag)).size(12)).on_press_maybe(l.job.is_none().then_some(Message::Llm(LlmMsg::UpdateEngine))).style(button::primary).padding([3, 12]),
+                Some(tag) => button(text(format!("Update to {}", tag)).size(12)).on_press_maybe(l.job().is_none().then_some(Message::Llm(LlmMsg::UpdateEngine))).style(button::primary).padding([3, 12]),
                 None => button(text("Check for update").size(12)).on_press(Message::Llm(LlmMsg::CheckEngine)).style(button::secondary).padding([3, 12]),
             });
         }
@@ -1314,7 +1512,7 @@ impl App {
             .width(Length::Fill)
             .into()
         } else {
-            checkbox("Start the LLM when I sign in", l.autostart).on_toggle(|b| Message::Llm(LlmMsg::Autostart(b))).size(14).text_size(13).into()
+            checkbox("Start the LLM when I sign in", l.cfg.at_sign_in).on_toggle(|b| Message::Llm(LlmMsg::Autostart(b))).size(14).text_size(13).into()
         };
         col = col.push(row![text("At sign-in").size(13).width(110), sign_in].spacing(8).align_y(iced::Alignment::Center));
 
@@ -1322,12 +1520,12 @@ impl App {
         let mut mrow = row![
             text("Models folder").size(13).width(110),
             text(gguf_dir(&l.cfg).display().to_string()).size(12).color(MUTED).width(Length::Fill),
-            button(text("Change").size(12)).on_press_maybe(l.job.is_none().then_some(Message::Llm(LlmMsg::ModelsBrowse))).style(button::secondary).padding([3, 12]),
+            button(text("Change").size(12)).on_press_maybe(l.job().is_none().then_some(Message::Llm(LlmMsg::ModelsBrowse))).style(button::secondary).padding([3, 12]),
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
         if l.cfg.models_dir.is_some() {
-            mrow = mrow.push(button(text("Use default").size(12)).on_press_maybe(l.job.is_none().then_some(Message::Llm(LlmMsg::ModelsDir(None)))).style(button::secondary).padding([3, 12]));
+            mrow = mrow.push(button(text("Use default").size(12)).on_press_maybe(l.job().is_none().then_some(Message::Llm(LlmMsg::ModelsDir(None)))).style(button::secondary).padding([3, 12]));
         }
         col = col.push(mrow);
 

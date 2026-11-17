@@ -40,7 +40,7 @@ impl App {
         let browse_btn = button("Browse").on_press_maybe((!frozen).then_some(Message::BrowsePath));
 
         // At-a-glance: does the chosen folder actually hold a Sapphire install?
-        let (hint_txt, hint_color) = match install_kind(&self.install_path) {
+        let (hint_txt, hint_color) = match self.kind {
             InstallKind::Sapphire => ("installed", color!(0x4caf50)),
             InstallKind::Unfinished => ("unfinished", color!(0xf9e154)),
             InstallKind::Other => ("not Sapphire", color!(0xf9e154)),
@@ -86,7 +86,7 @@ impl App {
             header = header.push(badge);
         }
 
-        if self.sapphire_stopping {
+        if self.run.stopping() {
             let stopping_btn = button(text("Stopping...").font(Font {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
@@ -94,12 +94,13 @@ impl App {
             .style(button::secondary);
 
             header = header.push(stopping_btn);
-        } else if self.sapphire_running {
-            let open_btn = button(text("Open Browser").font(Font {
+        } else if self.run.up() {
+            // Lit only once her page answers: before that it leads to an error page.
+            let open_btn = button(text(if self.web_ready { "Open Browser" } else { "Starting..." }).font(Font {
                 weight: iced::font::Weight::Bold,
                 ..Font::DEFAULT
             }))
-            .on_press(Message::OpenBrowser)
+            .on_press_maybe(self.web_ready.then_some(Message::OpenBrowser))
             .style(button::primary);
 
             let stop_label = if self.is_armed(Arm::Sweep) { "Click to confirm" } else { "Stop" };
@@ -138,7 +139,7 @@ impl App {
         let mut col = Column::new().spacing(6).width(Length::Fill);
 
         if let Some(b) = self.pending_branch {
-            let what = if self.sapphire_running {
+            let what = if self.run.up() {
                 format!("Switch this install to {}? This stops Sapphire, swaps her code and installs the packages it needs.", b)
             } else {
                 format!("Switch this install to {}? This swaps her code and installs the packages it needs.", b)
@@ -169,7 +170,7 @@ impl App {
                 line = line.push(button(text("Go to that folder").size(12)).on_press_maybe((!self.path_frozen()).then_some(Message::PathChanged(target))).style(button::secondary).padding([3, 10]));
             }
             #[cfg(windows)]
-            if looks_like_install(&self.install_path) {
+            if self.kind == InstallKind::Sapphire {
                 line = line.push(button(text("Use this folder").size(12)).on_press(Message::AutostartRepoint).style(button::primary).padding([3, 10]));
             }
             col = col.push(line);
@@ -196,7 +197,7 @@ impl App {
     // ── Tab bar ────────────────────────────────────────────────────────────
 
     fn view_tab_bar(&self) -> Element<'_, Message> {
-        let running_label = if self.sapphire_running { "Log *" } else { "Log" };
+        let running_label = if self.run.up() { "Log *" } else { "Log" };
         let mut tabs = row![
             self.tab_button("Install", Tab::Install),
             self.tab_button("Update", Tab::Update),
@@ -210,7 +211,7 @@ impl App {
         // Autostart tab: shown when autostart is set up OR Sapphire is installed (so an
         // orphaned setup stays removable after an uninstall). Linux = systemd unit;
         // Windows = our autostart marker file (autostart.on) existing.
-        let main_py = PathBuf::from(&self.install_path).join("main.py").exists();
+        let main_py = self.kind == InstallKind::Sapphire;
         #[cfg(not(windows))]
         let show_autostart = self.service.is_some() || main_py;
         #[cfg(windows)]
@@ -329,7 +330,7 @@ impl App {
 
         // Before any slow step: this folder can't take a clone, or she has packages open.
         let clone_blocked = clone_blocker(&self.install_path).is_some();
-        let she_is_up = self.sapphire_running || self.sapphire_stopping;
+        let she_is_up = self.run.up() || self.run.stopping();
         let can_go = self.idle() && !clone_blocked && !she_is_up;
 
         let mut buttons_row = row![].spacing(10);
@@ -393,7 +394,7 @@ impl App {
 
         let update_label = if self.op == Op::Updating {
             "Updating..."
-        } else if self.sapphire_running || self.sapphire_stopping {
+        } else if self.run.up() || self.run.stopping() {
             "Stop & Update"
         } else {
             "Update"
@@ -446,7 +447,7 @@ impl App {
     fn view_uninstall_tab(&self) -> Element<'_, Message> {
         // Nothing here runs while she is up: a live Sapphire rewrites credentials.json
         // from memory, and deleting folders under her is how installs get half-eaten.
-        let blocked = self.sapphire_running || self.sapphire_stopping;
+        let blocked = self.run.up() || self.run.stopping();
         let busy = !self.idle() || blocked;
         let armed_red = color!(0xe74c3c);
 
@@ -544,9 +545,9 @@ impl App {
         let llm_row = llm_root.exists().then(|| {
             let armed = self.is_armed(Arm::LlmRemove);
             let why = if self.llm.running().is_some() {
-                Some("Stop the LLM first (LLM tab).")
-            } else if self.llm.job.is_some() {
-                Some("Wait for the LLM download to finish, or cancel it on the LLM tab.")
+                Some("Stop the LLM first (its bar, under the header).")
+            } else if self.llm.job().is_some() {
+                Some("Wait for the LLM download to finish, or cancel it on its bar under the header.")
             } else {
                 None
             };
@@ -622,7 +623,7 @@ impl App {
         let mut checks_col = Column::new().spacing(8);
         // Fixes pip-install into her env: one at a time, and only while she is down
         // (Windows keeps the files she has open locked — half-installed packages).
-        let fix_blocked = self.ts_running || !self.idle() || self.sapphire_running;
+        let fix_blocked = self.ts_running || !self.idle() || self.run.up();
         let mut any_fixable = false;
 
         for (check, status) in &self.ts_checks {
@@ -679,10 +680,10 @@ impl App {
         }
 
         let check_btn = button(text("Check Sapphire"))
-            .on_press_maybe(if self.ts_running || (self.op == Op::Fixing) { None } else { Some(Message::TroubleshootCheck) })
+            .on_press_maybe(if self.ts_running || !matches!(self.op, Op::Idle | Op::Scanning) { None } else { Some(Message::TroubleshootCheck) })
             .style(button::primary);
 
-        let note = if any_fixable && (self.sapphire_running || self.sapphire_stopping) {
+        let note = if any_fixable && (self.run.up() || self.run.stopping()) {
             "Stop Sapphire to install or repair packages."
         } else {
             ""
@@ -803,12 +804,12 @@ impl App {
             return col
                 .push(divider())
                 .push(remove_btn)
-                .push(text("Backs up the unit to sapphire.service.bak, then deletes it.").size(11).color(muted))
+                .push(text("Keeps a backup copy of the unit, then deletes it.").size(11).color(muted))
                 .into();
         }
 
         // ── Pre-install view: no unit yet ───────────────────────────────────
-        let main_py = PathBuf::from(&self.install_path).join("main.py").exists();
+        let main_py = self.kind == InstallKind::Sapphire;
         let env_py = sapphire_env_python();
         let installed = main_py && env_py.is_some();
 
@@ -832,7 +833,7 @@ impl App {
         // Not mid-install (it'd point at a half-installed Sapphire), and not while she
         // is running: `enable --now` would start a twin under the one we follow, wipe
         // her log and leave the first one orphaned when the window closes.
-        let running = self.sapphire_running || self.sapphire_stopping;
+        let running = self.run.up() || self.run.stopping();
         let can_enable = self.systemd_available && installed && self.idle() && !running;
         let enable_btn = button(text("Enable Sapphire service").font(bold))
             .on_press_maybe(if can_enable { Some(Message::ServiceInstall) } else { None })
@@ -877,7 +878,7 @@ impl App {
         let enabled = crate::platform::autostart_marker_path().exists();
 
         if enabled {
-            let (run_txt, run_color) = if self.sapphire_running {
+            let (run_txt, run_color) = if self.run.up() {
                 ("running", color!(0x4caf50))
             } else {
                 ("stopped", muted)
@@ -901,7 +902,7 @@ impl App {
         }
 
         // Not set up yet.
-        let installed = PathBuf::from(&self.install_path).join("main.py").exists()
+        let installed = self.kind == InstallKind::Sapphire
             && crate::platform::sapphire_pythonw().is_some();
         let (mark, c, t) = if installed {
             ("[ok]", color!(0x4caf50), format!("Sapphire install: found at {}", self.install_path))
@@ -929,8 +930,8 @@ impl App {
     }
 
     fn view_running_tab(&self) -> Element<'_, Message> {
-        let status_text = if self.sapphire_running {
-            let words = self.attached.as_ref().map_or_else(|| "Sapphire is running".to_string(), |i| i.describe());
+        let status_text = if self.run.up() {
+            let words = self.run.instance().map_or_else(|| "Sapphire is running".to_string(), |i| i.describe());
             text(words).size(13).color(color!(0x4caf50))
         } else if self.sapphire_log.is_empty() {
             text("Hit Launch to start Sapphire.").size(13).color(color!(0x7f849c))
@@ -1004,7 +1005,12 @@ impl App {
             .style(button::text)
             .padding([2, 8]);
 
-        let mut panel = column![toggle].spacing(2).width(Length::Fill);
+        // The whole log, for a support chat: what is on screen is only its tail.
+        let copy = button(text("Copy log").size(12))
+            .on_press(Message::CopyLauncherLog)
+            .style(button::text)
+            .padding([2, 8]);
+        let mut panel = column![row![toggle, copy].spacing(4)].spacing(2).width(Length::Fill);
 
         if self.log_visible {
             // Tail only — keep redraw cheap as the launcher log grows.

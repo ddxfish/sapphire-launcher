@@ -94,25 +94,22 @@ pub(crate) fn systemd_user_available() -> bool {
 #[cfg(windows)]
 pub(crate) fn systemd_user_available() -> bool { false }
 
-/// Create + enable the systemd --user unit so Sapphire starts at sign-in.
-/// Runs the env python directly (no wrapper); references an optional EnvironmentFile
-/// so the env-vars textarea can drop keys in later without touching the unit.
+/// The unit's text. systemd reads these values with its own rules, so paths are
+/// never pasted in raw: `%` starts a specifier everywhere (`%%` is a literal one),
+/// and ExecStart is split on spaces, so its program is quoted with C-style escapes
+/// (`$` is left alone: systemd never expands variables in the program's own path,
+/// checked with `systemd-analyze verify`). WorkingDirectory and EnvironmentFile
+/// take the rest of the line.
+///
+/// 43 = another Sapphire already holds this user/ (lock or port), 44 = config
+/// error: a restart would just loop, so neither counts as a failure to retry.
+/// 120 s stop timeout: longer than the runner's own 90 s child-kill, so systemd
+/// never SIGKILLs a stop that is still winding down.
 #[cfg(not(windows))]
-pub(crate) async fn install_service(install_path: String) -> (String, bool) {
-    let Some(py) = sapphire_env_python() else {
-        return ("Couldn't find the Sapphire environment's Python — install Sapphire first.".to_string(), false);
-    };
-    let home = std::env::var("HOME").unwrap_or_default();
-    let unit_dir = format!("{}/.config/systemd/user", home);
-    let env_file = format!("{}/.config/sapphire/service.env", home);
-    if let Err(e) = tokio::fs::create_dir_all(&unit_dir).await {
-        return (format!("Couldn't create {}: {}", unit_dir, e), false);
-    }
-    // 43 = another Sapphire already holds this user/ (lock or port), 44 = config
-    // error: a restart would just loop, so neither counts as a failure to retry.
-    // 120 s stop timeout: longer than the runner's own 90 s child-kill, so systemd
-    // never SIGKILLs a stop that is still winding down.
-    let unit = format!(
+pub(crate) fn unit_text(install: &str, py: &str, env_file: &str) -> String {
+    let plain = |p: &str| p.replace('%', "%%");
+    let quoted = |p: &str| format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%"));
+    format!(
         "[Unit]\n\
          Description=Sapphire AI\n\
          After=network.target\n\n\
@@ -128,11 +125,57 @@ pub(crate) async fn install_service(install_path: String) -> (String, bool) {
          EnvironmentFile=-{env}\n\n\
          [Install]\n\
          WantedBy=default.target\n",
-        wd = install_path, py = py, env = env_file,
-    );
-    let unit_path = format!("{}/sapphire.service", unit_dir);
-    if let Err(e) = tokio::fs::write(&unit_path, unit).await {
-        return (format!("Couldn't write {}: {}", unit_path, e), false);
+        wd = plain(install), py = quoted(py), env = plain(env_file),
+    )
+}
+
+/// A copy of the unit before it is changed or deleted, under a name that holds
+/// nothing else: `.bak`, then `.bak.2`, `.bak.3`... An earlier backup is somebody's
+/// only copy of their own unit and is never written over. A unit that one of them
+/// already holds word for word is not copied again. Returns where the copy is.
+#[cfg(not(windows))]
+pub(crate) fn back_up_unit(unit: &std::path::Path) -> std::io::Result<PathBuf> {
+    let text = std::fs::read(unit)?;
+    let name = |n: u32| PathBuf::from(if n == 1 { format!("{}.bak", unit.display()) } else { format!("{}.bak.{}", unit.display(), n) });
+    let mut n = 1;
+    loop {
+        let bak = name(n);
+        match std::fs::read(&bak) {
+            Ok(have) if have == text => return Ok(bak),
+            Ok(_) => n += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::copy(unit, &bak)?;
+                return Ok(bak);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Create + enable the systemd --user unit so Sapphire starts at sign-in.
+/// Runs the env python directly (no wrapper); references an optional EnvironmentFile
+/// so the env-vars textarea can drop keys in later without touching the unit.
+#[cfg(not(windows))]
+pub(crate) async fn install_service(install_path: String) -> (String, bool) {
+    let Some(py) = sapphire_env_python() else {
+        return ("Couldn't find the Sapphire environment's Python — install Sapphire first.".to_string(), false);
+    };
+    // The folder as the system knows it: a unit takes absolute paths only, and the
+    // path box holds whatever was typed.
+    let Ok(install) = std::fs::canonicalize(&install_path) else {
+        return (format!("Couldn't find the folder {}.", install_path), false);
+    };
+    let unit_path = unit_path();
+    // A unit already there is somebody's work (and one that fails to load reads as
+    // "no unit" to us): a copy is kept, or nothing is written.
+    if unit_path.exists()
+        && let Err(e) = back_up_unit(&unit_path)
+    {
+        return (format!("There is already a unit at {}, and it couldn't be backed up, so nothing was changed: {}", unit_path.display(), e), false);
+    }
+    let unit = unit_text(&install.to_string_lossy(), &py, &service_env_path().to_string_lossy());
+    if let Err(e) = write_atomic(&unit_path, &unit, false) {
+        return (format!("Couldn't write {}: {}", unit_path.display(), e), false);
     }
     let _ = run_cmd_full_async("systemctl".into(), vec!["--user".into(), "daemon-reload".into()]).await;
     match run_cmd_full_async("systemctl".into(), vec!["--user".into(), "enable".into(), "--now".into(), "sapphire".into()]).await {
@@ -252,20 +295,24 @@ pub(crate) fn repoint_autostart(install: &str) -> String {
     }
 }
 
-/// Stop, disable, back up (.bak), and delete the systemd --user unit.
+/// Stop, disable, back up, and delete the systemd --user unit.
 #[cfg(not(windows))]
 pub(crate) async fn remove_service() -> (String, bool) {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let unit_path = format!("{}/.config/systemd/user/sapphire.service", home);
+    let unit_path = unit_path();
     let _ = run_cmd_full_async("systemctl".into(), vec!["--user".into(), "disable".into(), "--now".into(), "sapphire".into()]).await;
-    if tokio::fs::metadata(&unit_path).await.is_ok() {
-        let _ = tokio::fs::copy(&unit_path, format!("{}.bak", unit_path)).await;
-        if let Err(e) = tokio::fs::remove_file(&unit_path).await {
-            return (format!("Disabled, but couldn't delete {}: {}", unit_path, e), false);
+    let mut kept = String::new();
+    if unit_path.exists() {
+        // No copy, no delete: "kept a copy" has to be true.
+        match back_up_unit(&unit_path) {
+            Ok(bak) => kept = format!(" (kept a copy at {})", bak.display()),
+            Err(e) => return (format!("Disabled, but the unit couldn't be backed up, so it was left where it is ({}): {}", unit_path.display(), e), false),
+        }
+        if let Err(e) = std::fs::remove_file(&unit_path) {
+            return (format!("Disabled, but couldn't delete {}: {}", unit_path.display(), e), false);
         }
     }
     let _ = run_cmd_full_async("systemctl".into(), vec!["--user".into(), "daemon-reload".into()]).await;
-    ("Service stopped, disabled, and removed (kept a .bak copy).".to_string(), true)
+    (format!("Service stopped, disabled, and removed{}.", kept), true)
 }
 /// Windows: disable autostart. Unregisters the logon task (admin → UAC) and clears our
 /// "enabled" marker.
@@ -583,7 +630,7 @@ pub(crate) async fn check_unit() -> Option<UnitIssues> {
     (!issues.is_empty()).then_some(issues)
 }
 
-/// Add the missing lines to the unit file (backup `.bak` first) and daemon-reload.
+/// Add the missing lines to the unit file (a backup copy first) and daemon-reload.
 /// Only touches a unit inside the user's home — anything else is told, not edited.
 #[cfg(not(windows))]
 pub(crate) async fn patch_unit(fragment: String, lines: Vec<&'static str>) -> (String, bool) {
@@ -595,14 +642,15 @@ pub(crate) async fn patch_unit(fragment: String, lines: Vec<&'static str>) -> (S
         Ok(t) => t,
         Err(e) => return (format!("Couldn't read {}: {}", fragment, e), false),
     };
-    if let Err(e) = tokio::fs::copy(&fragment, format!("{}.bak", fragment)).await {
-        return (format!("Couldn't back up {}: {}", fragment, e), false);
-    }
+    let bak = match back_up_unit(std::path::Path::new(&fragment)) {
+        Ok(bak) => bak,
+        Err(e) => return (format!("Couldn't back up {}: {}", fragment, e), false),
+    };
     if let Err(e) = tokio::fs::write(&fragment, add_service_lines(&text, &lines)).await {
         return (format!("Couldn't write {}: {}", fragment, e), false);
     }
     match run_cmd_full_async("systemctl".into(), vec!["--user".into(), "daemon-reload".into()]).await {
-        Ok(_) => (format!("Service file updated (added {}; backup at {}.bak).", lines.join(" and "), fragment), true),
+        Ok(_) => (format!("Service file updated (added {}; backup at {}).", lines.join(" and "), bak.display()), true),
         Err(e) => (format!("Service file updated, but daemon-reload failed: {}", e), false),
     }
 }
@@ -616,27 +664,26 @@ pub(crate) async fn read_env_file(path: String) -> String {
 /// Write the unit's EnvironmentFile (chmod 600 — it can hold API keys).
 #[cfg(not(windows))]
 pub(crate) async fn write_env_file(path: String, content: String) -> bool {
-    if let Some(dir) = std::path::Path::new(&path).parent()
-        && tokio::fs::create_dir_all(dir).await.is_err()
-    {
-        return false;
-    }
-    if tokio::fs::write(&path, content).await.is_err() { return false; }
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    true
+    // Born 0600 and renamed into place: never half-written, never world-readable.
+    tokio::task::spawn_blocking(move || write_atomic(std::path::Path::new(&path), &content, true).is_ok()).await.unwrap_or(false)
 }
 
 /// Run a command, streaming each output line into `sink` (drained to the launcher
 /// log by the Tick handler). Spin-safe: a normal awaited future, not a Task::stream.
-/// Returns Ok("") on success (lines already shown live) / Err(reason) on failure.
+/// Returns Ok("") on success (lines already shown live). Err = "exit code N", then
+/// the command's own last lines: what `explain_failure` reads. Never shown raw.
 pub(crate) async fn run_cmd_streamed(
     program: String,
     args: Vec<String>,
     cwd: Option<String>,
     sink: Arc<std::sync::Mutex<Vec<String>>>,
 ) -> Result<String, String> {
-    async fn pump(r: impl tokio::io::AsyncRead + Unpin, sink: Arc<std::sync::Mutex<Vec<String>>>) {
+    // The command's own last lines, kept apart from `sink`: the window drains the
+    // sink five times a second, and the sink is shared with whatever ran before.
+    // A failure is explained from THIS command's ending, nothing else.
+    type Tail = Arc<std::sync::Mutex<std::collections::VecDeque<String>>>;
+    const TAIL_LINES: usize = 40;
+    async fn pump(r: impl tokio::io::AsyncRead + Unpin, sink: Arc<std::sync::Mutex<Vec<String>>>, tail: Tail) {
         use tokio::io::AsyncBufReadExt;
         let mut reader = BufReader::new(r);
         let mut buf = Vec::new();
@@ -645,7 +692,14 @@ pub(crate) async fn run_cmd_streamed(
             let mut s = String::from_utf8_lossy(&buf).into_owned();
             if let Some(i) = s.rfind('\r') { s = s[i + 1..].to_string(); }
             buf.clear();
-            if let Ok(mut v) = sink.lock() { v.push(format!("  {}", strip_ansi(&s))); }
+            let line = strip_ansi(&s);
+            if let Ok(mut t) = tail.lock() {
+                if t.len() == TAIL_LINES {
+                    t.pop_front();
+                }
+                t.push_back(line.clone());
+            }
+            if let Ok(mut v) = sink.lock() { v.push(format!("  {}", line)); }
         }
     }
 
@@ -660,17 +714,27 @@ pub(crate) async fn run_cmd_streamed(
         .env("CONDA_PLUGINS_AUTO_ACCEPT_TOS", "yes"); // see run_cmd_full_async
     if let Some(d) = cwd { cmd.current_dir(d); }
     #[cfg(windows)]
-    { cmd.creation_flags(CREATE_NO_WINDOW); }
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        // pip needs git by name for a `git+https` requirement (see path_with_git).
+        if let Some(path) = path_with_git() {
+            cmd.env("PATH", path);
+        }
+    }
 
     let mut child = cmd.spawn().map_err(|e| e.to_string())?;
     let so = child.stdout.take().unwrap();
     let se = child.stderr.take().unwrap();
-    let a = tokio::spawn(pump(so, sink.clone()));
-    let b = tokio::spawn(pump(se, sink.clone()));
+    let tail: Tail = Default::default();
+    let a = tokio::spawn(pump(so, sink.clone(), tail.clone()));
+    let b = tokio::spawn(pump(se, sink.clone(), tail.clone()));
     let (_, _, status) = tokio::join!(a, b, child.wait());
     match status {
         Ok(s) if s.success() => Ok(String::new()),
-        Ok(s) => Err(format!("exit code {}", s.code().unwrap_or(-1))),
+        Ok(s) => {
+            let said = tail.lock().map(|t| t.iter().cloned().collect::<Vec<_>>().join("\n")).unwrap_or_default();
+            Err(format!("exit code {}\n{}", s.code().unwrap_or(-1), said))
+        }
         Err(e) => Err(e.to_string()),
     }
 }
@@ -799,6 +863,10 @@ fn spawn_detached(
         // the runner and everything it spawned; hidden console so nothing flashes —
         // and that console is hers, so it stays when the launcher closes.
         cmd.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
+        // She gets a PATH with git on it even when Git was installed this session.
+        if let Some(path) = path_with_git() {
+            cmd.env("PATH", path);
+        }
     }
     #[cfg(unix)]
     {
@@ -1192,6 +1260,50 @@ mod tail_tests {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn a_unit_backup_never_writes_over_an_earlier_one() {
+        let dir = std::env::temp_dir().join(format!("sl-test-unit-bak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let unit = dir.join("sapphire.service");
+        let read = |p: &std::path::Path| std::fs::read_to_string(p).unwrap();
+        // Somebody's own unit: Remove keeps it as .bak.
+        std::fs::write(&unit, "theirs").unwrap();
+        let first = back_up_unit(&unit).unwrap();
+        assert_eq!(first, dir.join("sapphire.service.bak"));
+        // Enable writes ours, Remove backs that up: their copy must still be there.
+        std::fs::write(&unit, "ours").unwrap();
+        let second = back_up_unit(&unit).unwrap();
+        assert_eq!(second, dir.join("sapphire.service.bak.2"));
+        assert_eq!(read(&first), "theirs", "the only copy of a hand-written unit was written over");
+        assert_eq!(read(&second), "ours");
+        // The same text again makes no third file, whichever backup holds it.
+        assert_eq!(back_up_unit(&unit).unwrap(), second);
+        std::fs::write(&unit, "theirs").unwrap();
+        assert_eq!(back_up_unit(&unit).unwrap(), first);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3);
+        // No unit: an error, so the caller changes nothing.
+        std::fs::remove_file(&unit).unwrap();
+        assert!(back_up_unit(&unit).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn the_unit_survives_awkward_paths() {
+        let plain = unit_text("/home/k/sapphire", "/home/k/miniconda3/envs/sapphire/bin/python", "/home/k/.config/sapphire/service.env");
+        assert!(plain.contains("WorkingDirectory=/home/k/sapphire\n"));
+        assert!(plain.contains("ExecStart=\"/home/k/miniconda3/envs/sapphire/bin/python\" main.py\n"));
+        assert!(plain.contains("EnvironmentFile=-/home/k/.config/sapphire/service.env\n"));
+        // A space would split ExecStart and `%` starts a specifier; `$` in the
+        // program's path is literal to systemd.
+        let odd = unit_text("/home/krem b/100% hers", "/home/krem b/my $envs/bin/python", "/home/krem b/.config/sapphire/service.env");
+        assert!(odd.contains("WorkingDirectory=/home/krem b/100%% hers\n"), "{}", odd);
+        assert!(odd.contains("ExecStart=\"/home/krem b/my $envs/bin/python\" main.py\n"), "{}", odd);
+        assert!(odd.contains("EnvironmentFile=-/home/krem b/.config/sapphire/service.env\n"), "{}", odd);
+    }
     use futures::StreamExt;
     use std::time::Duration;
 

@@ -39,14 +39,47 @@ fn conda_roots() -> Vec<PathBuf> {
     roots
 }
 
-/// A file inside the sapphire env (`<root>/envs/sapphire/<rel>`), from the first conda
-/// root that has it. None = no env anywhere we know of.
+/// Where conda itself says the sapphire env is, once it has been asked (every scan
+/// asks). conda does not always put an env under its own root: a machine-wide
+/// install the user can't write to gets its envs in the user's `.conda` folder.
+static ENV_PREFIX: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Remember conda's answer (None = it has no such env).
+pub(crate) fn set_env_prefix(prefix: Option<PathBuf>) {
+    if let Ok(mut p) = ENV_PREFIX.lock() {
+        *p = prefix;
+    }
+}
+
+/// `conda env list --json` → the folder of the env called sapphire.
+pub(crate) fn conda_env_prefix(json: &str) -> Option<PathBuf> {
+    let v: serde_json::Value = serde_json::from_str(&json[json.find('{')?..]).ok()?;
+    v.get("envs")?.as_array()?.iter().filter_map(|e| e.as_str()).map(PathBuf::from)
+        .find(|p| p.file_name().is_some_and(|n| n.eq_ignore_ascii_case("sapphire")))
+}
+
+/// Every folder the sapphire env could be in, most trusted first: conda's own
+/// answer, each known root's `envs`, then conda's per-user fallback.
+fn sapphire_env_dirs() -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = ENV_PREFIX.lock().ok().and_then(|p| p.clone()).into_iter().collect();
+    dirs.extend(conda_roots().into_iter().map(|r| r.join("envs").join("sapphire")));
+    let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
+    if !home.is_empty() {
+        dirs.push(PathBuf::from(home).join(".conda").join("envs").join("sapphire"));
+    }
+    dirs
+}
+
+/// A file inside the sapphire env, from the first place that has it. None = no env
+/// anywhere we know of. One answer for python, pip, pythonw and the unit's ExecStart.
 fn sapphire_env_file(rel: &str) -> Option<String> {
-    conda_roots()
-        .into_iter()
-        .map(|r| r.join("envs").join("sapphire").join(rel))
-        .find(|p| p.exists())
-        .map(|p| p.to_string_lossy().into_owned())
+    sapphire_env_dirs().into_iter().map(|d| d.join(rel)).find(|p| p.exists()).map(|p| p.to_string_lossy().into_owned())
+}
+
+/// The env's folder, if its python is there.
+pub(crate) fn sapphire_env_dir() -> Option<PathBuf> {
+    let rel = if cfg!(windows) { "python.exe" } else { "bin/python" };
+    sapphire_env_dirs().into_iter().find(|d| d.join(rel).exists())
 }
 
 /// Absolute path to the sapphire env's python (for a systemd ExecStart). None if
@@ -220,10 +253,73 @@ pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
+/// Rename, patiently: on Windows a scanner, a sync client or another reader can
+/// hold the target for a moment, and that moment must not lose the write.
+pub(crate) fn rename_retry(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let mut last = std::fs::rename(from, to);
+    for _ in 0..5 {
+        if last.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        last = std::fs::rename(from, to);
+    }
+    last
+}
+
+/// The one way a file of ours is written: whole or not at all. `private` = it can
+/// hold secrets (API keys), so it is never readable by anyone else, not even for
+/// the moment between being written and being renamed into place.
+pub(crate) fn write_atomic(path: &std::path::Path, text: &str, private: bool) -> std::io::Result<()> {
+    use std::io::Write;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // A tmp name of this write's own (process, then a count within it): two
+    // writers sharing one would rename a half-written file into place.
+    static NTH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nth = NTH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = PathBuf::from(format!("{}.{}-{}.tmp", path.display(), std::process::id(), nth));
+    let _ = std::fs::remove_file(&tmp); // a leftover (a recycled pid's) would keep its old permissions
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::OpenOptionsExt;
+        open.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    let _ = private; // a Windows profile folder is already the user's alone
+    let done = open.open(&tmp).and_then(|mut f| f.write_all(text.as_bytes())).and_then(|_| rename_retry(&tmp, path));
+    if done.is_err() {
+        let _ = std::fs::remove_file(&tmp); // never left lying about
+    }
+    done
+}
+
+/// Where the systemd --user unit lives (`$XDG_CONFIG_HOME/systemd/user`, as systemd
+/// itself reads it), and the file its EnvironmentFile= names. One answer for the
+/// writer, the remover and the LLM watcher's look at the unit.
+#[cfg(not(windows))]
+pub(crate) fn unit_path() -> PathBuf {
+    app_config_dir().with_file_name("systemd").join("user").join("sapphire.service")
+}
+#[cfg(not(windows))]
+pub(crate) fn service_env_path() -> PathBuf {
+    app_config_dir().join("service.env")
+}
+
 /// Written before an update changes anything and removed once its packages are in:
 /// a launcher opening with this file finds new code on old packages.
 pub(crate) fn update_marker_path() -> PathBuf {
     app_config_dir().join("update-unfinished")
+}
+
+/// Write the marker for this install. False = it couldn't be written, and a crash
+/// from here on would leave no trace that an update stopped halfway.
+pub(crate) fn mark_update_unfinished(install: &str) -> bool {
+    let _ = std::fs::create_dir_all(app_config_dir());
+    std::fs::write(update_marker_path(), install).is_ok()
 }
 
 /// Did an update on this install stop partway?
@@ -260,12 +356,7 @@ pub(crate) fn write_run_state(path: &std::path::Path, st: &RunState) -> std::io:
         Origin::Elsewhere => "elsewhere",
     };
     let json = serde_json::json!({ "pid": st.pid, "log": st.log.to_string_lossy(), "by": by, "started": st.started, "install": st.install });
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, format!("{:#}\n", json))?;
-    std::fs::rename(&tmp, path)
+    write_atomic(path, &format!("{:#}\n", json), false)
 }
 
 /// Read the handshake. Forgiving: anything odd is "no handshake".
@@ -658,18 +749,34 @@ pub(crate) fn signal_stop(pid: u32) -> bool {
             SetConsoleCtrlHandler, SetStdHandle, CTRL_BREAK_EVENT, STD_ERROR_HANDLE,
             STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
         };
+        // The console and the std handles belong to the whole process: two stops
+        // overlapping here would detach each other's console and restore dead handles.
+        static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _turn = ONE_AT_A_TIME.lock();
+        // While attached, this process is on her console too. Ctrl+Break goes to her
+        // process group, but a pid that leads no group (she was started by hand in a
+        // terminal, or through `conda run`) may be treated as "everyone on this
+        // console", and the default answer to Ctrl+Break is to exit: the launcher
+        // would close on its own Stop. So the launcher answers every console event
+        // itself with "handled". The null handler would only cover Ctrl+C.
+        unsafe extern "system" fn handled(_event: u32) -> i32 {
+            1
+        }
         // SAFETY: plain Win32 calls against our own process; the only pointer argument
-        // is the null handler (None), which is the documented "ignore Ctrl+C" form.
+        // is `handled`, a function that lives as long as the program.
         unsafe {
             let std_ids = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
             let saved = std_ids.map(|id| GetStdHandle(id));
             FreeConsole();
             let mut sent = false;
             if AttachConsole(pid) != 0 {
-                SetConsoleCtrlHandler(None, 1);
+                // Off, then on: registered exactly once however many stops there
+                // were, and left on (the event arrives on its own thread, perhaps
+                // after this function has returned).
+                SetConsoleCtrlHandler(Some(handled), 0);
+                SetConsoleCtrlHandler(Some(handled), 1);
                 sent = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) != 0;
                 FreeConsole();
-                SetConsoleCtrlHandler(None, 0);
             }
             for (id, h) in std_ids.into_iter().zip(saved) {
                 SetStdHandle(id, h);
@@ -685,37 +792,83 @@ pub(crate) fn signal_stop(pid: u32) -> bool {
     }
 }
 
-/// Hard stop — the fallback when `signal_stop` can't be sent or Sapphire ignores it.
-/// With a pid: her tree / process group, precisely. Without one (pid 0: an old core
-/// started elsewhere, nothing to name): sweep every sapphire-env python — a user's
-/// own script in that env too, which is why the sweep is the last resort only.
+/// Hard stop of a pid we can name — the fallback when `signal_stop` can't be sent
+/// or Sapphire ignores it: her tree / process group, precisely. Pid 0 names nobody
+/// and does nothing here; with no pid to name, the caller asks for `sweep_sapphire`.
 pub(crate) fn kill_process_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
     #[cfg(windows)]
     {
-        if pid > 0 {
-            let _ = hidden_cmd("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
-            return;
+        let _ = hidden_cmd("taskkill").args(["/F", "/T", "/PID", &pid.to_string()]).output();
+    }
+    #[cfg(not(windows))]
+    {
+        // Her whole group (she leads one when we started her), child STT/TTS
+        // workers too; the runner alone otherwise. Direct syscalls — see signal_group.
+        if !signal_group(pid, libc::SIGKILL) {
+            signal_one(pid, libc::SIGKILL);
         }
-        // Sweep every Sapphire-env interpreter — BOTH python.exe AND pythonw.exe (an
-        // old autostart shim runs her under pythonw). Matching by an env-path substring
-        // covers miniconda3/anaconda3/Anaconda3 variants. This kills main.py too, so its
-        // supervisor can't relaunch sapphire.py. Uses CIM, not the deprecated wmic
-        // (removed-by-default on Win11 24H2+).
+    }
+}
+
+/// Every process that is her, by the one test used everywhere (`pid_look`: her
+/// env's python, running main.py or sapphire.py), read from /proc. Never this
+/// process, never pid 1, and never another user's (their /proc entries don't open).
+#[cfg(not(windows))]
+pub(crate) fn her_pids() -> Vec<u32> {
+    let me = std::process::id();
+    let Ok(procs) = std::fs::read_dir("/proc") else { return Vec::new() };
+    procs
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid > 1 && *pid != me && pid_look(*pid) == Some(true))
+        .collect()
+}
+
+/// Stop a Sapphire nobody can name (an old core started elsewhere, found on the web
+/// port only), the last resort. `force` = she ignored the polite ask.
+///
+/// Linux: each of `her_pids`, one direct signal each, and `signal_one` checks the
+/// pid again at the moment of sending. Not `pkill -f <pattern>`: that signalled
+/// anything whose command line merely contained her env's path (an editor on a file
+/// in it, a `watch`, a debugger) and could never escalate.
+/// Windows: every python in her env by its image path, a user's own script in that
+/// env too, which is why the window asks first.
+pub(crate) fn sweep_sapphire(force: bool) {
+    #[cfg(windows)]
+    {
+        let _ = force; // Stop-Process is the only tool here, and it is always a hard stop
+        // BOTH python.exe AND pythonw.exe (an old autostart shim runs her under
+        // pythonw). Matching by an env-path substring covers the miniconda3/anaconda3
+        // variants. This ends main.py too, so its supervisor can't relaunch
+        // sapphire.py. CIM, not the deprecated wmic (gone by default on Win11 24H2+).
         let ps = "Get-CimInstance Win32_Process -Filter \"Name='python.exe' OR Name='pythonw.exe'\" | Where-Object { $_.ExecutablePath -like '*\\envs\\sapphire\\*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
         let _ = hidden_cmd("powershell").args(["-NoProfile", "-Command", ps]).output();
     }
     #[cfg(not(windows))]
+    for pid in her_pids() {
+        signal_one(pid, if force { libc::SIGKILL } else { libc::SIGTERM });
+    }
+}
+
+/// Make this process's standard handles non-inheritable (Windows). A headless run
+/// started with its output captured would otherwise pass the caller's pipe on to
+/// every child it starts (handles are inherited wholesale there), and the caller
+/// would wait for llama-server or a download to end before seeing end-of-output.
+pub(crate) fn no_inherit_std() {
+    #[cfg(windows)]
     {
-        if pid > 0 {
-            // Her whole group (she leads one when we started her), child STT/TTS
-            // workers too; the runner alone otherwise. Direct syscalls — see signal_group.
-            if !signal_group(pid, libc::SIGKILL) {
-                signal_one(pid, libc::SIGKILL);
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+        // SAFETY: plain Win32 calls on this process's own handles; a null or invalid
+        // handle makes the call fail harmlessly.
+        unsafe {
+            for id in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+                SetHandleInformation(GetStdHandle(id), HANDLE_FLAG_INHERIT, 0);
             }
-            return;
         }
-        // Sweep any stray python running the sapphire env (started outside us, no pid known).
-        let _ = hidden_cmd("pkill").args(["-TERM", "-f", "envs/sapphire/bin/python"]).output();
     }
 }
 
@@ -762,87 +915,241 @@ pub(crate) const CREATE_NO_WINDOW: u32 = 0x08000000;
 pub(crate) const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
 
 
-/// Run a command on a background thread so it doesn't freeze the UI.
-pub(crate) async fn run_cmd_async(program: String, args: Vec<String>) -> Result<String, String> {
-    let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new(&program);
-        cmd.args(&args);
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        cmd.output()
-            .map(|out| {
-                let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                if out.status.success() {
-                    Ok(stdout)
-                } else if stderr.is_empty() {
-                    Err(format!("Exit code {}", out.status.code().unwrap_or(-1)))
-                } else {
-                    Err(stderr)
-                }
-            })
-            .unwrap_or_else(|e| Err(e.to_string()))
-    })
-    .await;
-    result.map_err(|e| e.to_string())?
+/// What a command did. `code` is None when it was ended (its deadline, a signal).
+#[derive(Debug, Default)]
+pub(crate) struct Ran {
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    /// Its deadline passed and it was ended: `stdout`/`stderr` hold what it had said.
+    pub timed_out: bool,
 }
 
+impl Ran {
+    pub(crate) fn ok(&self) -> bool {
+        self.code == Some(0)
+    }
 
+    /// stdout then stderr, as one text for the log.
+    pub(crate) fn both(&self) -> String {
+        format!("{}{}", self.stdout, self.stderr).trim().to_string()
+    }
+}
 
-
-/// Run a command on a background thread, returning combined stdout+stderr for logging.
-/// Conda's terms-of-service gate (2025-07) would otherwise stall `conda create` on a
-/// pre-existing conda with no terminal to say yes in; the variable is harmless elsewhere.
-pub(crate) async fn run_cmd_full_async(program: String, args: Vec<String>) -> Result<String, String> {
-    let result: Result<Result<String, String>, _> = tokio::task::spawn_blocking(move || {
-        let mut cmd = Command::new(&program);
-        // GIT_TERMINAL_PROMPT: with no terminal, a credentials prompt would hang forever.
-        cmd.args(&args).env("CONDA_PLUGINS_AUTO_ACCEPT_TOS", "yes").env("GIT_TERMINAL_PROMPT", "0");
-        #[cfg(target_os = "windows")]
-        {
-            use std::os::windows::process::CommandExt;
-            cmd.creation_flags(CREATE_NO_WINDOW);
+/// The one way a command is run to completion: off the UI thread, no window, stdin
+/// closed, and never left waiting on a prompt nobody can see. Err = it couldn't be
+/// started.
+///
+/// The child is ours to end: when `limit` passes it is killed, and so it is when
+/// the caller stops waiting (a `tokio::time::timeout` round this future, a dropped
+/// Task). A timeout that walks away from a live `python` leaves it holding the
+/// env's files, which is how a later pip fails on Windows.
+pub(crate) async fn run(program: &str, args: &[String], limit: Option<std::time::Duration>) -> Result<Ran, String> {
+    use tokio::io::AsyncReadExt;
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        // Conda's terms-of-service gate (2025-07) would stall `conda create` with no
+        // terminal to say yes in; a git credentials prompt would hang forever.
+        .env("CONDA_PLUGINS_AUTO_ACCEPT_TOS", "yes")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        // Tools answer in English: a few of their sentences are still read here
+        // (git's "would be overwritten"), and the log is what support is shown.
+        // Messages only; the text encoding stays the user's.
+        .env("LC_MESSAGES", "C")
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        if let Some(path) = path_with_git() {
+            cmd.env("PATH", path);
         }
-        match cmd.output() {
-            Ok(out) => {
-                let stdout = String::from_utf8_lossy(&out.stdout).to_string();
-                let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-                let combined = format!("{}{}", stdout, stderr).trim().to_string();
-                if out.status.success() {
-                    Ok(combined)
-                } else {
-                    Err(combined)
+    }
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let (mut so, mut se) = (child.stdout.take(), child.stderr.take());
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let work = async {
+        let read_out = async {
+            if let Some(s) = so.as_mut() {
+                let _ = s.read_to_end(&mut out).await;
+            }
+        };
+        let read_err = async {
+            if let Some(s) = se.as_mut() {
+                let _ = s.read_to_end(&mut err).await;
+            }
+        };
+        tokio::join!(read_out, read_err, child.wait()).2
+    };
+    let status = match limit {
+        Some(d) => tokio::time::timeout(d, work).await.ok(),
+        None => Some(work.await),
+    };
+    let timed_out = status.is_none();
+    if timed_out {
+        let _ = child.start_kill();
+        let _ = child.wait().await;
+    }
+    let code = match status {
+        Some(Ok(s)) => s.code(),
+        Some(Err(e)) => return Err(e.to_string()),
+        None => None,
+    };
+    Ok(Ran { code, stdout: String::from_utf8_lossy(&out).into_owned(), stderr: String::from_utf8_lossy(&err).into_owned(), timed_out })
+}
+
+/// A command's stdout when it succeeds; else its stderr (or its exit code).
+pub(crate) async fn run_cmd_async(program: String, args: Vec<String>) -> Result<String, String> {
+    let ran = run(&program, &args, None).await?;
+    let stderr = ran.stderr.trim();
+    if ran.ok() {
+        Ok(ran.stdout.trim().to_string())
+    } else if stderr.is_empty() {
+        Err(format!("Exit code {}", ran.code.unwrap_or(-1)))
+    } else {
+        Err(stderr.to_string())
+    }
+}
+
+/// A command's stdout+stderr, for the log: Ok when it succeeded, Err when it didn't.
+pub(crate) async fn run_cmd_full_async(program: String, args: Vec<String>) -> Result<String, String> {
+    let ran = run(&program, &args, None).await?;
+    if ran.ok() { Ok(ran.both()) } else { Err(ran.both()) }
+}
+
+/// Is anything listening on this local port? A plain connect, no process: what the
+/// idle polls ask first, so a closed port costs nothing more.
+pub(crate) fn port_open(port: u16) -> bool {
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).is_ok()
+}
+
+/// `GET http://127.0.0.1:<port><path>`, in-process, and the reply's body. None =
+/// nothing answered within `secs`. Plain HTTP only (the LLM's own server); enough
+/// of the protocol for a small JSON reply, which is all that is asked of it.
+pub(crate) fn local_get(port: u16, path: &str, secs: u64) -> Option<String> {
+    use std::io::{Read, Write};
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let limit = std::time::Duration::from_secs(secs);
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(300)).ok()?;
+    stream.set_read_timeout(Some(limit)).ok()?;
+    stream.set_write_timeout(Some(limit)).ok()?;
+    // One write, so the request leaves as one piece: a server that answers and
+    // closes after its first read would otherwise reset the connection under us.
+    let request = format!("GET {} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAccept: application/json\r\nConnection: close\r\n\r\n", path, port);
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut reply = Vec::new();
+    // A reply cut short by the timeout still counts for what arrived.
+    let _ = stream.take(1 << 20).read_to_end(&mut reply);
+    let reply = String::from_utf8_lossy(&reply);
+    let (_, body) = reply.split_once("\r\n\r\n")?;
+    Some(body.to_string())
+}
+
+// ── Graphics cards ─────────────────────────────────────────────────────────
+
+/// One NVIDIA card, as nvidia-smi describes it. The one reader for the torch
+/// step, the LLM's build choice and the Troubleshoot line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Card {
+    pub name: String,
+    /// Total memory in MiB (0 = the driver wouldn't say).
+    pub vram_mib: u64,
+    /// The driver's major version: 581 of "581.15".
+    pub driver: u32,
+    /// Compute capability x10: 75 for 7.5 (None = a driver too old to report it).
+    pub cap10: Option<u32>,
+}
+
+/// What nvidia-smi is asked, newest first: an older driver rejects `compute_cap`.
+const CARD_ASKS: [&str; 2] = ["name,memory.total,driver_version,compute_cap", "name,memory.total,driver_version"];
+
+/// One line per card from either ask in `CARD_ASKS` (csv, no header, no units).
+/// A row counts only when its driver version reads as one, so nvidia-smi's own
+/// complaints ("has failed because...", "not a valid field") are never a card.
+pub(crate) fn parse_cards(out: &str) -> Vec<Card> {
+    out.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split(',').map(str::trim).collect();
+            if !(3..=4).contains(&f.len()) || f[0].is_empty() {
+                return None;
+            }
+            let driver = f[2].split('.').next()?.parse().ok()?;
+            let cap10 = f.get(3).and_then(|c| {
+                let (maj, min) = c.split_once('.')?;
+                Some(maj.parse::<u32>().ok()? * 10 + min.parse::<u32>().ok()?.min(9))
+            });
+            Some(Card { name: f[0].to_string(), vram_mib: f[1].parse().unwrap_or(0), driver, cap10 })
+        })
+        .collect()
+}
+
+/// Every NVIDIA card nvidia-smi can see; empty = none, no driver, or a driver that
+/// didn't answer. Each ask gets fifteen seconds and is then ended, and a wedged
+/// driver is not asked twice.
+pub(crate) async fn nvidia_cards() -> Vec<Card> {
+    for fields in CARD_ASKS {
+        let args = [format!("--query-gpu={}", fields), "--format=csv,noheader,nounits".to_string()];
+        match run("nvidia-smi", &args, Some(std::time::Duration::from_secs(15))).await {
+            Ok(ran) if ran.timed_out => break,
+            Ok(ran) if ran.ok() => {
+                let cards = parse_cards(&ran.stdout);
+                if !cards.is_empty() {
+                    return cards;
                 }
             }
-            Err(e) => Err(e.to_string()),
+            _ => {}
         }
-    })
-    .await;
-    result.map_err(|e| e.to_string())?
+    }
+    Vec::new()
 }
 
+/// The card everything is chosen for: the newest generation, then the most memory,
+/// whatever slot it sits in.
+pub(crate) fn best_card(cards: &[Card]) -> Option<&Card> {
+    cards.iter().max_by_key(|c| (c.cap10.unwrap_or(0), c.vram_mib))
+}
 
-/// Run a command, returning its exit code and combined output even when it fails.
-/// Err = it couldn't be started at all. For tools whose numeric code is the contract.
-#[cfg_attr(not(windows), allow(dead_code))]
-pub(crate) async fn run_cmd_code(program: String, args: Vec<String>) -> Result<(i32, String), String> {
-    tokio::task::spawn_blocking(move || {
-        let mut cmd = hidden_cmd(&program);
-        cmd.args(&args);
-        let out = cmd.output().map_err(|e| e.to_string())?;
-        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
-        Ok((out.status.code().unwrap_or(-1), text.trim().to_string()))
-    })
-    .await
-    .map_err(|e| e.to_string())?
+/// Where git is, remembered once found: this is asked before every git call, and
+/// looking means a process (`which`, `where`) each time. Not found is not
+/// remembered: Go may install it a minute from now.
+pub(crate) fn find_git() -> String {
+    static FOUND: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+    if let Ok(found) = FOUND.lock()
+        && let Some(p) = found.as_ref().filter(|p| PathBuf::from(p).exists())
+    {
+        return p.clone();
+    }
+    let p = locate_git();
+    if p != "git"
+        && let Ok(mut found) = FOUND.lock()
+    {
+        *found = Some(p.clone());
+    }
+    p
+}
+
+/// Windows: the PATH to give a child, with Git's folder in it. None = it is there
+/// already, or there is no git to add. winget installs Git during this very
+/// session and our own PATH is from before that, so a child that looks git up by
+/// name (pip, for a plugin fetched with `git+https`; Sapphire herself) would not
+/// find the git that is now there.
+#[cfg(windows)]
+pub(crate) fn path_with_git() -> Option<std::ffi::OsString> {
+    let git = PathBuf::from(find_git());
+    let dir = git.parent().filter(|d| d.is_absolute())?.to_path_buf();
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    if std::env::split_paths(&path).any(|p| p.as_os_str().eq_ignore_ascii_case(dir.as_os_str())) {
+        return None;
+    }
+    std::env::join_paths(std::iter::once(dir).chain(std::env::split_paths(&path))).ok()
 }
 
 /// Find git executable on disk (Linux: rely on PATH).
 #[cfg(not(windows))]
-pub(crate) fn find_git() -> String {
+fn locate_git() -> String {
     if let Ok(out) = std::process::Command::new("which").arg("git").output()
         && out.status.success()
     {
@@ -856,7 +1163,7 @@ pub(crate) fn find_git() -> String {
 
 /// Find git executable on disk
 #[cfg(windows)]
-pub(crate) fn find_git() -> String {
+fn locate_git() -> String {
     let home = std::env::var("USERPROFILE").unwrap_or_default();
     let common_paths = [
         "C:\\Program Files\\Git\\cmd\\git.exe".to_string(),
@@ -922,6 +1229,136 @@ pub(crate) fn find_conda_pip() -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_command_past_its_deadline_is_ended_and_keeps_what_it_said() {
+        let limit = Some(std::time::Duration::from_millis(400));
+        let started = std::time::Instant::now();
+        let ran = run("sh", &["-c".to_string(), "echo $$; exec sleep 30".to_string()], limit).await.unwrap();
+        assert!(ran.timed_out && ran.code.is_none() && !ran.ok());
+        assert!(started.elapsed().as_secs() < 10, "it came back at the deadline, not at the sleep's end");
+        let pid: u32 = ran.stdout.trim().parse().expect("what it printed before the deadline is kept");
+        assert!(!std::path::Path::new(&format!("/proc/{}", pid)).exists(), "and it is gone, not left running");
+        // The same when the caller is the one who stops waiting.
+        let note = std::env::temp_dir().join(format!("sapphire-launcher-test-{}-runner.pid", std::process::id()));
+        let _ = std::fs::remove_file(&note);
+        let script = format!("echo $$ > '{}'; exec sleep 30", note.display());
+        let waited = tokio::time::timeout(std::time::Duration::from_millis(400), run_cmd_full_async("sh".into(), vec!["-c".into(), script])).await;
+        assert!(waited.is_err());
+        let pid: u32 = std::fs::read_to_string(&note).unwrap().trim().parse().unwrap();
+        for _ in 0..50 {
+            if !std::path::Path::new(&format!("/proc/{}/cmdline", pid)).exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+        let left = std::fs::read_to_string(format!("/proc/{}/stat", pid)).unwrap_or_default();
+        assert!(left.is_empty() || left.contains(") Z "), "a dropped wait ends its child too: {}", left);
+        // And the plain shapes.
+        assert_eq!(run_cmd_async("sh".into(), vec!["-c".into(), "echo out; echo err >&2".into()]).await, Ok("out".to_string()));
+        assert_eq!(run_cmd_async("sh".into(), vec!["-c".into(), "echo err >&2; exit 3".into()]).await, Err("err".to_string()));
+        assert_eq!(run_cmd_async("sh".into(), vec!["-c".into(), "exit 3".into()]).await, Err("Exit code 3".to_string()));
+        assert_eq!(run_cmd_full_async("sh".into(), vec!["-c".into(), "echo out; echo err >&2; exit 1".into()]).await, Err("out\nerr".to_string()));
+        assert!(run("no-such-program-anywhere", &[], None).await.is_err());
+    }
+
+    #[test]
+    fn conda_says_where_the_env_is() {
+        // Wherever conda put it: its own root, or the user's .conda when the root isn't theirs.
+        let listed = r#"{"envs": ["/opt/conda", "/opt/conda/envs/other", "/home/k/.conda/envs/sapphire"]}"#;
+        assert_eq!(conda_env_prefix(listed), Some(PathBuf::from("/home/k/.conda/envs/sapphire")));
+        // A warning before the JSON, a path with a space and an accent, capitals.
+        let odd = "WARNING: something\n{\"envs\": [\"/home/José Núñez/miniconda3\", \"/home/José Núñez/miniconda3/envs/Sapphire\"]}";
+        assert_eq!(conda_env_prefix(odd), Some(PathBuf::from("/home/José Núñez/miniconda3/envs/Sapphire")));
+        assert_eq!(conda_env_prefix(r#"{"envs": ["/opt/conda", "/opt/conda/envs/sapphire-old"]}"#), None);
+        assert_eq!(conda_env_prefix("conda: command not found"), None);
+        assert_eq!(conda_env_prefix(""), None);
+    }
+
+    #[test]
+    fn a_file_is_written_whole_and_a_private_one_is_born_private() {
+        let dir = std::env::temp_dir().join(format!("sapphire-launcher-test-{}-atomic", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join("deep").join("keys.env");
+        write_atomic(&file, "A=1\n", true).unwrap();
+        write_atomic(&file, "A=2\n", true).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "A=2\n");
+        let left: Vec<_> = std::fs::read_dir(file.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 1, "no tmp left behind: {:?}", left);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+            let open = dir.join("open.json");
+            write_atomic(&open, "{}", false).unwrap();
+            assert_ne!(std::fs::metadata(&open).unwrap().permissions().mode() & 0o077, 0, "an ordinary file keeps the usual permissions");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// NEVER run plainly: on a box with a live Sapphire this would stop her. It is
+    /// for a dry run with the kill syscalls blocked, to read what would be sent:
+    /// `strace -f -e trace=kill,tgkill,tkill,pidfd_send_signal -e inject=kill,tgkill,tkill,pidfd_send_signal:error=EPERM <test binary> --ignored --exact platform::tests::sweep_dry_run_under_strace_only`
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "signals real processes: strace-inject only"]
+    fn sweep_dry_run_under_strace_only() {
+        assert_eq!(std::env::var("SAPPHIRE_SWEEP_DRY_RUN").as_deref(), Ok("kill-is-blocked"), "refusing: see the comment above");
+        eprintln!("her_pids = {:?}", her_pids());
+        sweep_sapphire(false);
+        sweep_sapphire(true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_sweep_names_only_her_own_processes() {
+        // Read-only: who WOULD be swept. Never this test, never init, and nothing
+        // that merely mentions her env's path on its command line.
+        let dir = std::env::temp_dir().join(format!("sapphire-launcher-test-{}-sweep", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut mention = std::process::Command::new("sleep").args(["30", "/home/x/miniconda3/envs/sapphire/bin/python", "main.py"])
+            .stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .spawn().unwrap();
+        let swept = her_pids();
+        let _ = mention.kill();
+        let _ = mention.wait();
+        assert!(!swept.contains(&mention.id()), "its command line names her python, but it is `sleep`");
+        assert!(!swept.contains(&std::process::id()) && !swept.contains(&1));
+        for pid in swept {
+            assert!(pid_look(pid).unwrap_or(true), "only pids that pass the identity test (or went away since)");
+        }
+    }
+
+    #[test]
+    fn nvidia_smi_rows_become_cards() {
+        // A current driver: name, memory, driver, capability.
+        let two = "NVIDIA GeForce GTX 1080, 8192, 581.15, 6.1\nNVIDIA GeForce RTX 5090, 32607, 581.15, 12.0\n";
+        let cards = parse_cards(two);
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[1], Card { name: "NVIDIA GeForce RTX 5090".into(), vram_mib: 32607, driver: 581, cap10: Some(120) });
+        // The newest card wins, whatever slot it is in; memory breaks a tie.
+        assert_eq!(best_card(&cards).map(|c| c.name.as_str()), Some("NVIDIA GeForce RTX 5090"));
+        let twins = parse_cards("RTX 3060, 12288, 581.15, 8.6\nRTX 3090, 24576, 581.15, 8.6\nRTX 3060, 12288, 581.15, 8.6");
+        assert_eq!(best_card(&twins).map(|c| c.name.as_str()), Some("RTX 3090"));
+        assert_eq!(parse_cards("NVIDIA GeForce RTX 2060, 6144, 560.94, 7.5")[0].cap10, Some(75));
+        // An older driver has no compute_cap column: still a card, capability unknown.
+        assert_eq!(parse_cards("NVIDIA GeForce GTX 970, 4096, 472.12"), vec![Card { name: "NVIDIA GeForce GTX 970".into(), vram_mib: 4096, driver: 472, cap10: None }]);
+        // Memory the driver won't give doesn't lose the card.
+        assert_eq!(parse_cards("Tesla T4, [N/A], 550.54, 7.5")[0].vram_mib, 0);
+        // nvidia-smi's own complaints are never a card.
+        for noise in [
+            "",
+            "No devices were found",
+            "Field \"compute_cap\" is not a valid field to query.",
+            "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver. Make sure that the latest NVIDIA driver is installed and running.",
+            "Unable to determine the device handle for GPU0000:01:00.0: Unknown Error, try again, later",
+        ] {
+            assert_eq!(parse_cards(noise), vec![], "{}", noise);
+        }
+        assert_eq!(best_card(&[]), None);
+    }
 
     #[test]
     fn kill_if_named_only_ever_touches_the_named_program() {

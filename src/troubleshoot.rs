@@ -26,12 +26,27 @@ pub(crate) enum TsStatus {
 
 // ── Troubleshoot checks ────────────────────────────────────────────────────
 
+/// How long any one check may take. The slow ones ask her Python about every
+/// package; five minutes is past anything a working env needs.
+const TS_CHECK_LIMIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// A check, held to `TS_CHECK_LIMIT`. Past it the check is dropped, which ends
+/// whatever command it was waiting on (see `platform::run`), and the row says so.
+pub(crate) async fn ts_within(check: TsCheck, work: impl std::future::Future<Output = (TsCheck, TsStatus)>) -> (TsCheck, TsStatus) {
+    ts_within_limit(check, work, TS_CHECK_LIMIT).await
+}
+
+async fn ts_within_limit(check: TsCheck, work: impl std::future::Future<Output = (TsCheck, TsStatus)>, limit: std::time::Duration) -> (TsCheck, TsStatus) {
+    let late = (check, TsStatus::Warning("This check didn't answer in time and was stopped. Try Check health again; if it keeps happening, restart your computer.".into()));
+    tokio::time::timeout(limit, work).await.unwrap_or(late)
+}
+
 pub(crate) async fn ts_check_running(port: u16) -> (TsCheck, TsStatus) {
     match run_cmd_full_async("curl".into(), vec![
-        "-sk".into(), "--max-time".into(), "5".into(),
+        "-sk".into(), "--noproxy".into(), "*".into(), "--max-time".into(), "5".into(),
         format!("{}/api/health", web_url(port)),
     ]).await {
-        Ok(body) if body.contains("ok") => (TsCheck::SapphireRunning, TsStatus::Ok("Sapphire is responding".into())),
+        Ok(body) if health_says_ok(&body) => (TsCheck::SapphireRunning, TsStatus::Ok("Sapphire is responding".into())),
         Ok(_) => (TsCheck::SapphireRunning, TsStatus::Problem("Sapphire responded but health check failed".into())),
         Err(_) => (TsCheck::SapphireRunning, TsStatus::Problem("Can't reach Sapphire — is it running?".into())),
     }
@@ -39,7 +54,7 @@ pub(crate) async fn ts_check_running(port: u16) -> (TsCheck, TsStatus) {
 
 pub(crate) async fn ts_check_webui(port: u16) -> (TsCheck, TsStatus) {
     match run_cmd_full_async("curl".into(), vec![
-        "-sk".into(), "--max-time".into(), "5".into(),
+        "-sk".into(), "--noproxy".into(), "*".into(), "--max-time".into(), "5".into(),
         "-o".into(), null_device().into(),
         "-w".into(), "%{http_code}".into(),
         "-L".into(), format!("{}/", web_url(port)),
@@ -96,6 +111,17 @@ pub(crate) async fn ts_check_deps(install_path: String) -> (TsCheck, TsStatus) {
     {
         return (TsCheck::DepsHealth, TsStatus::Problem(format!("Sapphire's packages need installing: {}", name_some(&missing))));
     }
+    // PyPI's CPU torch satisfies her requirements, and leaves voice on the processor.
+    // Swapping it is offered here, as a choice: it is a 2.7 GB download.
+    match gpu_torch_decision().await {
+        Some((card, TorchPlan::Swap(_) | TorchPlan::Install(_))) => {
+            return (TsCheck::DepsHealth, TsStatus::Problem(format!("The torch that can use your {} isn't installed, so her voice runs on the processor. Fix installs it (about 2.7 GB).", card)));
+        }
+        Some((card, TorchPlan::Stuck(_, why))) => {
+            return (TsCheck::DepsHealth, TsStatus::Problem(format!("The torch for your {} is installed but won't load, so her local voice is down: {} Fix reinstalls it (about 2.7 GB).", card, why)));
+        }
+        _ => {}
+    }
     // pip check exits non-zero when it finds something, so its findings can be in Err.
     let output = pip_run(vec!["check".into()]).await;
     let text = match &output {
@@ -109,35 +135,39 @@ pub(crate) async fn ts_check_deps(install_path: String) -> (TsCheck, TsStatus) {
 
 pub(crate) async fn ts_fix_deps(install_path: String, sink: Arc<std::sync::Mutex<Vec<String>>>) -> (TsCheck, String, bool) {
     let req = PathBuf::from(&install_path).join("requirements.txt");
-    let sink2 = sink.clone();
-    match pip_install_streamed(vec!["-r".into(), req.to_string_lossy().to_string()], sink).await {
-        Ok(_) => (TsCheck::DepsHealth, "Repaired! Restart Sapphire to apply.".to_string(), true),
-        Err(e) => (TsCheck::DepsHealth, pip_failure("Repair failed.", &sink2, &e), false),
+    // Fix does what the check SHOWED, in the check's own order: missing packages
+    // first, and the 2.7 GB torch swap only when torch was the problem on screen.
+    // With packages missing the row never mentioned torch, so it isn't touched: the
+    // next check offers it.
+    let who = match requirements_missing(&req).await {
+        Ok(missing) if !missing.is_empty() => Torch::Fresh,
+        _ => Torch::Repair,
+    };
+    match pip_install_requirements(&req, sink, who).await {
+        // "Repaired" is only said when the torch part, if there was one, took.
+        Ok(done) if !done.torch_ok => (TsCheck::DepsHealth, format!("Her packages are in.{}", done.note), false),
+        Ok(done) => (TsCheck::DepsHealth, format!("Repaired! Restart Sapphire to apply.{}", done.note), true),
+        Err(e) => (TsCheck::DepsHealth, plain_failure("Repair failed.", &e), false),
     }
 }
 
-/// `nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits` → one entry
-/// per GPU, e.g. "RTX 4090 (24 GB), RTX 3060 (12 GB)". None if no line parses.
-pub(crate) fn gpu_summary(output: &str) -> Option<String> {
-    let gpus: Vec<String> = output.lines().filter_map(|l| {
-        let (name, mem) = l.split_once(',')?;
-        let name = name.trim();
-        let gb = mem.trim().parse::<f64>().ok()? / 1024.0;
-        (!name.is_empty()).then(|| format!("{} ({:.0} GB)", name, gb))
-    }).collect();
-    (!gpus.is_empty()).then(|| gpus.join(", "))
+/// One entry per card: "RTX 4090 (24 GB), RTX 3060 (12 GB)". A card whose memory
+/// the driver wouldn't give is named without it.
+pub(crate) fn gpu_summary(cards: &[Card]) -> String {
+    let one = |c: &Card| match c.vram_mib {
+        0 => c.name.clone(),
+        mib => format!("{} ({:.0} GB)", c.name, mib as f64 / 1024.0),
+    };
+    cards.iter().map(one).collect::<Vec<_>>().join(", ")
 }
 
 pub(crate) async fn ts_check_gpu() -> (TsCheck, TsStatus) {
-    match run_cmd_async("nvidia-smi".into(), vec![
-        "--query-gpu=name,memory.total".into(), "--format=csv,noheader,nounits".into(),
-    ]).await {
-        Ok(output) => match gpu_summary(&output) {
-            Some(gpus) => (TsCheck::Gpu, TsStatus::Ok(format!("{} — voice features will use GPU", gpus))),
-            None => (TsCheck::Gpu, TsStatus::Ok(format!("NVIDIA GPU found: {}", output.trim()))),
-        },
-        Err(_) => (TsCheck::Gpu, TsStatus::Ok("No NVIDIA GPU found — voice features will use CPU (still works, just slower)".into())),
-    }
+    let cards = nvidia_cards().await;
+    let line = match cards.is_empty() {
+        true => "No NVIDIA GPU found — voice features will use CPU (still works, just slower)".to_string(),
+        false => format!("{} — voice features will use GPU", gpu_summary(&cards)),
+    };
+    (TsCheck::Gpu, TsStatus::Ok(line))
 }
 
 pub(crate) async fn ts_check_plugins(install_path: String) -> (TsCheck, TsStatus) {
@@ -190,7 +220,7 @@ pub(crate) async fn ts_fix_plugins(install_path: String, sink: Arc<std::sync::Mu
         let req_path = install_dir.join(file);
         if !req_path.exists() { continue; }
         if let Err(e) = pip_install_streamed(vec!["-r".into(), req_path.to_string_lossy().to_string()], sink.clone()).await {
-            return (TsCheck::Plugins, format!("Failed on {}: {}", file, e), false);
+            return (TsCheck::Plugins, plain_failure(&format!("Installing {} failed.", file), &e), false);
         }
     }
     (TsCheck::Plugins, "All optional features installed. Restart Sapphire to apply.".into(), true)
@@ -278,14 +308,24 @@ pub(crate) async fn ts_check_plugin_deps(install_path: String) -> (TsCheck, TsSt
 /// The "Install" button for plugin deps: pip-install every enabled plugin's specifiers
 /// in one call (pip skips already-satisfied ones, so we don't need to pre-filter).
 pub(crate) async fn ts_fix_plugin_deps(install_path: String, sink: Arc<std::sync::Mutex<Vec<String>>>) -> (TsCheck, String, bool) {
-    let specs: Vec<String> = enabled_plugin_deps(&install_path).await
-        .into_iter().flat_map(|(_, s)| s).collect();
-    if specs.is_empty() {
+    let plugins: Vec<(String, Vec<String>)> = enabled_plugin_deps(&install_path).await.into_iter().filter(|(_, specs)| !specs.is_empty()).collect();
+    if plugins.is_empty() {
         return (TsCheck::PluginDeps, "No plugin dependencies to install.".into(), true);
     }
-    match pip_install_streamed(specs, sink).await {
-        Ok(_) => (TsCheck::PluginDeps, "Plugin dependencies installed. Restart Sapphire to apply.".into(), true),
-        Err(e) => (TsCheck::PluginDeps, format!("Install failed: {}", e), false),
+    // One plugin at a time: a package that can't be had (one fetched with git, on a
+    // machine where git isn't reachable yet) must not keep every other plugin's out.
+    let mut failed = Vec::new();
+    let mut why = String::new();
+    for (plugin, specs) in plugins {
+        if let Err(e) = pip_install_streamed(specs, sink.clone()).await {
+            failed.push(plugin);
+            why = e;
+        }
+    }
+    if failed.is_empty() {
+        (TsCheck::PluginDeps, "Plugin dependencies installed. Restart Sapphire to apply.".into(), true)
+    } else {
+        (TsCheck::PluginDeps, plain_failure(&format!("Packages for these plugins didn't install: {}.", failed.join(", ")), &why), false)
     }
 }
 
@@ -331,16 +371,9 @@ pub(crate) fn clear_api_keys_file(path: &std::path::Path) -> String {
     }
 }
 
-/// Write via a sibling temp file + rename (never a half-written secrets file), 0600 on unix.
+/// A secrets file: whole or not at all, and never readable by anyone else.
 fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, text)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
-    std::fs::rename(&tmp, path)
+    write_atomic(path, text, true)
 }
 
 pub(crate) fn ts_label(check: TsCheck) -> &'static str {
@@ -416,12 +449,24 @@ mod tests {
         assert_eq!(deps_status("conda: command not found"), None);
     }
 
+    #[tokio::test]
+    async fn a_check_that_never_answers_is_given_up_on() {
+        let never = async {
+            std::future::pending::<()>().await;
+            (TsCheck::Gpu, TsStatus::Ok(String::new()))
+        };
+        let (check, status) = ts_within_limit(TsCheck::Gpu, never, std::time::Duration::from_millis(50)).await;
+        assert!(check == TsCheck::Gpu && matches!(status, TsStatus::Warning(w) if w.contains("didn't answer")));
+        let quick = async { (TsCheck::WebUi, TsStatus::Ok("fine".into())) };
+        assert_eq!(ts_within(TsCheck::WebUi, quick).await, (TsCheck::WebUi, TsStatus::Ok("fine".into())));
+    }
+
     #[test]
-    fn gpu_lines_parse_one_per_card() {
-        assert_eq!(gpu_summary("NVIDIA GeForce RTX 4090, 24564\n").as_deref(), Some("NVIDIA GeForce RTX 4090 (24 GB)"));
-        assert_eq!(gpu_summary("RTX 4090, 24564\nRTX 3060, 12288\n").as_deref(), Some("RTX 4090 (24 GB), RTX 3060 (12 GB)"));
-        assert_eq!(gpu_summary("No devices were found"), None);
-        assert_eq!(gpu_summary(""), None);
+    fn the_gpu_line_names_every_card() {
+        let card = |name: &str, vram_mib| Card { name: name.into(), vram_mib, driver: 581, cap10: Some(89) };
+        assert_eq!(gpu_summary(&[card("NVIDIA GeForce RTX 4090", 24564)]), "NVIDIA GeForce RTX 4090 (24 GB)");
+        assert_eq!(gpu_summary(&[card("RTX 4090", 24564), card("RTX 3060", 12288)]), "RTX 4090 (24 GB), RTX 3060 (12 GB)");
+        assert_eq!(gpu_summary(&[card("Tesla", 0)]), "Tesla", "memory the driver wouldn't give is left out");
     }
 
     const CREDS: &str = r#"{

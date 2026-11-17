@@ -84,7 +84,7 @@ impl StepStatus {
 pub(crate) async fn check_git() -> (Step, StepStatus) {
     match run_cmd_async(find_git(), vec!["--version".into()]).await {
         Ok(ver) => (Step::Git, StepStatus::Found(ver)),
-        Err(_) => (Step::Git, StepStatus::NotFound("Git not found — we'll install it".to_string())),
+        Err(_) => (Step::Git, StepStatus::NotFound(format!("Git not found — we'll install it.{}", WINDOWS_WILL_ASK))),
     }
 }
 
@@ -130,7 +130,7 @@ pub(crate) async fn check_conda() -> (Step, StepStatus) {
         // The binary is there but won't answer (a half-finished install, a broken base
         // env): still "found" — Go's installer would only say "already installed".
         Err(_) if conda != "conda" => (Step::Conda, StepStatus::Found(format!("Found at {}", conda))),
-        Err(_) => (Step::Conda, StepStatus::NotFound("Miniconda not found — we'll install it".to_string())),
+        Err(_) => (Step::Conda, StepStatus::NotFound(format!("Miniconda not found — we'll install it.{}", if cfg!(windows) { WINDOWS_WILL_ASK } else { "" }))),
     }
 }
 
@@ -138,19 +138,28 @@ pub(crate) async fn check_conda_init() -> (Step, StepStatus) {
     match run_cmd_async(find_conda(), vec!["info".into(), "--json".into()]).await {
         Ok(_) => (
             Step::CondaInit,
-            StepStatus::Found("Conda is initialized".to_string()),
+            StepStatus::Found("Conda is ready".to_string()),
         ),
         Err(_) => (
             Step::CondaInit,
-            StepStatus::NotFound("Will run conda init after install".to_string()),
+            StepStatus::NotFound("Will get conda ready after install".to_string()),
         ),
     }
 }
 
+/// Ask conda where the sapphire env is, and remember the answer for everything
+/// that needs a file inside it. Err = conda couldn't be asked.
+pub(crate) async fn find_env_prefix() -> Result<Option<PathBuf>, String> {
+    let listed = run_cmd_async(find_conda(), vec!["env".into(), "list".into(), "--json".into()]).await?;
+    let prefix = conda_env_prefix(&listed);
+    set_env_prefix(prefix.clone());
+    Ok(prefix)
+}
+
 pub(crate) async fn check_python_env() -> (Step, StepStatus) {
-    match run_cmd_async(find_conda(), vec!["env".into(), "list".into()]).await {
-        Ok(output) => {
-            if output.lines().any(|l| l.starts_with("sapphire ") || l.starts_with("sapphire\t")) {
+    match find_env_prefix().await {
+        Ok(prefix) => {
+            if prefix.is_some() {
                 (
                     Step::PythonEnv,
                     StepStatus::Found("'sapphire' environment exists".to_string()),
@@ -195,10 +204,34 @@ pub(crate) fn install_kind(path: &str) -> InstallKind {
     if git.exists() && ["main.py", "sapphire.py", "core/setup.py"].iter().all(|m| p.join(m).is_file()) {
         return InstallKind::Sapphire;
     }
-    if std::fs::read_to_string(git.join("config")).is_ok_and(|c| c.contains(SAPPHIRE_REMOTE)) {
+    if std::fs::read_to_string(git.join("config")).is_ok_and(|c| origin_url(&c).is_some_and(is_sapphire_remote)) {
         return InstallKind::Unfinished;
     }
     InstallKind::Other
+}
+
+/// `url` under `[remote "origin"]` in a `.git/config`.
+fn origin_url(config: &str) -> Option<&str> {
+    let mut in_origin = false;
+    for line in config.lines().map(str::trim) {
+        if line.starts_with('[') {
+            in_origin = line.replace(' ', "") == "[remote\"origin\"]";
+        } else if in_origin
+            && let Some((key, value)) = line.split_once('=')
+            && key.trim() == "url"
+        {
+            return Some(value.trim());
+        }
+    }
+    None
+}
+
+/// Is this URL her repo itself? The whole last two parts, so not a fork, not
+/// `sapphire.github.io.git`, and not a project that merely has her as a submodule
+/// or a second remote: being wrong here makes somebody's folder deletable.
+fn is_sapphire_remote(url: &str) -> bool {
+    let url = url.trim_end_matches('/');
+    url == SAPPHIRE_REMOTE || url.ends_with(&format!("/{}", SAPPHIRE_REMOTE)) || url.ends_with(&format!(":{}", SAPPHIRE_REMOTE))
 }
 
 /// Why Sapphire can't be cloned into this folder. Asked at scan time and again by
@@ -261,6 +294,235 @@ pub(crate) async fn pip_install_streamed(args: Vec<String>, sink: Arc<std::sync:
     base.push("install".into());
     base.extend(args);
     run_cmd_streamed(program, base, None, sink).await
+}
+
+// ── The graphics card's torch (Windows) ───────────────────────────────────
+//
+// PyPI's Windows torch has no CUDA, so on a box with a perfectly good NVIDIA card
+// her voice would quietly run on the processor. Before the requirements go in, the
+// env gets torch from PyTorch's own index when the card can use it; the
+// requirements then find `torch` already satisfied. Linux needs nothing: its PyPI
+// torch carries CUDA. The rule is core's (core/gpu_install.py), copied rather than
+// imported, because the launcher has to work against any branch of her.
+
+pub(crate) const TORCH_SPEC: &str = "torch>=2.7.0";
+
+/// Which PyTorch index fits a card, by compute capability x10 (None = a driver too
+/// old to say): below 5.0 no wheel fits; below 7.5 (Maxwell, Pascal, Volta) cu126;
+/// everything else cu128.
+pub(crate) fn torch_index(cap10: Option<u32>) -> Option<&'static str> {
+    match cap10 {
+        Some(c) if c < 50 => None,
+        Some(c) if c < 75 => Some("cu126"),
+        _ => Some("cu128"),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TorchPlan {
+    /// No card that a wheel fits, or the env's torch already has CUDA.
+    Leave,
+    /// No torch yet (a fresh env): install it from the index.
+    Install(&'static str),
+    /// A CPU build: swap it for the index's.
+    Swap(&'static str),
+    /// The card's build is installed but won't load (why). Often a swap that was cut
+    /// short; a forced reinstall is the repair.
+    Stuck(&'static str, String),
+}
+
+/// What the env says about its torch.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TorchSeen {
+    /// The installed version by its metadata ("" = not installed): "2.11.0+cu128".
+    pub version: String,
+    /// The CUDA it was built for, when it imports ("" = a CPU build). None = it didn't.
+    pub cuda: Option<String>,
+    /// It imports AND can open the card (a driver too old for its CUDA can't).
+    pub available: bool,
+    /// The last line of why it didn't import.
+    pub error: String,
+}
+
+/// One line of python, so it survives `conda run`. The version is flushed before
+/// the import: a torch that crashes the interpreter outright must not take that
+/// line with it.
+const TORCH_PROBE: &str = "import importlib.metadata as m; print('VERSION=' + m.version('torch'), flush=True); import torch; print('CUDA=' + (torch.version.cuda or '')); print('AVAILABLE=' + str(torch.cuda.is_available()))";
+
+/// Read the probe's output (stdout, then stderr, as `run_cmd_full_async` glues them).
+pub(crate) fn parse_torch_probe(out: &str) -> TorchSeen {
+    let field = |key: &str| out.lines().find_map(|l| l.trim().strip_prefix(key)).map(|v| v.trim().to_string());
+    TorchSeen {
+        version: field("VERSION=").unwrap_or_default(),
+        cuda: field("CUDA="),
+        available: field("AVAILABLE=").as_deref() == Some("True"),
+        error: out.lines().rev().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").to_string(),
+    }
+}
+
+/// What to do about torch.
+pub(crate) fn torch_plan(index: Option<&'static str>, seen: &TorchSeen) -> TorchPlan {
+    let Some(index) = index else { return TorchPlan::Leave };
+    match &seen.cuda {
+        Some(cuda) if !cuda.is_empty() => TorchPlan::Leave,
+        Some(_) => TorchPlan::Swap(index),
+        None if seen.version.is_empty() => TorchPlan::Install(index),
+        None if seen.version.contains("+cu") => TorchPlan::Stuck(index, seen.error.clone()),
+        None => TorchPlan::Swap(index),
+    }
+}
+
+/// The pip steps for a plan (each is the arguments after `pip install`). A swap is
+/// core's two steps: force torch itself with no deps, then let pip fill whatever
+/// the new wheel wants, from the same index. A stuck one is repaired the same way.
+pub(crate) fn torch_pip_steps(plan: &TorchPlan) -> Vec<Vec<String>> {
+    let base = |index: &str, extra: &[&str]| {
+        let mut v = vec!["--index-url".to_string(), format!("https://download.pytorch.org/whl/{}", index), "--progress-bar".into(), "off".into()];
+        v.extend(extra.iter().map(|s| s.to_string()));
+        v.push(TORCH_SPEC.to_string());
+        v
+    };
+    match plan {
+        TorchPlan::Leave => vec![],
+        TorchPlan::Install(i) => vec![base(i, &[])],
+        TorchPlan::Swap(i) | TorchPlan::Stuck(i, _) => vec![base(i, &["--force-reinstall", "--no-deps"]), base(i, &[])],
+    }
+}
+
+/// Ask the env about its torch. Given three minutes, then ended: an import that
+/// hangs must not hang whatever asked, nor stay alive holding torch's files. What
+/// it printed before then still counts (the version comes before the import).
+async fn env_torch() -> TorchSeen {
+    let (py, mut args) = sapphire_python_cmd();
+    args.extend(["-c".to_string(), TORCH_PROBE.to_string()]);
+    match run(&py, &args, Some(std::time::Duration::from_secs(180))).await {
+        Ok(ran) if ran.timed_out => TorchSeen { error: "python didn't answer within three minutes".into(), ..parse_torch_probe(&ran.both()) },
+        Ok(ran) => parse_torch_probe(&ran.both()),
+        Err(e) => TorchSeen { error: e, ..Default::default() },
+    }
+}
+
+/// The card and what should happen to torch for it. None = not a box this applies
+/// to (not Windows, no NVIDIA card, or one too old for any wheel): python is not
+/// even asked. `SAPPHIRE_GPU_INDEX=cu126|cu128` forces it on any box (core's testing
+/// knob, same name).
+pub(crate) async fn gpu_torch_decision() -> Option<(String, TorchPlan)> {
+    let forced = std::env::var("SAPPHIRE_GPU_INDEX").ok().and_then(|f| ["cu126", "cu128"].into_iter().find(|i| *i == f.trim().to_lowercase()));
+    if !cfg!(windows) && forced.is_none() {
+        return None;
+    }
+    let cards = nvidia_cards().await;
+    let card = best_card(&cards);
+    let index = forced.or_else(|| card.and_then(|c| torch_index(c.cap10)))?;
+    let name = card.map_or("your graphics card".to_string(), |c| c.name.clone());
+    Some((name, torch_plan(Some(index), &env_torch().await)))
+}
+
+/// Who is installing her packages, which decides how far the torch step may go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Torch {
+    /// Install, Update, branch switch: an env with no torch yet gets the card's
+    /// build straight away (one download, not PyPI's and then a swap). A torch that
+    /// is already there is left alone: swapping it is a 2.7 GB decision, and the
+    /// health check on the Troubleshoot tab is where it is offered.
+    Fresh,
+    /// The health check's Fix button: asked for, so a CPU build is swapped and a
+    /// stuck one reinstalled.
+    Repair,
+}
+
+/// What the torch step did, to be put into words once the requirements are in too.
+enum TorchDid {
+    Nothing,
+    /// It wanted the card's torch and didn't get it: the words to add.
+    Fell(String),
+    Installed(String, &'static str),
+}
+
+/// The requirements are in. `note` is a few words to add to the caller's line (""
+/// = nothing to add); `torch_ok` is false when the card's torch was wanted and is
+/// not working, which the note then explains. A fact, so nobody has to read the
+/// note to learn it.
+pub(crate) struct PipDone {
+    pub note: String,
+    pub torch_ok: bool,
+}
+
+async fn install_gpu_torch(sink: &Arc<std::sync::Mutex<Vec<String>>>, who: Torch) -> TorchDid {
+    let say = |line: String| {
+        if let Ok(mut v) = sink.lock() {
+            v.push(line);
+        }
+    };
+    let Some((name, plan)) = gpu_torch_decision().await else { return TorchDid::Nothing };
+    let index = match (&plan, who) {
+        (TorchPlan::Leave, _) => return TorchDid::Nothing,
+        (TorchPlan::Install(i), _) | (TorchPlan::Swap(i), Torch::Repair) => *i,
+        (TorchPlan::Stuck(i, why), Torch::Repair) => {
+            say(format!("[torch] The torch for {} is installed but won't load ({}). Reinstalling it.", name, why));
+            *i
+        }
+        // Not asked for here: the Troubleshoot tab's health check offers it.
+        (TorchPlan::Swap(_), Torch::Fresh) => return TorchDid::Nothing,
+        (TorchPlan::Stuck(_, why), Torch::Fresh) => {
+            say(format!("[torch] The torch for {} is installed but won't load: {}", name, why));
+            return TorchDid::Fell(format!(" Torch for {} is installed but won't load, so her local voice won't work until it is repaired (Troubleshoot, Check health, Fix).", name));
+        }
+    };
+    say(format!("[torch] {} found: installing the torch that can use it ({}, about 2.7 GB). This can take a while.", name, index));
+    for step in torch_pip_steps(&plan) {
+        let work = pip_install_streamed(step, sink.clone());
+        tokio::pin!(work);
+        let started = Instant::now();
+        // pip says nothing while it works: a line a minute shows it is alive.
+        let result = loop {
+            tokio::select! {
+                r = &mut work => break r,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(60)) => say(format!("[torch] Still working ({} min so far)...", started.elapsed().as_secs() / 60)),
+            }
+        };
+        if let Err(e) = result {
+            say(format!("[torch] {}", plain_failure("That didn't work, so her voice will run on the processor for now.", &e)));
+            return TorchDid::Fell(format!(" Torch for {} couldn't be installed, so voice runs on the processor for now (Troubleshoot, Check health, Fix tries again).", name));
+        }
+    }
+    TorchDid::Installed(name, index)
+}
+
+/// `pip install -r <requirements.txt>`, the one way every flow installs her
+/// packages: the card's torch first where that applies (see `Torch`), then the
+/// requirements. Err = the requirements themselves didn't go in.
+pub(crate) async fn pip_install_requirements(req: &std::path::Path, sink: Arc<std::sync::Mutex<Vec<String>>>, who: Torch) -> Result<PipDone, String> {
+    let did = install_gpu_torch(&sink, who).await;
+    pip_install_streamed(vec!["-r".into(), req.to_string_lossy().to_string()], sink.clone()).await?;
+    let (note, torch_ok) = match did {
+        TorchDid::Nothing => (String::new(), true),
+        TorchDid::Fell(note) => (note, false),
+        // Believe the env, and only after the requirements have had their say too.
+        TorchDid::Installed(name, index) => {
+            let now = env_torch().await;
+            let say = |line: String| {
+                if let Ok(mut v) = sink.lock() {
+                    v.push(line);
+                }
+            };
+            match now.cuda.as_deref() {
+                Some(c) if !c.is_empty() && now.available => {
+                    say(format!("[torch] Torch for {} is in ({}).", name, now.version));
+                    (format!(" Torch for {} is in ({}).", name, index), true)
+                }
+                Some(c) if !c.is_empty() => {
+                    say(format!("[torch] Torch {} is in, but it can't open {} yet. The NVIDIA driver is probably too old for CUDA {}.", now.version, name, c));
+                    (format!(" Torch for {} is in, but it can't open the card yet: update the NVIDIA driver.", name), false)
+                }
+                _ => {
+                    say(format!("[torch] It installed, but it isn't the card's build, or won't load: {} {}", now.version, now.error));
+                    (format!(" Torch for {} didn't take, so voice runs on the processor for now (Troubleshoot, Check health, Fix tries again).", name), false)
+                }
+            }
+        }
+    };
+    Ok(PipDone { note, torch_ok })
 }
 
 /// `pip show` each specifier's package; returns the specifiers whose package is NOT
@@ -350,6 +612,9 @@ pub(crate) fn explain_failure(output: &str) -> Option<&'static str> {
     } else if has(&[
         "could not resolve", "failed to connect", "timed out", "name resolution", "network is unreachable",
         "unable to access", "condahttperror", "connection broken", "getaddrinfo", "connection reset",
+        // A connection that dropped partway (flaky Wi-Fi), as git and pip put it.
+        "connection was reset", "connectionreseterror", "connection aborted", "early eof", "rpc failed",
+        "remote end hung up", "incompleteread", "not enough bytes", "could not connect",
     ]) {
         Some("Couldn't reach the internet. Check your connection, then try again.")
     } else {
@@ -362,13 +627,17 @@ pub(crate) fn plain_failure(what: &str, raw: &str) -> String {
     format!("{} {}", what, explain_failure(raw).unwrap_or("The details are in the log below."))
 }
 
-/// A failed pip's error is only its exit code; the reason is in what it streamed.
-pub(crate) fn pip_failure(what: &str, sink: &Arc<std::sync::Mutex<Vec<String>>>, err: &str) -> String {
-    let output = sink.lock().map(|v| v.join("\n")).unwrap_or_default();
-    plain_failure(what, &format!("{}\n{}", output, err))
-}
-
 // ── winget ────────────────────────────────────────────────────────────────
+
+/// Said on every step that may raise Windows' permission prompt, BEFORE it does: the
+/// prompt can open behind this window, and a step waiting on it looks frozen.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const WINDOWS_WILL_ASK: &str = " Windows may ask for permission: choose Yes.";
+
+/// How long one winget install may take before it is ended. Past any real install;
+/// what takes this long is a permission prompt nobody has seen.
+#[cfg(windows)]
+const WINGET_LIMIT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 #[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,18 +672,22 @@ async fn winget_install(step: Step, id: &str, name: &str, manual: &str) -> (Step
     let args = ["install", "--exact", "--id", id, "--source", "winget", "--accept-source-agreements", "--accept-package-agreements"]
         .iter().map(|a| a.to_string()).collect();
     let by_hand = format!("Or install {} yourself from {}, then click Re-scan.", name, manual);
-    let (code, out) = match run_cmd_code("winget".into(), args).await {
-        Ok(r) => r,
+    let args: Vec<String> = args;
+    let (code, out) = match run("winget", &args, Some(WINGET_LIMIT)).await {
+        Ok(ran) if ran.timed_out => {
+            return (step, StepStatus::Failed(format!("Installing {} didn't finish in twenty minutes. Windows was probably waiting for you to allow it: look for a flashing shield on the taskbar, choose Yes, then click Retry.", name)), ran.both());
+        }
+        Ok(ran) => (ran.code.unwrap_or(-1), ran.both()),
         Err(e) => return (step, StepStatus::Failed(format!("Windows' app installer (winget) isn't available here. Install {} from {}, then click Re-scan.", name, manual)), e),
     };
     let status = match winget_outcome(code) {
         WingetOutcome::Installed => StepStatus::Done(format!("{} installed", name)),
         WingetOutcome::AlreadyThere => StepStatus::Done(format!("{} is already installed", name)),
         WingetOutcome::RestartNeeded => StepStatus::Failed(format!("Restart your PC to finish installing {}, then open this app again.", name)),
-        WingetOutcome::Cancelled => StepStatus::Failed(format!("The {} install was cancelled. Click Retry when you're ready.", name)),
+        WingetOutcome::Cancelled => StepStatus::Failed(format!("The {} install was cancelled. Click Retry, and choose Yes when Windows asks for permission.", name)),
         WingetOutcome::NoNetwork => StepStatus::Failed(format!("Couldn't download {}. Check your connection, then click Retry. {}", name, by_hand)),
         WingetOutcome::DiskFull => StepStatus::Failed(format!("Your disk is full. Free up some space, then click Retry to install {}.", name)),
-        WingetOutcome::Failed => StepStatus::Failed(format!("Couldn't install {}. {}", name, by_hand)),
+        WingetOutcome::Failed => StepStatus::Failed(format!("Couldn't install {}. If Windows asked for permission, choose Yes and click Retry. {}", name, by_hand)),
     };
     (step, status, out)
 }
@@ -458,7 +731,7 @@ pub(crate) async fn check_vcredist() -> (Step, StepStatus) {
                 return (Step::VcRedist, StepStatus::Found("Visual C++ runtime is installed".to_string()));
             }
     }
-    (Step::VcRedist, StepStatus::NotFound("We'll install the Visual C++ runtime — Sapphire's components need it".to_string()))
+    (Step::VcRedist, StepStatus::NotFound(format!("We'll install the Visual C++ runtime — Sapphire's components need it.{}", WINDOWS_WILL_ASK)))
 }
 
 /// Windows-only: install the VC++ redistributable via winget.
@@ -483,8 +756,13 @@ pub(crate) fn system_packages_plan() -> (Vec<String>, String) {
     let hay = format!("{} {}", id, id_like);
     let v = |parts: &[&str]| parts.iter().map(|s| s.to_string()).collect::<Vec<_>>();
     if hay.contains("debian") || hay.contains("ubuntu") {
-        (v(&["apt-get", "install", "-y", "git", "libportaudio2", "python3-dev", "curl"]),
-         "sudo apt install git libportaudio2 python3-dev curl".into())
+        // The package lists first: on a fresh box they are stale or empty, and the
+        // install then fails on files that no longer exist. A refresh that fails (one
+        // dead third-party source is enough) must not stop the install: the step is
+        // judged by the install alone. And two minutes for the lock, which the
+        // system's own updater holds right after start-up.
+        (v(&["sh", "-c", "apt-get update; apt-get install -y -o DPkg::Lock::Timeout=120 git libportaudio2 python3-dev curl"]),
+         "sudo apt update; sudo apt install git libportaudio2 python3-dev curl".into())
     } else if hay.contains("fedora") || hay.contains("rhel") || hay.contains("centos") {
         (v(&["dnf", "install", "-y", "git", "portaudio", "python3-devel", "curl"]),
          "sudo dnf install git portaudio python3-devel curl".into())
@@ -492,8 +770,8 @@ pub(crate) fn system_packages_plan() -> (Vec<String>, String) {
         (v(&["pacman", "-S", "--noconfirm", "git", "portaudio", "curl"]),
          "sudo pacman -S git portaudio curl".into())
     } else if hay.contains("suse") {
-        (v(&["zypper", "install", "-y", "git", "libportaudio2", "python3-devel", "curl"]),
-         "sudo zypper install git libportaudio2 python3-devel curl".into())
+        (v(&["sh", "-c", "zypper --non-interactive refresh; zypper --non-interactive install git libportaudio2 python3-devel curl"]),
+         "sudo zypper refresh; sudo zypper install git libportaudio2 python3-devel curl".into())
     } else {
         (vec![], "install git, portaudio, python dev headers, and curl with your package manager".into())
     }
@@ -510,14 +788,20 @@ pub(crate) async fn install_git() -> (Step, StepStatus, String) {
         );
     }
     // pkexec hands off to polkit — the desktop's OWN password dialog, not ours.
-    match run_cmd_full_async("pkexec".into(), pm_args).await {
-        Ok(out) => (Step::Git, StepStatus::Done("System packages installed (git, audio libs).".to_string()), out),
-        Err(e) => (
-            Step::Git,
-            StepStatus::Failed(format!("Couldn't install system packages automatically. Run this in a terminal, then Re-scan:  {}", manual)),
-            e,
-        ),
-    }
+    let ran = match run("pkexec", &pm_args, None).await {
+        Ok(ran) => ran,
+        Err(e) => {
+            return (Step::Git, StepStatus::Failed(format!("This desktop has no password prompt to ask with (pkexec). Run this in a terminal, then Re-scan:  {}", manual)), e);
+        }
+    };
+    let status = match ran.code {
+        Some(0) => StepStatus::Done("System packages installed (git, audio libs).".to_string()),
+        // pkexec's own two codes: the prompt was closed, or the password was refused.
+        // Nothing went wrong with the install, because it never began.
+        Some(126 | 127) => StepStatus::Failed("The password prompt was closed, so nothing was installed. Click Retry and enter your password.".to_string()),
+        _ => StepStatus::Failed(format!("{} Or run this in a terminal, then Re-scan:  {}", plain_failure("Couldn't install the system packages.", &ran.both()), manual)),
+    };
+    (Step::Git, status, ran.both())
 }
 
 #[cfg(windows)]
@@ -535,7 +819,17 @@ pub(crate) async fn install_conda() -> (Step, StepStatus, String) {
         _ => "x86_64",
     };
     let url = format!("https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-{}.sh", installer_arch);
-    let tmp = std::env::temp_dir().join("miniconda-installer.sh").to_string_lossy().to_string();
+    // Into a folder made just now, ours alone: a fixed name in /tmp is one another
+    // user of this machine could have put there first, and we run what is in it.
+    let dir = std::env::temp_dir().join(format!("sapphire-launcher-{}-{}", std::process::id(), now_secs()));
+    let made = {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&dir)
+    };
+    if let Err(e) = made {
+        return (Step::Conda, StepStatus::Failed(plain_failure("Couldn't make a folder to download Miniconda into.", &e.to_string())), e.to_string());
+    }
+    let tmp = dir.join("miniconda-installer.sh").to_string_lossy().to_string();
 
     // Download with curl, fall back to wget.
     let dl = match run_cmd_full_async("curl".into(), vec!["-fsSL".into(), "-o".into(), tmp.clone(), url.clone()]).await {
@@ -543,20 +837,26 @@ pub(crate) async fn install_conda() -> (Step, StepStatus, String) {
         Err(_) => run_cmd_full_async("wget".into(), vec!["-qO".into(), tmp.clone(), url.clone()]).await,
     };
     if let Err(e) = dl {
+        let _ = std::fs::remove_dir_all(&dir);
         return (Step::Conda, StepStatus::Failed(plain_failure("Couldn't download Miniconda.", &e)), e);
     }
 
     let home = std::env::var("HOME").unwrap_or_default();
     let prefix = format!("{}/miniconda3", home);
-    match run_cmd_full_async("bash".into(), vec![tmp, "-b".into(), "-p".into(), prefix]).await {
+    let ran = run_cmd_full_async("bash".into(), vec![tmp, "-b".into(), "-p".into(), prefix.clone()]).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    // By what is on disk afterwards, not by the installer's words: "already
+    // exists" is also what it says about a folder left by an install cut short.
+    let works = PathBuf::from(&prefix).join("bin").join("conda").exists();
+    match ran {
         Ok(out) => (Step::Conda, StepStatus::Done("Miniconda installed into ~/miniconda3".to_string()), out),
-        Err(e) => {
-            if e.contains("already exists") {
-                (Step::Conda, StepStatus::Done("Miniconda already installed".to_string()), e)
-            } else {
-                (Step::Conda, StepStatus::Failed(plain_failure("Miniconda didn't install.", &e)), e)
-            }
-        }
+        Err(e) if works => (Step::Conda, StepStatus::Done("Miniconda already installed".to_string()), e),
+        Err(e) if PathBuf::from(&prefix).exists() => (
+            Step::Conda,
+            StepStatus::Failed(format!("There is already a folder at {}, but no working Miniconda in it (an earlier install cut short, most likely). Rename or delete that folder, then click Retry.", prefix)),
+            e,
+        ),
+        Err(e) => (Step::Conda, StepStatus::Failed(plain_failure("Miniconda didn't install.", &e)), e),
     }
 }
 
@@ -574,22 +874,26 @@ pub(crate) async fn install_conda_init() -> (Step, StepStatus, String) {
         ]).await;
     }
 
-    match run_cmd_full_async(conda, vec!["init".into()]).await {
-        Ok(out) => (Step::CondaInit, StepStatus::Done("Conda initialized".to_string()), out),
+    // No `conda init`: it edits the user's shell profiles (PowerShell, cmd's
+    // AutoRun, .bashrc) and nothing here needs it. conda and her python are always
+    // called by their full paths. What this step proves is that conda answers.
+    match run_cmd_full_async(conda, vec!["info".into(), "--json".into()]).await {
+        Ok(_) => (Step::CondaInit, StepStatus::Done("Conda is ready".to_string()), String::new()),
         Err(e) => (Step::CondaInit, StepStatus::Failed(plain_failure("Python setup hit a snag.", &e)), e),
     }
 }
 
 pub(crate) async fn install_python_env() -> (Step, StepStatus, String) {
     match run_cmd_full_async(find_conda(), vec!["create".into(), "-n".into(), "sapphire".into(), "python=3.11".into(), "-y".into()]).await {
-        Ok(out) => (Step::PythonEnv, StepStatus::Done("Python 3.11 environment 'sapphire' created".to_string()), out),
-        Err(e) => {
-            if e.contains("already exists") {
-                (Step::PythonEnv, StepStatus::Done("Environment 'sapphire' already exists".to_string()), e)
-            } else {
-                (Step::PythonEnv, StepStatus::Failed(plain_failure("Couldn't set up Sapphire's Python environment.", &e)), e)
-            }
+        Ok(out) => {
+            let _ = find_env_prefix().await; // where it landed, for everything after
+            (Step::PythonEnv, StepStatus::Done("Python 3.11 environment 'sapphire' created".to_string()), out)
         }
+        // It may have been there already. conda's answer decides, not its wording.
+        Err(e) => match find_env_prefix().await {
+            Ok(Some(_)) => (Step::PythonEnv, StepStatus::Done("Environment 'sapphire' already exists".to_string()), e),
+            _ => (Step::PythonEnv, StepStatus::Failed(plain_failure("Couldn't set up Sapphire's Python environment.", &e)), e),
+        },
     }
 }
 
@@ -609,6 +913,7 @@ pub(crate) async fn install_clone(install_path: String, branch: String) -> (Step
     match run_cmd_full_async(
         find_git(),
         vec![
+            GIT_NET[0].into(), GIT_NET[1].into(), GIT_NET[2].into(), GIT_NET[3].into(),
             "clone".into(),
             "--branch".into(),
             git_branch.to_string(),
@@ -641,10 +946,10 @@ pub(crate) async fn install_deps(install_path: String, sink: Arc<std::sync::Mute
     }
 
     // Stream output live so a multi-GB download (torch &c.) shows progress.
-    match pip_install_streamed(vec!["-r".into(), req_file.to_string_lossy().to_string()], sink.clone()).await {
+    match pip_install_requirements(&req_file, sink.clone(), Torch::Fresh).await {
         // lines were already streamed live → empty log_output to avoid double-printing
-        Ok(_) => (Step::Deps, StepStatus::Done("Dependencies installed".to_string()), String::new()),
-        Err(e) => (Step::Deps, StepStatus::Failed(pip_failure("Installing Sapphire's packages failed.", &sink, &e)), String::new()),
+        Ok(done) => (Step::Deps, StepStatus::Done(format!("Dependencies installed.{}", done.note).trim_end_matches('.').to_string()), String::new()),
+        Err(e) => (Step::Deps, StepStatus::Failed(plain_failure("Installing Sapphire's packages failed.", &e)), String::new()),
     }
 }
 
@@ -676,15 +981,23 @@ pub(crate) fn delete_by_rename(p: &std::path::Path) -> Result<(), String> {
 }
 
 pub(crate) async fn uninstall_conda_env() -> (String, bool) {
-    match run_cmd_full_async(find_conda(), vec!["remove".into(), "-n".into(), "sapphire".into(), "--all".into(), "-y".into()]).await {
-        Ok(out) => (format!("Removed conda environment 'sapphire'.\n{}", out), true),
+    // Where it is comes from conda's own list, and "gone" from the disk: conda's
+    // sentences for a missing env change between versions, and a conda that
+    // couldn't be run says "not found" too.
+    let prefix = match find_env_prefix().await {
+        Ok(Some(p)) => p,
+        Ok(None) => return ("Conda environment 'sapphire' doesn't exist — nothing to remove.".to_string(), true),
         Err(e) => {
-            if e.contains("does not exist") || e.contains("not found") {
-                ("Conda environment 'sapphire' doesn't exist — nothing to remove.".to_string(), true)
-            } else {
-                (format!("Failed to remove conda environment: {}", e), false)
-            }
+            return match sapphire_env_dir() {
+                Some(left) => (format!("Conda wouldn't run, so the environment at {} is still there: {}", left.display(), e), false),
+                None => ("No conda environment 'sapphire' found — nothing to remove.".to_string(), true),
+            };
         }
+    };
+    let removed = run_cmd_full_async(find_conda(), vec!["remove".into(), "-p".into(), prefix.to_string_lossy().into_owned(), "--all".into(), "-y".into()]).await;
+    match (removed, find_env_prefix().await) {
+        (Ok(out), _) | (Err(out), Ok(None)) => (format!("Removed conda environment 'sapphire'.\n{}", out), true),
+        (Err(e), _) => (format!("Failed to remove conda environment: {}", e), false),
     }
 }
 
@@ -740,10 +1053,11 @@ pub(crate) async fn check_for_updates(install_path: String, branch: Option<Branc
     // Fetch latest from remote. Offline (or a dead network) must read as "couldn't
     // check", never as "up to date" against a stale origin/ — and a hung fetch must
     // not leave the tab on "Checking..." forever.
-    let fetch = tokio::time::timeout(
-        std::time::Duration::from_secs(30),
-        run_cmd_full_async(find_git(), vec!["-C".into(), install_path.clone(), "fetch".into(), "origin".into()]),
-    ).await;
+    // The wait ending ends the fetch too (see `platform::run`), and with it the lock.
+    let fetch = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let _one_at_a_time = GIT_NET_LOCK.lock().await;
+        git_in(&install_path, &[GIT_NET[0], GIT_NET[1], GIT_NET[2], GIT_NET[3], "fetch", "origin"]).await
+    }).await;
     if !matches!(fetch, Ok(Ok(_))) {
         return None;
     }
@@ -763,9 +1077,6 @@ pub(crate) async fn check_for_updates(install_path: String, branch: Option<Branc
 // ── Launcher update check (GitHub releases) ───────────────────────────────
 
 pub(crate) const LAUNCHER_REPO: &str = "ddxfish/sapphire-launcher";
-/// While the launcher is pre-1.0 every release is a beta, so beta users should hear
-/// about the next beta. Flip to false at 1.0 to announce stable releases only.
-const INCLUDE_PRERELEASES: bool = true;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LauncherRelease {
@@ -794,25 +1105,25 @@ pub(crate) fn parse_version(tag: &str) -> Option<(u32, u32, u32)> {
     Some((major, minor, patch))
 }
 
-/// The newest non-draft release in a GitHub `/releases` listing that is newer than
-/// `local`. Drafts never count; pre-releases per INCLUDE_PRERELEASES. Tags that are
-/// not versions are skipped; a body that is not a release list → None.
+/// The newest full release in a GitHub `/releases` listing that is newer than `local`.
+/// Drafts and pre-releases never count: a pre-release is for testers who were handed
+/// its link, not something to announce to everyone. Tags that are not versions are
+/// skipped; a body that is not a release list → None.
 pub(crate) fn newer_release(json: &str, local: &str) -> Option<LauncherRelease> {
     let local_v = parse_version(local)?;
     let list: Vec<serde_json::Value> = serde_json::from_str(json).ok()?;
     let flag = |r: &serde_json::Value, key: &str| r.get(key).and_then(|b| b.as_bool()).unwrap_or(false);
     list.iter()
-        .filter(|r| !flag(r, "draft") && (INCLUDE_PRERELEASES || !flag(r, "prerelease")))
+        .filter(|r| !flag(r, "draft") && !flag(r, "prerelease"))
         .filter_map(|r| {
             let tag = r.get("tag_name")?.as_str()?;
             let url = r.get("html_url")?.as_str()?.to_string();
             let rel = LauncherRelease { version: tag.trim_start_matches(['v', 'V']).to_string(), url };
-            Some((parse_version(tag)?, !flag(r, "prerelease"), rel))
+            Some((parse_version(tag)?, rel))
         })
-        .filter(|(v, _, _)| *v > local_v)
-        // Same version as beta and final: the final wins the tie.
-        .max_by_key(|(v, is_final, _)| (*v, *is_final))
-        .map(|(_, _, rel)| rel)
+        .filter(|(v, _)| *v > local_v)
+        .max_by_key(|(v, _)| *v)
+        .map(|(_, rel)| rel)
 }
 
 /// One small GitHub API call (at startup and on the Update tab's check): is there a
@@ -839,12 +1150,30 @@ pub(crate) async fn check_launcher_release() -> LauncherCheck {
 
 // ── Update helpers ─────────────────────────────────────────────────────────
 
+/// Given to every git call that talks to the network: a connection that carries
+/// under 1 KB/s for a minute is given up on. Without it a stalled clone or pull
+/// never returns, and nothing here can cancel it.
+const GIT_NET: [&str; 4] = ["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"];
+
+/// One network git at a time in a checkout. The update check's `fetch` and an
+/// Update's `pull` both write `refs/remotes/origin/*`; run together, one fails on
+/// the other's ref lock and the user is told the update couldn't be downloaded.
+static GIT_NET_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// git, in one folder. stdout only on success: a warning on stderr must not read as
 /// a file listing.
 async fn git_in(path: &str, args: &[&str]) -> Result<String, String> {
     let mut all = vec!["-C".to_string(), path.to_string()];
     all.extend(args.iter().map(|a| a.to_string()));
     run_cmd_async(find_git(), all).await
+}
+
+/// What `update_code` did. `moved` = HEAD is not where it was: there is new code on
+/// disk, whatever else happened.
+pub(crate) struct Pulled {
+    pub msg: String,
+    pub ok: bool,
+    pub moved: bool,
 }
 
 const STASH_LABEL: &str = "sapphire-launcher: your edits from before an update";
@@ -854,16 +1183,18 @@ const STASH_LABEL: &str = "sapphire-launcher: your edits from before an update";
 /// can't be combined with the new code, the update stands, the tree is left clean so
 /// Sapphire can run, and the edits stay safe in the stash. Untracked files are never
 /// touched: a pull only trips on one the update itself would overwrite, and says so.
-pub(crate) async fn update_code(path: String, sink: Arc<std::sync::Mutex<Vec<String>>>) -> (String, bool) {
+pub(crate) async fn update_code(path: String, sink: Arc<std::sync::Mutex<Vec<String>>>) -> Pulled {
     let log = |line: String| { if let Ok(mut v) = sink.lock() { v.push(line); } };
+    let untouched = |msg: String| Pulled { msg, ok: false, moved: false };
     if git_in(&path, &["symbolic-ref", "-q", "HEAD"]).await.is_err() {
-        return ("This install isn't on a branch, so there's nothing to update from. Pick Stable or Development at the top first.".to_string(), false);
+        return untouched("This install isn't on a branch, so there's nothing to update from. Pick Stable or Development at the top first.".to_string());
     }
+    let before = git_in(&path, &["rev-parse", "HEAD"]).await.ok();
     let dirty = match git_in(&path, &["status", "--porcelain", "--untracked-files=no"]).await {
         Ok(out) => !out.trim().is_empty(),
         Err(e) => {
             log(e.clone());
-            return (plain_failure("Couldn't read this install's state, so nothing was changed.", &e), false);
+            return untouched(plain_failure("Couldn't read this install's state, so nothing was changed.", &e));
         }
     };
     if dirty {
@@ -872,19 +1203,30 @@ pub(crate) async fn update_code(path: String, sink: Arc<std::sync::Mutex<Vec<Str
             "stash", "push", "-m", STASH_LABEL]).await;
         if let Err(e) = stashed {
             log(e.clone());
-            return (plain_failure("Couldn't set your edited files aside, so nothing was changed.", &e), false);
+            return untouched(plain_failure("Couldn't set your edited files aside, so nothing was changed.", &e));
         }
     }
 
-    let pulled = run_cmd_full_async(find_git(), vec!["-C".into(), path.clone(), "pull".into(), "--ff-only".into()]).await;
+    let pulled = {
+        let _one_at_a_time = GIT_NET_LOCK.lock().await;
+        let mut args: Vec<String> = vec!["-C".into(), path.clone()];
+        args.extend(GIT_NET.iter().map(|a| a.to_string()));
+        args.extend(["pull".to_string(), "--ff-only".to_string()]);
+        run_cmd_full_async(find_git(), args).await
+    };
     if let Err(e) = &pulled {
         log(e.clone());
     }
     let restored = if dirty { restore_edits(&path, &log).await } else { Ok(()) };
+    // By where HEAD is, not by what git said: its words come in the user's language.
+    // Unknown counts as moved: the cautious answer for whoever asks "is there new
+    // code on old packages?".
+    let after = git_in(&path, &["rev-parse", "HEAD"]).await.ok();
+    let moved = before.is_none() || before != after;
 
-    match (pulled, restored) {
-        (Ok(out), Ok(())) => {
-            let done = if out.contains("Already up to date") { "Already up to date." } else { "Downloaded the latest code." };
+    let (msg, ok) = match (pulled, restored) {
+        (Ok(_), Ok(())) => {
+            let done = if moved { "Downloaded the latest code." } else { "Already up to date." };
             (format!("{}{}", done, if dirty { " Your edited files are still in place." } else { "" }), true)
         }
         (Ok(_), Err(why)) => (format!("Downloaded the latest code. {}", why), true),
@@ -903,7 +1245,8 @@ pub(crate) async fn update_code(path: String, sink: Arc<std::sync::Mutex<Vec<Str
             };
             (format!("Couldn't download the update. {}{}", cause, kept), false)
         }
-    }
+    };
+    Pulled { msg, ok, moved }
 }
 
 /// Put stashed edits back. On a conflict: the tree was clean before the pop, so
@@ -928,7 +1271,7 @@ pub(crate) fn step_label(step: Step) -> &'static str {
         #[cfg(not(windows))]
         Step::Git => "Check system packages (git, audio, curl)",
         Step::Conda => "Check for Miniconda",
-        Step::CondaInit => "Initialize conda",
+        Step::CondaInit => "Get conda ready",
         Step::PythonEnv => "Create Python environment",
         Step::Clone => "Clone Sapphire",
         #[cfg(windows)]
@@ -941,6 +1284,68 @@ pub(crate) fn step_label(step: Step) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cards_torch_follows_cores_rule() {
+        // core/gpu_install.py: below 5.0 nothing, below 7.5 cu126, else cu128.
+        assert_eq!(torch_index(Some(35)), None, "Kepler: no wheel fits");
+        assert_eq!(torch_index(Some(50)), Some("cu126"), "Maxwell");
+        assert_eq!(torch_index(Some(61)), Some("cu126"), "GTX 10-series");
+        assert_eq!(torch_index(Some(70)), Some("cu126"), "Volta");
+        assert_eq!(torch_index(Some(75)), Some("cu128"), "RTX 20-series");
+        assert_eq!(torch_index(Some(120)), Some("cu128"), "Blackwell");
+        assert_eq!(torch_index(None), Some("cu128"), "a driver too old to say");
+
+        // What the probe prints, as captured from real envs, and what is read from it.
+        let cuda_torch = parse_torch_probe("VERSION=2.11.0+cu128\nCUDA=12.8\nAVAILABLE=True\n");
+        assert_eq!(cuda_torch, TorchSeen { version: "2.11.0+cu128".into(), cuda: Some("12.8".into()), available: true, error: "AVAILABLE=True".into() });
+        let old_driver = parse_torch_probe("VERSION=2.11.0+cu128\r\nCUDA=12.8\r\nAVAILABLE=False\r\n");
+        assert!(old_driver.cuda.as_deref() == Some("12.8") && !old_driver.available, "Windows line ends, a driver too old");
+        let cpu = parse_torch_probe("VERSION=2.11.0\nCUDA=\nAVAILABLE=False");
+        assert_eq!((cpu.version.as_str(), cpu.cuda.as_deref()), ("2.11.0", Some("")));
+        let none = parse_torch_probe("Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\nimportlib.metadata.PackageNotFoundError: No package metadata was found for torch\n");
+        assert!(none.version.is_empty() && none.cuda.is_none() && none.error.contains("PackageNotFoundError"));
+        // The version is printed (and flushed) before the import that fails or crashes.
+        let broken = parse_torch_probe("VERSION=2.11.0+cu128\nTraceback (most recent call last):\nOSError: [WinError 1455] The paging file is too small\n\n");
+        assert_eq!((broken.version.as_str(), broken.cuda.clone(), broken.error.as_str()), ("2.11.0+cu128", None, "OSError: [WinError 1455] The paging file is too small"));
+        // Warnings on stderr and conda's own last line don't change the answer.
+        let noisy = parse_torch_probe("VERSION=2.11.0\nCUDA=\nAVAILABLE=False\nUserWarning: something, with, commas\nERROR conda.cli.main_run:execute(125): ...");
+        assert_eq!((noisy.version.as_str(), noisy.cuda.as_deref(), noisy.available), ("2.11.0", Some(""), false));
+        assert_eq!(torch_plan(Some("cu128"), &cuda_torch), TorchPlan::Leave);
+        assert_eq!(torch_plan(Some("cu128"), &old_driver), TorchPlan::Leave, "reinstalling can't fix a driver");
+        assert_eq!(torch_plan(Some("cu128"), &cpu), TorchPlan::Swap("cu128"));
+        assert_eq!(torch_plan(Some("cu128"), &none), TorchPlan::Install("cu128"));
+        assert_eq!(torch_plan(Some("cu128"), &broken), TorchPlan::Stuck("cu128", "OSError: [WinError 1455] The paging file is too small".into()));
+
+        // No torch: install. A CPU build: swap. CUDA already: leave.
+        let seen = |version: &str, cuda: Option<&str>, error: &str| TorchSeen { version: version.into(), cuda: cuda.map(str::to_string), available: false, error: error.into() };
+        let missing = seen("", None, "importlib.metadata.PackageNotFoundError: No package metadata was found for torch");
+        assert_eq!(torch_plan(Some("cu128"), &missing), TorchPlan::Install("cu128"));
+        assert_eq!(torch_plan(Some("cu128"), &seen("2.11.0", Some(""), "")), TorchPlan::Swap("cu128"));
+        assert_eq!(torch_plan(Some("cu128"), &seen("2.11.0+cu128", Some("12.8"), "")), TorchPlan::Leave);
+        assert_eq!(torch_plan(Some("cu128"), &seen("2.14.0+cu130", Some("13.0"), "")), TorchPlan::Leave, "a newer CUDA someone installed is theirs");
+        // A CPU build that won't even import (half-removed, a missing dependency): swap it.
+        assert_eq!(torch_plan(Some("cu126"), &seen("2.11.0", None, "ModuleNotFoundError: No module named 'torch._C'")), TorchPlan::Swap("cu126"));
+        // The card's build is there but won't load (a swap cut short, a paging file
+        // too small): its own state. Only the health check's Fix reinstalls it, by
+        // force, the way a swap goes in.
+        let stuck = seen("2.11.0+cu128", None, "OSError: [WinError 1455] The paging file is too small");
+        assert_eq!(torch_plan(Some("cu128"), &stuck), TorchPlan::Stuck("cu128", "OSError: [WinError 1455] The paging file is too small".into()));
+        assert_eq!(torch_pip_steps(&torch_plan(Some("cu128"), &stuck)), torch_pip_steps(&TorchPlan::Swap("cu128")));
+        assert_eq!(torch_plan(None, &missing), TorchPlan::Leave, "no card, or one too old: PyPI's torch is right");
+
+        // The pip steps are core's, word for word.
+        let url = "https://download.pytorch.org/whl/cu128";
+        assert_eq!(torch_pip_steps(&TorchPlan::Install("cu128")), vec![vec!["--index-url", url, "--progress-bar", "off", "torch>=2.7.0"]]);
+        assert_eq!(
+            torch_pip_steps(&TorchPlan::Swap("cu128")),
+            vec![
+                vec!["--index-url", url, "--progress-bar", "off", "--force-reinstall", "--no-deps", "torch>=2.7.0"],
+                vec!["--index-url", url, "--progress-bar", "off", "torch>=2.7.0"],
+            ]
+        );
+        assert!(torch_pip_steps(&TorchPlan::Leave).is_empty());
+    }
 
     #[test]
     fn requirement_names() {
@@ -988,13 +1393,13 @@ mod tests {
             {"tag_name":"v0.9.5","draft":false,"prerelease":false,"html_url":"https://x/old"}
         ]"#;
         let got = newer_release(listing, "0.9.6").expect("something newer than 0.9.6");
-        assert_eq!(got, LauncherRelease { version: "0.9.8-beta".into(), url: "https://x/beta".into() });
-        assert_eq!(newer_release(listing, "0.9.8"), None, "equal is not newer");
-        let tie = r#"[
-            {"tag_name":"v0.9.9-beta","draft":false,"prerelease":true,"html_url":"https://x/beta9"},
-            {"tag_name":"v0.9.9","draft":false,"prerelease":false,"html_url":"https://x/final9"}
+        assert_eq!(got, LauncherRelease { version: "0.9.7".into(), url: "https://x/stable".into() });
+        assert_eq!(newer_release(listing, "0.9.7"), None, "equal is not newer, and a pre-release is never offered");
+        let both = r#"[
+            {"tag_name":"v0.9.9","draft":false,"prerelease":true,"html_url":"https://x/alpha9"},
+            {"tag_name":"v0.9.8","draft":false,"prerelease":false,"html_url":"https://x/final8"}
         ]"#;
-        assert_eq!(newer_release(tie, "0.9.6").unwrap().url, "https://x/final9", "final beats beta at the same version");
+        assert_eq!(newer_release(both, "0.9.6").unwrap().url, "https://x/final8", "the older full release, not the newer pre-release");
         assert_eq!(newer_release(listing, "1.0.0"), None, "drafts never count");
         assert_eq!(newer_release("not json", "0.9.6"), None);
         assert_eq!(newer_release(r#"{"message":"API rate limit exceeded"}"#, "0.9.6"), None);
@@ -1073,12 +1478,12 @@ mod tests {
         assert!(!can_delete(&s(&mine)) && !looks_like_install(&s(&mine)));
         assert!(clone_blocker(&s(&mine)).is_some());
         // The launcher's own repo has "ddxfish/sapphire" in its remote, and isn't her.
-        std::fs::write(mine.join(".git/config"), "url = https://github.com/ddxfish/sapphire-launcher.git\n").unwrap();
+        std::fs::write(mine.join(".git/config"), "[remote \"origin\"]\n\turl = https://github.com/ddxfish/sapphire-launcher.git\n").unwrap();
         assert_eq!(install_kind(&s(&mine)), InstallKind::Other);
         // Our clone, cut short.
         let cut = root.join("cut");
         std::fs::create_dir_all(cut.join(".git")).unwrap();
-        std::fs::write(cut.join(".git/config"), "url = https://github.com/ddxfish/sapphire.git\n").unwrap();
+        std::fs::write(cut.join(".git/config"), "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = https://github.com/ddxfish/sapphire.git\n").unwrap();
         assert_eq!(install_kind(&s(&cut)), InstallKind::Unfinished);
         assert!(can_delete(&s(&cut)) && !looks_like_install(&s(&cut)));
         // A real checkout, fork or not.
@@ -1152,9 +1557,12 @@ mod tests {
         let Some((root, work)) = git_setup("up-ok") else { return };
         upstream_change(&root, "new.py", "news\n");
         std::fs::write(work.join("app.py"), "one\nmine\nthree\n").unwrap();
-        let (msg, ok) = update_code(work.to_string_lossy().into_owned(), sink()).await;
-        assert!(ok && msg.contains("still in place"), "{}", msg);
+        let Pulled { msg, ok, moved } = update_code(work.to_string_lossy().into_owned(), sink()).await;
+        assert!(ok && moved && msg.contains("still in place") && msg.contains("Downloaded"), "{}", msg);
         assert!(work.join("new.py").exists(), "the update landed");
+        // Again, with nothing new: said by where HEAD is, not by git's words.
+        let again = update_code(work.to_string_lossy().into_owned(), sink()).await;
+        assert!(again.ok && !again.moved && again.msg.contains("Already up to date"), "{}", again.msg);
         assert!(std::fs::read_to_string(work.join("app.py")).unwrap().contains("mine"), "the edit survived");
         assert_eq!(stashes(&work), 0);
     }
@@ -1164,8 +1572,8 @@ mod tests {
         let Some((root, work)) = git_setup("up-fail") else { return };
         std::fs::write(work.join("app.py"), "one\nmine\nthree\n").unwrap();
         std::fs::remove_dir_all(root.join("remote.git")).unwrap(); // GitHub's down
-        let (msg, ok) = update_code(work.to_string_lossy().into_owned(), sink()).await;
-        assert!(!ok && msg.contains("still in place"), "{}", msg);
+        let Pulled { msg, ok, moved } = update_code(work.to_string_lossy().into_owned(), sink()).await;
+        assert!(!ok && !moved && msg.contains("still in place"), "nothing came down, so there is no update to finish: {}", msg);
         assert!(std::fs::read_to_string(work.join("app.py")).unwrap().contains("mine"), "the edit is back");
         assert_eq!(stashes(&work), 0);
     }
@@ -1175,8 +1583,8 @@ mod tests {
         let Some((root, work)) = git_setup("up-clash") else { return };
         upstream_change(&root, "app.py", "one\ntheirs\nthree\n");
         std::fs::write(work.join("app.py"), "one\nmine\nthree\n").unwrap();
-        let (msg, ok) = update_code(work.to_string_lossy().into_owned(), sink()).await;
-        assert!(ok && msg.contains("saved in the git stash"), "{}", msg);
+        let Pulled { msg, ok, moved } = update_code(work.to_string_lossy().into_owned(), sink()).await;
+        assert!(ok && moved && msg.contains("saved in the git stash"), "{}", msg);
         let text = std::fs::read_to_string(work.join("app.py")).unwrap();
         assert!(text.contains("theirs") && !text.contains("<<<<"), "the new code, no conflict markers: {}", text);
         assert_eq!(stashes(&work), 1, "the edit is safe");
@@ -1187,8 +1595,8 @@ mod tests {
         let Some((root, work)) = git_setup("up-untracked") else { return };
         upstream_change(&root, "new.py", "news\n");
         std::fs::write(work.join("my-notes.txt"), "mine").unwrap();
-        let (msg, ok) = update_code(work.to_string_lossy().into_owned(), sink()).await;
-        assert!(ok && !msg.contains("edited"), "{}", msg);
+        let Pulled { msg, ok, moved } = update_code(work.to_string_lossy().into_owned(), sink()).await;
+        assert!(ok && moved && !msg.contains("edited"), "{}", msg);
         assert!(work.join("my-notes.txt").exists());
         assert_eq!(stashes(&work), 0);
     }
@@ -1197,8 +1605,50 @@ mod tests {
     async fn update_refuses_a_detached_install_in_plain_words() {
         let Some((_root, work)) = git_setup("up-detached") else { return };
         assert!(git(&work, &["checkout", "-q", "--detach"]));
-        let (msg, ok) = update_code(work.to_string_lossy().into_owned(), sink()).await;
-        assert!(!ok && msg.contains("isn't on a branch"), "{}", msg);
+        let Pulled { msg, ok, moved } = update_code(work.to_string_lossy().into_owned(), sink()).await;
+        assert!(!ok && !moved && msg.contains("isn't on a branch"), "{}", msg);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failure_is_explained_from_the_failing_commands_own_last_lines() {
+        // The sink is shared and already holds an earlier command's recovered hiccup.
+        let shared = sink();
+        shared.lock().unwrap().push("  WARNING: Retrying after connection broken by 'ReadTimeoutError': Read timed out.".into());
+        let failing = "i=0; while [ $i -lt 60 ]; do echo line $i; i=$((i+1)); done; echo \"ERROR: Could not install: [Errno 28] No space left on device\" >&2; exit 1";
+        let err = run_cmd_streamed("sh".into(), vec!["-c".into(), failing.into()], None, shared.clone()).await.unwrap_err();
+        assert!(err.starts_with("exit code 1\n") && err.contains("No space left") && !err.contains("line 5\n"), "its ending, not all of it: {}", err);
+        assert_eq!(plain_failure("Installing failed.", &err), "Installing failed. Your disk is full. Free up some space, then try again.");
+        // A dropped connection, as git and pip word it.
+        for said in ["fatal: early EOF", "error: RPC failed; curl 56 Recv failure: Connection was reset", "ConnectionResetError(104, 'Connection reset by peer')", "fatal: the remote end hung up unexpectedly"] {
+            assert_eq!(explain_failure(said), Some("Couldn't reach the internet. Check your connection, then try again."), "{}", said);
+        }
+    }
+
+    #[test]
+    fn only_her_own_origin_makes_a_folder_an_unfinished_download() {
+        let cfg = |body: &str| format!("[core]\n\tbare = false\n{}", body);
+        let ours = cfg("[remote \"origin\"]\n\turl = https://github.com/ddxfish/sapphire.git\n\tfetch = +refs/heads/*:refs/remotes/origin/*\n");
+        assert!(origin_url(&ours).is_some_and(is_sapphire_remote));
+        assert!(is_sapphire_remote("git@github.com:ddxfish/sapphire.git"));
+        // Somebody's project that only mentions her.
+        let upstream = cfg("[remote \"origin\"]\n\turl = https://github.com/me/mine.git\n[remote \"upstream\"]\n\turl = https://github.com/ddxfish/sapphire.git\n");
+        assert!(!origin_url(&upstream).is_some_and(is_sapphire_remote));
+        let submodule = cfg("[remote \"origin\"]\n\turl = https://github.com/me/mine.git\n[submodule \"vendor/sapphire\"]\n\turl = https://github.com/ddxfish/sapphire.git\n");
+        assert!(!origin_url(&submodule).is_some_and(is_sapphire_remote));
+        assert!(!is_sapphire_remote("https://github.com/ddxfish/sapphire.github.io.git"));
+        assert!(!is_sapphire_remote("https://github.com/notddxfish/sapphire.git"));
+        assert!(!is_sapphire_remote("https://github.com/ddxfish/sapphire-launcher.git"));
+        assert_eq!(origin_url(&cfg("")), None);
+        // On disk: the mention alone no longer makes the folder deletable.
+        let mine = scratch("mention");
+        std::fs::create_dir_all(mine.join(".git")).unwrap();
+        std::fs::write(mine.join("notes.txt"), "mine").unwrap();
+        std::fs::write(mine.join(".git").join("config"), &upstream).unwrap();
+        assert_eq!(install_kind(&mine.to_string_lossy()), InstallKind::Other);
+        assert!(!can_delete(&mine.to_string_lossy()));
+        std::fs::write(mine.join(".git").join("config"), &ours).unwrap();
+        assert_eq!(install_kind(&mine.to_string_lossy()), InstallKind::Unfinished);
     }
 
     #[test]

@@ -64,15 +64,27 @@ build-windows.bat       # Windows: dist\sapphire-launcher.exe
 
 The Linux script needs Docker: the binary is compiled in an Ubuntu 22.04 container so the files run on older systems; packaging happens on your machine.
 
-Publishing a beta (pre-release) from the repo root, after both builds:
+Publishing, from the repo root after both builds. The launcher only announces full releases, so the two kinds are posted differently.
+
+An alpha for testers, who get the link from you and nobody else is told:
 
 ```
-gh release create v0.9.8 dist/* --prerelease --title "Sapphire Launcher v0.9.8 (beta)" --generate-notes
+gh release create alpha-0.9.9 dist/* --prerelease --title "Sapphire Launcher 0.9.9 (alpha)" --generate-notes
 ```
 
-Add a file built elsewhere later with `gh release upload v0.9.8 <file>`; promote it with `gh release edit v0.9.8 --prerelease=false`.
+Keep the tag from looking like a version (`alpha-0.9.9`, not `v0.9.9`): launchers 0.9.6 to 0.9.8 announce any pre-release whose tag reads as a version.
 
-CI (`.github/workflows/ci.yml`) runs clippy with warnings-as-errors and the tests on Linux and Windows for every push, and keeps the Windows release exe as a build artifact. The launcher checks the GitHub releases of this repo on start and shows a badge when a newer one exists.
+A release for everyone, which every launcher's update check picks up:
+
+```
+gh release create v0.9.9 dist/* --title "Sapphire Launcher v0.9.9" --generate-notes
+```
+
+Add a file built elsewhere later with `gh release upload <tag> <file>`. A build that changed after its alpha gets a new number: the check only announces a version newer than the one running.
+
+Testing a build on Windows: put `test-on-windows.bat` and `test-on-windows.ps1` next to `sapphire-launcher.exe` and double-click the `.bat`. It checks the PC and the launcher's headless switches, offers (and asks first) to start and stop the local LLM, and writes `sapphire-launcher-test-report.txt` with no user name, PC name, key or chat in it, ready to paste where testers report. It sends nothing anywhere and changes no setting. Attach both files to an alpha release.
+
+CI (`.github/workflows/ci.yml`) runs clippy with warnings-as-errors and the tests on Linux and Windows for every push, and keeps the Windows release exe as a build artifact. The launcher checks the GitHub releases of this repo on start and shows a badge when a newer full release exists (pre-releases and drafts are never announced).
 
 Tests (Linux, needs the sapphire conda env for the two process tests):
 
