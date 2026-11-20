@@ -146,6 +146,9 @@ fn main() -> iced::Result {
     // The headless switches (`--start-llm` at sign-in, the download worker, what
     // Sapphire calls): do the one thing and exit, no window.
     let args: Vec<String> = std::env::args().collect();
+    // Before anything is started, window or headless: no Windows error box may
+    // come up from a hidden child and hold it there.
+    no_error_boxes();
     // Debug builds only: the stand-in engine for tests/llm_flows.rs.
     #[cfg(debug_assertions)]
     if let Some(code) = llm::fake_engine(&args) {
@@ -2798,7 +2801,7 @@ mod tests {
             let r = scratch(&format!("branch-{}", branch));
             // A real install is a clone with history; an unborn branch has no HEAD to
             // resolve, so give the test repo one commit.
-            let git = |args: &[&str]| std::process::Command::new("git")
+            let git = |args: &[&str]| hidden_cmd("git")
                 .args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args)
                 .current_dir(&r).status().map(|s| s.success()).unwrap_or(false);
             let ok = git(&["init", "-q", "-b", branch]) && git(&["commit", "-q", "--allow-empty", "-m", "init"]);
@@ -2808,7 +2811,7 @@ mod tests {
             }
             assert_eq!(detect_git_branch(&r.to_string_lossy()), Some(want), "branch {}", branch);
             // HEAD is read from the file, never by running git: it must say what git says.
-            let says = |args: &[&str]| std::process::Command::new("git").args(args).current_dir(&r).output().ok()
+            let says = |args: &[&str]| hidden_cmd("git").args(args).current_dir(&r).output().ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
             assert_eq!(git_head_name(&r.to_string_lossy()), says(&["rev-parse", "--abbrev-ref", "HEAD"]));
             // A feature branch is named; a detached commit is "a specific commit".
@@ -3982,7 +3985,7 @@ mod tests {
     fn a_failed_checkout_puts_the_picker_back() {
         let mut a = app();
         let r = scratch("checkout-fail");
-        let git = |args: &[&str]| std::process::Command::new("git")
+        let git = |args: &[&str]| hidden_cmd("git")
             .args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args)
             .current_dir(&r).status().map(|s| s.success()).unwrap_or(false);
         if !(git(&["init", "-q", "-b", "main"]) && git(&["commit", "-q", "--allow-empty", "-m", "init"])) {

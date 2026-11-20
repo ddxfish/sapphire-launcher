@@ -8,6 +8,26 @@ use iced::widget::text_editor;
 use iced::{color, Element, Font, Length, Padding};
 use std::path::PathBuf;
 
+/// The logs' fixed-width font. Windows names one that ships with it: "any monospace
+/// font" there can come back as whatever fixed-width font the PC happens to have,
+/// and a barcode font is one (a log of bars and empty squares). Consolas, else
+/// Courier New, else the old behaviour; looked for once.
+fn mono() -> Font {
+    #[cfg(windows)]
+    {
+        static FOUND: std::sync::OnceLock<Font> = std::sync::OnceLock::new();
+        *FOUND.get_or_init(|| {
+            let fonts = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join("Fonts");
+            [("Consolas", "consola.ttf"), ("Courier New", "cour.ttf")]
+                .into_iter()
+                .find(|(_, file)| fonts.join(file).exists())
+                .map_or(Font::MONOSPACE, |(name, _)| Font::with_name(name))
+        })
+    }
+    #[cfg(not(windows))]
+    Font::MONOSPACE
+}
+
 impl App {
     // ── View ───────────────────────────────────────────────────────────────
 
@@ -999,7 +1019,7 @@ impl App {
 
         let log_scroll = scrollable(
             container(
-                text(log_text).size(12).font(Font::MONOSPACE),
+                text(log_text).size(12).font(mono()),
             )
             .width(Length::Fill)
             .padding(6),
@@ -1050,7 +1070,7 @@ impl App {
                     container(
                         text(log_text)
                             .size(12)
-                            .font(Font::MONOSPACE),
+                            .font(mono()),
                     )
                     .width(Length::Fill)
                     .padding(6),

@@ -667,7 +667,10 @@ pub(crate) fn winget_outcome(code: i32) -> WingetOutcome {
 /// by hand. The output always goes to the log.
 #[cfg(windows)]
 async fn winget_install(step: Step, id: &str, name: &str, manual: &str) -> (Step, StepStatus, String) {
-    let args = ["install", "--exact", "--id", id, "--source", "winget", "--accept-source-agreements", "--accept-package-agreements"]
+    // --silent: the installer shows no window of its own (winget's default lets it
+    // show progress, and with that its "Setup Failed" page, which waits for a click).
+    // Windows' permission prompt still appears.
+    let args = ["install", "--silent", "--exact", "--id", id, "--source", "winget", "--accept-source-agreements", "--accept-package-agreements"]
         .iter().map(|a| a.to_string()).collect();
     let by_hand = format!("Or install {} yourself from {}, then click Re-scan.", name, manual);
     let args: Vec<String> = args;
@@ -697,6 +700,20 @@ type StepCheck = fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = (Ste
 /// it by hand), and never call it done until the tool is really found.
 #[cfg(windows)]
 async fn winget_step(step: Step, id: &str, name: &str, manual: &str, check: StepCheck) -> (Step, StepStatus, String) {
+    // One installer at a time, whoever asks: Go's steps in a window, and the LLM's
+    // download worker (its own process) fetching the Visual C++ runtime. Windows
+    // runs only one such install at once, and the second fails. The wait is for a
+    // lock file the OS frees when its holder ends, so it is never stale; the check
+    // comes after it, so what the other one installed meanwhile is found, not redone.
+    let _turn = tokio::task::spawn_blocking(|| {
+        let _ = std::fs::create_dir_all(app_config_dir());
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(app_config_dir().join("winget.lock")).ok()?;
+        f.lock().ok()?;
+        Some(f)
+    })
+    .await
+    .ok()
+    .flatten();
     if matches!(check().await.1, StepStatus::Found(_)) {
         return (step, StepStatus::Done(format!("{} is already installed", name)), String::new());
     }
@@ -1525,7 +1542,7 @@ mod tests {
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) -> bool {
-        std::process::Command::new("git").args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"]).args(args)
+        hidden_cmd("git").args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"]).args(args)
             .current_dir(dir).output().is_ok_and(|o| o.status.success())
     }
 
@@ -1541,7 +1558,7 @@ mod tests {
     }
 
     fn stashes(work: &std::path::Path) -> usize {
-        let out = std::process::Command::new("git").args(["stash", "list"]).current_dir(work).output().unwrap();
+        let out = hidden_cmd("git").args(["stash", "list"]).current_dir(work).output().unwrap();
         String::from_utf8_lossy(&out.stdout).lines().count()
     }
 

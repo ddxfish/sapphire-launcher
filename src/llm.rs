@@ -512,8 +512,15 @@ pub(crate) async fn probe(engine: Option<PathBuf>) -> Hw {
 }
 
 /// Err = the engine wouldn't run at all, which is not the same as "no devices".
+/// Given a minute, then ended: an engine stuck behind something nobody can see (a
+/// Windows error box, a wedged driver) must not hold up an install, a start or the
+/// watcher for ever. A first run can be slow (a scanner reading the CUDA libraries).
 async fn list_devices(exe: &Path) -> Result<Vec<(String, u64)>, String> {
-    run_cmd_full_async(exe.display().to_string(), vec!["--list-devices".into()]).await.map(|o| parse_devices(&o))
+    let ran = crate::platform::run(&exe.display().to_string(), &["--list-devices".to_string()], Some(std::time::Duration::from_secs(60))).await?;
+    if ran.timed_out {
+        return Err("it didn't answer within a minute".into());
+    }
+    if ran.ok() { Ok(parse_devices(&ran.both())) } else { Err(ran.both()) }
 }
 
 /// CUDA 13 builds need compute capability 7.5+ (Turing) and driver 580+; older
@@ -1256,7 +1263,8 @@ async fn run_job(spec: &JobSpec, rep: &mut Reporter) -> Result<(), String> {
         // and the Install tab only reaches at its sixth step.
         #[cfg(windows)]
         if !matches!(crate::install::check_vcredist().await.1, crate::install::StepStatus::Found(_)) {
-            rep.progress("the Visual C++ runtime", 0, 0);
+            // Said before the prompt can appear: it may open behind the window.
+            rep.progress("the Visual C++ runtime (Windows may ask for permission: choose Yes)", 0, 0);
             if let (_, crate::install::StepStatus::Failed(why), _) = crate::install::install_vcredist().await {
                 return Err(format!("llama.cpp needs the Visual C++ runtime, and installing it didn't work: {}", why));
             }

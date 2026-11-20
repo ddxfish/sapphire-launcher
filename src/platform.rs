@@ -140,6 +140,12 @@ pub(crate) fn launch_log_path() -> PathBuf {
 
 /// The handshake left for a later launcher: "this pid's output is in this file".
 pub(crate) fn run_state_path() -> PathBuf {
+    // Tests never read the real one: on a computer with a live Sapphire it says she
+    // is running from her real folder, and every test that asks "is she running
+    // somewhere else?" about its made-up folder would be told yes.
+    #[cfg(test)]
+    return std::env::temp_dir().join(format!("sl-test-{}-sapphire-run.json", std::process::id()));
+    #[cfg(not(test))]
     app_config_dir().join("sapphire-run.json")
 }
 
@@ -850,6 +856,23 @@ pub(crate) fn sweep_sapphire(force: bool) {
     #[cfg(not(windows))]
     for pid in her_pids() {
         signal_one(pid, if force { libc::SIGKILL } else { libc::SIGTERM });
+    }
+}
+
+/// Windows shows its own error boxes for a program that can't load a DLL or that
+/// crashes, and the program waits behind the box until someone clicks it. For
+/// something started hidden (llama-server, a download's curl) that is a popup from
+/// nowhere and a job that never ends. This turns them off for this process, and
+/// every child inherits the setting: the failure comes back as an exit code, which
+/// is said in the launcher's own words.
+pub(crate) fn no_error_boxes() {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX, SEM_NOOPENFILEERRORBOX};
+        // SAFETY: takes flags, returns the old ones; cannot fail.
+        unsafe {
+            SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+        }
     }
 }
 
